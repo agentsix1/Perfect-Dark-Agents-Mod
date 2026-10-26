@@ -1,0 +1,83 @@
+# Local test harness (kept on disk, never pushed)
+/run/
+
+# Build / packaging outputs
+/build/
+/dist/
+cmake-build-*/
+.flatpak-builder/
+extracted/
+src/generated/
+tools/mkrom/mkrom
+
+# Compiled binaries (any arch / layout)
+*.o
+*.a
+*.lib
+*.dll
+*.exe
+*.so
+*.dylib
+*.app
+*.out
+*.elf
+*.nro
+*.nso
+*.nacp
+*.pfs0
+*.nsp
+
+# ROMs and copyrighted game dumps — do not redistribute
+*.z64
+*.n64
+*.v64
+*.rom
+*.gbc
+pd.*.z64
+Perfect Dark*.zip
+**/pd.ntsc-*.z64
+**/pd.pal-*.z64
+**/pd.jpn-*.z64
+
+# Extracted / packed game assets from the ROM
+src/assets/*/*.bin
+src/assets/*/*.ctl
+src/assets/*/*.tbl
+src/assets/*/animations/*.bin
+src/assets/*/files/audio/*.mp3
+src/assets/*/files/bgdata/*.bin
+src/assets/*/files/bgdata/*.seg
+src/assets/*/files/chrs/*.bin
+src/assets/*/files/guns/*.bin
+src/assets/*/files/props/*.bin
+src/assets/*/files/ob/ob_mid.seg
+src/assets/*/fonts/*.bin
+src/assets/*/sequences/*.seq
+src/assets/*/textures/*.bin
+
+# Runtime save / config dumps outside source
+eeprom.bin
+mpsetups.bin
+*.sav
+*.eeprom
+
+# Logs, crash dumps, agent scratch files
+*.log
+*.ndjson
+/_*.txt
+/_sizes.c
+/_sizeof_*.c
+pd.crash.log
+
+# Python / editor / IDE
+*.pyc
+__pycache__/
+.vs/
+.vscode/
+.idea/
+CppProperties.json
+*~
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
