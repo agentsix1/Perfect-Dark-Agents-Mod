@@ -42,6 +42,7 @@
 #include "net/net.h"
 #include "net/netmsg.h"
 #include "system.h"
+#include "debugrooms.h"
 #endif
 
 /**
@@ -367,18 +368,101 @@ static bool scenarioPlayerIsHostRemote(struct player *pl)
 	return g_NetMode == NETMODE_SERVER && pl && pl->isremote;
 }
 
-/**
- * KOH occupancy: rooms[0] alone flickers for remotes at room seams. Also match
- * any room slot, and fall back to hillpos proximity for host remotes.
+/*
+ * Most hills: stock whole-room claim (matches full-room highlight).
+ * Skedar 00DA sits in an oversized BG room that also contains 0055/0056/0058
+ * ~1500u away — for that pad only, require proximity to hillpos so the far
+ * pads do not count. Other large rooms stay whole-room.
  */
-static bool scenarioKohPropInHill(struct prop *prop)
+#define KOH_TIGHT_XZ_RADIUS   1200.0f
+#define KOH_TIGHT_Y_TOLERANCE 250.0f
+
+bool scenarioKohWorldPosInHillZone(f32 x, f32 y, f32 z)
 {
-	s32 i;
 	f32 dx;
 	f32 dy;
 	f32 dz;
 
+	if (g_ScenarioData.koh.movehill || g_ScenarioData.koh.hillindex < 0) {
+		return false;
+	}
+
+	dx = x - g_ScenarioData.koh.hillpos.x;
+	dy = y - g_ScenarioData.koh.hillpos.y;
+	dz = z - g_ScenarioData.koh.hillpos.z;
+	return (dx * dx + dz * dz) <= (KOH_TIGHT_XZ_RADIUS * KOH_TIGHT_XZ_RADIUS)
+			&& ABS(dy) <= KOH_TIGHT_Y_TOLERANCE;
+}
+
+/**
+ * True when this hill's BG room is known to be far larger than the playable
+ * platform (Skedar 00DA). Highlight stays whole-room; claim uses a pad radius.
+ */
+static bool scenarioKohHillNeedsTightZone(void)
+{
+	s32 pad;
+
+	if (g_ScenarioData.koh.hillindex < 0
+			|| g_ScenarioData.koh.hillindex >= g_ScenarioData.koh.hillcount) {
+		return false;
+	}
+
+	pad = g_ScenarioData.koh.hillpads[g_ScenarioData.koh.hillindex];
+	return pad == PAD_OAT_00DA;
+}
+
+static bool scenarioKohNearHillPos(struct prop *prop, f32 xzradius, f32 ytol)
+{
+	f32 dx;
+	f32 dy;
+	f32 dz;
+
+	dx = prop->pos.x - g_ScenarioData.koh.hillpos.x;
+	dy = prop->pos.y - g_ScenarioData.koh.hillpos.y;
+	dz = prop->pos.z - g_ScenarioData.koh.hillpos.z;
+	return (dx * dx + dz * dz) <= (xzradius * xzradius) && ABS(dy) <= ytol;
+}
+
+/**
+ * KOH occupancy: stock rooms[0] == hill room, plus a pad-radius gate only for
+ * known oversized rooms (Skedar 00DA). Remotes may match any rooms[] slot or a
+ * tight pad proximity when room membership flickers at seams.
+ */
+static bool scenarioKohPropInHill(struct prop *prop)
+{
+	s32 i;
+	bool isremote;
+	bool inroom;
+	bool needstight;
+
 	if (!prop || g_ScenarioData.koh.movehill) {
+		return false;
+	}
+
+	needstight = scenarioKohHillNeedsTightZone();
+	inroom = (prop->rooms[0] == g_ScenarioData.koh.hillrooms[0]);
+
+	if (inroom) {
+		if (!needstight || scenarioKohWorldPosInHillZone(prop->pos.x, prop->pos.y, prop->pos.z)) {
+			return true;
+		}
+		return false;
+	}
+
+	isremote = false;
+
+	if (g_NetMode == NETMODE_SERVER && prop->type == PROPTYPE_PLAYER) {
+		i = playermgrGetPlayerNumByProp(prop);
+		if (i >= 0 && i < PLAYERCOUNT() && scenarioPlayerIsHostRemote(g_Vars.players[i])) {
+			isremote = true;
+		}
+	}
+
+	if (!isremote) {
+		return false;
+	}
+
+	if (needstight && !scenarioKohWorldPosInHillZone(prop->pos.x, prop->pos.y, prop->pos.z)) {
 		return false;
 	}
 
@@ -391,16 +475,8 @@ static bool scenarioKohPropInHill(struct prop *prop)
 		}
 	}
 
-	if (g_NetMode == NETMODE_SERVER && prop->type == PROPTYPE_PLAYER) {
-		i = playermgrGetPlayerNumByProp(prop);
-		if (i >= 0 && i < PLAYERCOUNT() && scenarioPlayerIsHostRemote(g_Vars.players[i])) {
-			dx = prop->pos.x - g_ScenarioData.koh.hillpos.x;
-			dy = prop->pos.y - g_ScenarioData.koh.hillpos.y;
-			dz = prop->pos.z - g_ScenarioData.koh.hillpos.z;
-			if ((dx * dx + dz * dz) <= (300.0f * 300.0f) && ABS(dy) <= 220.0f) {
-				return true;
-			}
-		}
+	if (scenarioKohNearHillPos(prop, 300.0f, 220.0f)) {
+		return true;
 	}
 
 	return false;
@@ -909,6 +985,15 @@ Gfx *scenarioRenderHud(Gfx *gdl)
 			gdl = g_MpScenarios[g_MpSetup.scenario].hudfunc(gdl);
 #endif
 		}
+
+#ifndef PLATFORM_N64
+#if VERSION >= VERSION_NTSC_1_0
+		if (g_MpSetup.paused != MPPAUSEMODE_GAMEOVER && g_NumReasonsToEndMpMatch == 0)
+#endif
+		{
+			gdl = debugSkedarRenderPadHud(gdl);
+		}
+#endif
 
 		playercount = PLAYERCOUNT();
 

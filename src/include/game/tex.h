@@ -8,6 +8,13 @@ void texInit(void);
 
 void surfaceReset(void);
 
+#ifndef PLATFORM_N64
+extern bool g_TexPipeSynced;
+s32 texModeToGbiMode(s32 txmode);
+void texResetTiles(void);
+#endif
+
+
 void texSetBitstring(u8 *arg0);
 s32 texReadBits(s32 arg0);
 void texReset(void);

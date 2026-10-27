@@ -30,6 +30,9 @@
 #include "data.h"
 #include "types.h"
 #include "platform.h"
+#ifndef PLATFORM_N64
+#include "debugrooms.h"
+#endif
 
 const char var7f1a78e0[] = "LIGHTS : Hit occured on light %d in room %d\n";
 const char var7f1a7910[] = "L2(%d) -> ";
@@ -1425,20 +1428,26 @@ void roomsTickLighting(void)
 					g_Rooms[i].flags |= ROOMFLAG_NEEDRESHADE;
 					g_Rooms[i].flags &= ~(ROOMFLAG_BRIGHTNESS_DIRTY_PERM | ROOMFLAG_BRIGHTNESS_DIRTY_TEMP);
 
-					if (g_Rooms[i].lightop == LIGHTOP_HIGHLIGHT) {
+					{
 						s32 r = roomGetFinalBrightnessForPlayer(i);
 						s32 g = r;
 						s32 b = r;
 
-						scenarioHighlightRoom(i, &r, &g, &b);
+#ifndef PLATFORM_N64
+						if (g_Rooms[i].lightop == LIGHTOP_HIGHLIGHT) {
+							scenarioHighlightRoom(i, &r, &g, &b);
+						} else if (debugSkedarRoomColoursActive()) {
+							debugSkedarApplyRoomColour(i, &r, &g, &b);
+						}
+#else
+						if (g_Rooms[i].lightop == LIGHTOP_HIGHLIGHT) {
+							scenarioHighlightRoom(i, &r, &g, &b);
+						}
+#endif
 
 						g_Rooms[i].highlightfrac_r = r * (1.0f / 255.0f);
 						g_Rooms[i].highlightfrac_g = g * (1.0f / 255.0f);
 						g_Rooms[i].highlightfrac_b = b * (1.0f / 255.0f);
-					} else {
-						g_Rooms[i].highlightfrac_r = roomGetFinalBrightnessForPlayer(i) * (1.0f / 255.0f);
-						g_Rooms[i].highlightfrac_g = g_Rooms[i].highlightfrac_r;
-						g_Rooms[i].highlightfrac_b = g_Rooms[i].highlightfrac_r;
 					}
 
 					numprocessed++;
@@ -1664,9 +1673,21 @@ void roomHighlight(s32 roomnum)
 					blue += extra;
 				}
 
+#ifndef PLATFORM_N64
+				/*
+				 * Debug hill tints yield to the live KOH/CTC room highlight so
+				 * the active objective still glows team/green.
+				 */
+				if (g_Rooms[roomnum].lightop == LIGHTOP_HIGHLIGHT) {
+					scenarioHighlightRoom(roomnum, &red, &green, &blue);
+				} else if (debugSkedarRoomColoursActive()) {
+					debugSkedarApplyRoomColour(roomnum, &red, &green, &blue);
+				}
+#else
 				if (g_Rooms[roomnum].lightop == LIGHTOP_HIGHLIGHT) {
 					scenarioHighlightRoom(roomnum, &red, &green, &blue);
 				}
+#endif
 
 				if (red > 255) {
 					red = 255;

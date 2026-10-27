@@ -14,6 +14,13 @@
 #include "video.h"
 #include "input.h"
 #include "config.h"
+#include "texpack.h"
+#ifndef PLATFORM_N64
+#include "xblamesh.h"
+#include "xblatex.h"
+#include "xblastage.h"
+#endif
+
 
 static s32 g_ExtMenuPlayer = 0;
 static struct menudialogdef *g_ExtNextDialog = NULL;
@@ -996,6 +1003,80 @@ static MenuItemHandlerResult menuhandlerScreenShake(s32 operation, struct menuit
 	return 0;
 }
 
+/**
+ * Texture Pack picker: index 0 = Default (ROM), then each folder under texture-packs/.
+ */
+static MenuItemHandlerResult menuhandlerTexturePack(s32 operation, struct menuitem *item, union handlerdata *data)
+{
+	const s32 numPacks = texpackGetNumPacks();
+
+	switch (operation) {
+	case MENUOP_GETOPTIONCOUNT:
+		data->dropdown.value = numPacks + 1; /* Default + packs */
+		break;
+	case MENUOP_GETOPTIONTEXT:
+		if (data->dropdown.value == 0) {
+			return (intptr_t)"Default";
+		}
+		if ((s32)data->dropdown.value - 1 < numPacks) {
+			return (intptr_t)texpackGetPackName((s32)data->dropdown.value - 1);
+		}
+		return (intptr_t)"";
+	case MENUOP_SET:
+		if (data->dropdown.value == 0) {
+			texpackSetSelectedPack(-1);
+		} else {
+			texpackSetSelectedPack((s32)data->dropdown.value - 1);
+		}
+		break;
+	case MENUOP_GETSELECTEDINDEX: {
+		const s32 sel = texpackGetSelectedPack();
+		data->dropdown.value = (sel < 0) ? 0 : (u32)(sel + 1);
+		break;
+	}
+	}
+
+	return 0;
+}
+
+#ifndef PLATFORM_N64
+static MenuItemHandlerResult menuhandlerXblaMeshes(s32 operation, struct menuitem *item, union handlerdata *data)
+{
+	switch (operation) {
+	case MENUOP_GET:
+		return xblaMeshGetEnabled();
+	case MENUOP_SET:
+		xblaMeshSetEnabled(data->checkbox.value);
+		break;
+	}
+	return 0;
+}
+
+static MenuItemHandlerResult menuhandlerXblaTextures(s32 operation, struct menuitem *item, union handlerdata *data)
+{
+	switch (operation) {
+	case MENUOP_GET:
+		return xblaTexGetEnabled();
+	case MENUOP_SET:
+		xblaTexSetEnabled(data->checkbox.value);
+		break;
+	}
+	return 0;
+}
+
+static MenuItemHandlerResult menuhandlerXblaStages(s32 operation, struct menuitem *item, union handlerdata *data)
+{
+	switch (operation) {
+	case MENUOP_GET:
+		return xblaStageGetEnabled();
+	case MENUOP_SET:
+		xblaStageSetEnabled(data->checkbox.value);
+		break;
+	}
+	return 0;
+}
+#endif
+
 struct menuitem g_ExtendedVideoMenuItems[] = {
 	{
 		MENUITEMTYPE_CHECKBOX,
@@ -1109,6 +1190,40 @@ struct menuitem g_ExtendedVideoMenuItems[] = {
 		0,
 		menuhandlerTexDetail,
 	},
+	{
+		MENUITEMTYPE_DROPDOWN,
+		0,
+		MENUITEMFLAG_LITERAL_TEXT,
+		(uintptr_t)"Texture Pack",
+		0,
+		menuhandlerTexturePack,
+	},
+#ifndef PLATFORM_N64
+	{
+		MENUITEMTYPE_CHECKBOX,
+		0,
+		MENUITEMFLAG_LITERAL_TEXT,
+		(uintptr_t)"XBLA Meshes",
+		0,
+		menuhandlerXblaMeshes,
+	},
+	{
+		MENUITEMTYPE_CHECKBOX,
+		0,
+		MENUITEMFLAG_LITERAL_TEXT,
+		(uintptr_t)"XBLA Textures",
+		0,
+		menuhandlerXblaTextures,
+	},
+	{
+		MENUITEMTYPE_CHECKBOX,
+		0,
+		MENUITEMFLAG_LITERAL_TEXT,
+		(uintptr_t)"XBLA Rooms",
+		0,
+		menuhandlerXblaStages,
+	},
+#endif
 	{
 		MENUITEMTYPE_SEPARATOR,
 		0,

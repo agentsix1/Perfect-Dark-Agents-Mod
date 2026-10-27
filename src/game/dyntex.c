@@ -405,6 +405,18 @@ void dyntexReset(void)
 	if (size1);
 }
 
+#ifndef PLATFORM_N64
+void dyntexForgetRooms(void)
+{
+	g_DyntexCurRoom = -1;
+	g_DyntexCurType = -1;
+	g_DyntexRoomPopulated = false;
+	g_DyntexRoomsCount = 0;
+	g_DyntexTypesCount = 0;
+	g_DyntexVerticesCount = 0;
+}
+#endif
+
 u32 var8007f704 = 0x0000001d;
 u32 var8007f708 = 0x0000004a;
 u32 var8007f70c = 0x00000006;

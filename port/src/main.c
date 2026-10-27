@@ -12,6 +12,8 @@
 #include "audio.h"
 #include "input.h"
 #include "fs.h"
+#include "texpack.h"
+#include "xblaimport.h"
 #include "romdata.h"
 #include "config.h"
 #include "mod.h"
@@ -108,11 +110,14 @@ int main(int argc, const char **argv)
 	conInit();
 	sysInit();
 	fsInit();
+	texpackInit();
 	configInit();
 	videoInit();
 	inputInit();
 	audioInit();
 	romdataInit();
+	xblaImportInit();
+	xblaImportFromCommandLine();
 	netInit();
 
 	g_ValidGbcRomFound = romdataCheckGbcRom();

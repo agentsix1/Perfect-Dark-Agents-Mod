@@ -44,6 +44,10 @@
 #include "gbiex.h"
 #include "types.h"
 #ifndef PLATFORM_N64
+#include "xblastage.h"
+#endif
+
+#ifndef PLATFORM_N64
 #include "preprocess.h"
 #include "system.h"
 #include "video.h"
@@ -2839,6 +2843,21 @@ void bgLoadRoom(s32 roomnum)
 	if (allocation != NULL) {
 		dyntexSetCurrentRoom(roomnum);
 
+#ifndef PLATFORM_N64
+		/* XBLA release rooms: already-inflated bytes from the package. */
+		{
+			const u32 xblen = xblaStageRoomSize(roomnum);
+
+			if (xblen && xblen <= (u32)alloclen) {
+				xblaStageRoomRead(roomnum, allocation, xblen);
+				inflatedlen = (s32)xblen;
+				inflatedlen = preprocessBgRoom(allocation, inflatedlen, g_BgRooms[roomnum].unk00);
+				g_Rooms[roomnum].gfxdata = (struct roomgfxdata *)allocation;
+				goto xbla_room_loaded;
+			}
+		}
+#endif
+
 		// Calculate the file offset and read length
 		// of the compressed room data in the BG file
 		readlen = ((g_BgRooms[roomnum + 1].unk00 - g_BgRooms[roomnum].unk00) + 0xf) & ~0xf;
@@ -2866,7 +2885,12 @@ void bgLoadRoom(s32 roomnum)
 		inflatedlen = preprocessBgRoom(allocation, inflatedlen, g_BgRooms[roomnum].unk00);
 #endif
 
+
 		g_Rooms[roomnum].gfxdata = (struct roomgfxdata *)allocation;
+
+#ifndef PLATFORM_N64
+xbla_room_loaded:
+#endif
 
 		// Promote offsets to pointers in the gfxdata header
 		if (g_Rooms[roomnum].gfxdata->vertices) {

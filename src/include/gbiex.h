@@ -175,6 +175,11 @@
 #define G_CC_CUSTOM_21  TEXEL1,    TEXEL0,      LOD_FRACTION, TEXEL0,      1,         0,           SHADE,         ENVIRONMENT
 #define G_CC_CUSTOM_22  TEXEL1,    TEXEL0,      LOD_FRACTION, TEXEL0,      SHADE,     ENVIRONMENT, TEXEL0,        0
 #define G_CC_CUSTOM_23  COMBINED,  0,           SHADE,        0,           1,         0,           PRIMITIVE,     COMBINED
+// Glass See-Through (modGetGlassSeeThrough()): the second cycle of 20 and 23
+// with the primitive alpha laid over the texel's as a blend, (1 - a) * prim + a,
+// where theirs adds it. A pane then keeps (1 - prim) of its own see-through
+// rather than going opaque as soon as prim reaches 1 - a. Identical at prim 0.
+#define G_CC_CUSTOM_GLASS_LERP  COMBINED,  0,     SHADE,        0,           1,         COMBINED,    PRIMITIVE,     COMBINED
 #define G_CC_CUSTOM_24  TEXEL1,    TEXEL0,      LOD_FRACTION, TEXEL0,      1,         SHADE,       ENVIRONMENT,   0
 #define G_CC_CUSTOM_25  TEXEL1,    TEXEL0,      LOD_FRACTION, TEXEL0,      1,         0,           ENVIRONMENT,   0
 #define G_CC_CUSTOM_26  TEXEL1,    TEXEL0,      LOD_FRACTION, TEXEL0,      TEXEL0,    0,           ENVIRONMENT,   0
@@ -197,10 +202,21 @@
 #define G_RDPFLUSH_EXT               0x43
 #define G_CLEAR_DEPTH_EXT            0x44
 #define G_SETSUBPIXELOFFSET_EXT      0x45
+#define G_SETFONTGLYPH_EXT           0x46
+#define G_SETTEXGENSHIFT_EXT         0x47
+#define G_SETRECTDEPTH_EXT           0x48
+#define G_SETDEPTHBIAS_EXT           0x49
+#define G_TAA_EXT                    0x4a
+#define G_SETFOGLINE_EXT             0x4b
+#define G_OCCLUSIONTEST_EXT          0x4c
+#define G_SETTILEOFFSET_EXT          0x4d
+#define G_MESH_EXT                   0x4e
+#define G_SETRECTSCALE_EXT           0x4f
 
 /* G_EXTRAGEOMETRYMODE flags */
 
 #define G_INVERT_CULLING_EXT     0x00000001
+#define G_TEX_OWN_LODS_EXT       0x00000002 // a mipmapped texture (G_TL_LOD) draws its own levels of detail, the tiles' images under the first as the RDP samples them, not levels the renderer makes from the first: a level converted from GoldenEye's ROM in the N64 look (bgRenderScene()), whose CI textures' levels GoldenEye's shrink made (getexshrink.c) - Crab Key's wall grille is a white mesh at a distance on the cartridge because of what they hold
 #define G_ASPECT_LEFT_EXT        0x00000010
 #define G_ASPECT_RIGHT_EXT       0x00000020
 #define G_ASPECT_WIDE_EXT        0x00000040
@@ -208,6 +224,20 @@
 #define G_ASPECT_MODE_EXT        (G_ASPECT_CENTER_EXT | G_ASPECT_WIDE_EXT)
 #define G_NO_CLIPPING_EXT        0x00000100
 #define G_MODULATE_EXT           0x00000200 // this should really go into OTHERMODE_H, but for some reason I can't get it to work
+#define G_ADDITIVE_EXT           0x00000400 // with a blending render mode: source times its alpha added to what is there
+#define G_ENVMAP_EXT             0x00000800 // texel 0 is a sphere-map atlas looked up per pixel: see gfx_pc.cpp
+#define G_TEXGEN_TURN_EXT        0x00001000 // with G_TEXGEN_EYE_EXT: G_SETTEXGENSHIFT_EXT's shift turns the LookAt (a fraction of a turn) instead of being added (the levels' reflections)
+#define G_TEXGEN_FACE_EXT        0x00004000 // with G_LIGHTING: each triangle is lit and texgenned from its own face normal, turned to the eye, not from its vertices' colours (a flat room panel with no normals of its own)
+#define G_TEXGEN_EYE_EXT         0x00002000 // with G_TEXTURE_GEN: the lookup follows the eye ray and adds G_SETTEXGENSHIFT_EXT's shift (the K7 sheen)
+#define G_DECAL_EXT              0x00008000 // what follows is drawn in the decal z mode (ZMODE_DEC) whatever the render mode says: a mesh's overlay flat on its own surface (xblamesh.c)
+#define G_NO_CULLING_EXT         0x00010000 // every depth-writing face is drawn whatever culling the lists set (translucent ones keep the lists' culling, except inside a faded body's G_DEPTH_PREPASS_EXT/G_DEPTH_FRONT_EXT passes, where every face counts as writing depth): GoldenEye's own guns, whose lists cull and some of whose faces are wound backwards (the silenced D5K's silencer)
+#define G_DEPTH_PREPASS_EXT      0x00020000 // what follows writes depth and no colour, whatever the render mode says: the first of a faded body's two passes (chrRender())
+#define G_DEPTH_FRONT_EXT        0x00040000 // what follows compares less-or-equal and writes no depth, whatever the render mode says: the second pass, which then draws only the surface the first left nearest
+#define G_SEAL_SEAMS_EXT         0x00080000 // opaque triangles that follow are grown half a pixel on screen, their corners slid along their own plane: a room's cracks between faces that do not quite meet (gfx_seal_seams(), gfx_pc.cpp)
+#define G_ALPHA_CORE_EXT         0x00100000 // with a texture-edge cutout (CVG_X_ALPHA): only texels of at least three quarters alpha are kept, drawn solid - the core of a soft picture, whose fringe is blended over it in a second draw (a character's hair, xblamesh.c)
+#define G_FOG_VERTEX_EXT         0x00200000 // fog is worked out at each vertex and clamped there, then carried across the triangle linearly on the screen, as the N64's RSP and its shade alpha do - not at each pixel from its own depth. A GoldenEye level's big floor triangles take the fog of their far corners well inside the fog's start (envStartFog() on a converted level)
+#define G_COVERAGE_ALPHA_EXT     0x00400000 // under a render mode that takes coverage for alpha (ALPHA_CVG_SEL) without FORCE_BL, CVG_X_ALPHA or an alpha compare, a covered pixel is drawn solid whatever alpha the combiner hands on, as the RDP draws it: a level converted from GoldenEye's ROM in the N64 look (bgRenderScene()), where GE Editor's grey I4 walls handed on their texels' intensity for alpha and were blended by it to half their brightness
+#define G_SHADE_LINEAR_EXT       0x00800000 // vertex colours are carried across a triangle linearly on the screen, as the RDP carries its shade, not with perspective, and a triangle crossing the RSP's clip volume is first cut where the RSP cuts it (as under G_FOG_VERTEX_EXT): a level converted from GoldenEye's ROM in the N64 look (bgRenderScene()), where Caverns' lake is one huge triangle with a black corner far off that the cartridge darkens across most of the screen
 
 /* Extra texture filtering mode */
 
@@ -220,6 +250,29 @@
 
 #define gDPSetFramebufferTextureEXT(pkt, f, s, w, i) \
     gSetImage(pkt, G_SETTIMG_FB_EXT, f, s, w, i)
+
+/*
+ * Names the glyph a font texture is about to draw, for the texture pack.
+ *
+ * A glyph is uploaded from font->chars[n].pixeldata, so its address does
+ * identify it - but the fill and the outline of the same glyph are drawn from
+ * the same address by two different renderers, and a pack ships a different
+ * image for each. The display list is built before it is run, so which one this
+ * is cannot be known later from anything else; it has to be said here.
+ *
+ * Applies to the next gDPSetTextureImage and nothing after it. Nothing about
+ * the glyph's size travels with it: a replacement image is of the whole tile
+ * the glyph is loaded as - 16 texels wide, the character in its top-left
+ * corner - so the renderer maps it exactly as it maps the game's own texels.
+ */
+#define gDPSetFontGlyphEXT(pkt, font, glyph, outline)          \
+{                                                              \
+    Gfx *_g = (Gfx *)(pkt);                                    \
+                                                               \
+    _g->words.w0 = _SHIFTL(G_SETFONTGLYPH_EXT, 24, 8);         \
+    _g->words.w1 = _SHIFTL(outline, 24, 8)                     \
+        | _SHIFTL(font, 16, 8) | _SHIFTL(glyph, 0, 16);        \
+}
 
 #define gDPCopyFramebufferEXT(pkt, dst, src, uls, ult, back)   \
 {                                                              \
@@ -299,6 +352,166 @@
                                                                                        \
     _g->words.w0 = _SHIFTL(G_SETSUBPIXELOFFSET_EXT, 24, 8) | _SHIFTL((s16)(x), 0, 16); \
     _g->words.w1 = _SHIFTL((s16)(y), 0, 16);                                           \
+}
+
+/*
+ * Added to the texgen's s and t under G_TEXGEN_EYE_EXT, in 1/16384ths of the
+ * span a normal's whole range covers (16384 is a whole span).
+ */
+#define gDPSetTexgenShiftEXT(pkt, s, t)                                                \
+{                                                                                      \
+    Gfx *_g = (Gfx*)(pkt);                                                             \
+                                                                                       \
+    _g->words.w0 = _SHIFTL(G_SETTEXGENSHIFT_EXT, 24, 8) | _SHIFTL((s16)(s), 0, 16);    \
+    _g->words.w1 = _SHIFTL((s16)(t), 0, 16);                                           \
+}
+
+/*
+ * Rectangles after this - texture and fill - and 2D shapes are drawn scale
+ * times their size about the point x, y (screen units, to a quarter), their
+ * texels spread over the smaller rectangle as they were over the whole one,
+ * until it is set again with a scale of 1: a line of the game's own font
+ * drawn smaller than its glyphs, and a menu row with its highlight (the
+ * online pages' text size, netlobbymenu.c, menu.c). x and y go in w0 as
+ * signed 12 bit quarter units, the scale in w1 as 16.16.
+ */
+#define gDPSetRectScaleEXT(pkt, scale, x, y)                                           \
+{                                                                                      \
+    Gfx *_g = (Gfx*)(pkt);                                                             \
+                                                                                       \
+    _g->words.w0 = _SHIFTL(G_SETRECTSCALE_EXT, 24, 8)                                  \
+        | _SHIFTL((s32)((x) * 4.0f), 12, 12) | _SHIFTL((s32)((y) * 4.0f), 0, 12);      \
+    _g->words.w1 = (u32)(s32)((scale) * 65536.0f);                                     \
+}
+
+/*
+ * Rectangles after this are drawn at normalised depth z (-1 near, 1 far) and
+ * depth tested against the scene without writing (on), or in front of
+ * everything as stock (off). z goes in w1 as a signed fraction of 2^30.
+ */
+#define gDPSetRectDepthEXT(pkt, on, z)                                                 \
+{                                                                                      \
+    Gfx *_g = (Gfx*)(pkt);                                                             \
+                                                                                       \
+    _g->words.w0 = _SHIFTL(G_SETRECTDEPTH_EXT, 24, 8) | _SHIFTL((on) ? 1 : 0, 0, 1);   \
+    _g->words.w1 = (u32)(s32)((z) * 1073741824.0f);                                    \
+}
+
+/*
+ * Asks the GPU whether anything the frame has drawn so far is nearer than
+ * normalised depth z (-1 near, 1 far) at screen pixel (x, y): a one pixel
+ * rectangle there is depth tested without being seen, and occlusion query
+ * slot counts the samples of it that pass. videoGetOcclusionResult() reads the
+ * count once the frame is done. Two words: z in the first as a signed
+ * fraction of 2^30, like gDPSetRectDepthEXT(), the pixel in the second, so
+ * pkt is gdl++ as for gDPFillRectangleWideEXT().
+ */
+#define gDPOcclusionTestEXT(pkt, slot, x, y, z)                                        \
+{                                                                                      \
+    Gfx *_g0 = (Gfx*)(pkt), *_g1 = (Gfx*)(pkt);                                        \
+                                                                                       \
+    _g0->words.w0 = _SHIFTL(G_OCCLUSIONTEST_EXT, 24, 8) | _SHIFTL((slot), 0, 16);      \
+    _g0->words.w1 = (u32)(s32)((z) * 1073741824.0f);                                   \
+    _g1->words.w0 = (u32)(s32)(x);                                                     \
+    _g1->words.w1 = (u32)(s32)(y);                                                     \
+}
+
+/*
+ * Push what follows away from the eye by this many of the depth buffer's
+ * smallest steps (0 for none), on top of whatever its z mode offsets by.
+ */
+// A tile's corner moved on by a fraction of a texel in s and t (0 to 1, in
+// 65536ths), finer than the quarter texel gDPSetTileSize can say. Set its size
+// again and it is gone.
+#define gDPSetTileOffsetEXT(pkt, tile, fs, ft)                                         \
+{                                                                                      \
+    Gfx *_g = (Gfx*)(pkt);                                                             \
+                                                                                       \
+    _g->words.w0 = _SHIFTL(G_SETTILEOFFSET_EXT, 24, 8) | _SHIFTL(tile, 0, 3);          \
+    _g->words.w1 = _SHIFTL(fs, 16, 16) | _SHIFTL(ft, 0, 16);                           \
+}
+
+#define gDPSetDepthBiasEXT(pkt, units)                                                 \
+{                                                                                      \
+    Gfx *_g = (Gfx*)(pkt);                                                             \
+                                                                                       \
+    _g->words.w0 = _SHIFTL(G_SETDEPTHBIAS_EXT, 24, 8);                                 \
+    _g->words.w1 = (u32)(s32)(units);                                                  \
+}
+
+/*
+ * The fog line gSPFogFactor() sets - factor = z/w * mul + offset, 0 to 255 -
+ * as a float, one half a command: G_FOGLINE_OFFSET_EXT in flags for the
+ * offset, the multiplier without. For fog further out than an s16 multiplier
+ * reaches under a near plane of a few units, where the z range from fog to
+ * full fog is a few ten-thousandths. With G_FOGLINE_LINEAR_EXT (on both
+ * halves) the line is evaluated at the eye depth instead, factor = w * mul +
+ * offset: fog linear in distance. gSPFogFactor()/gSPFogPosition() put the
+ * line back to z/w.
+ */
+#define G_FOGLINE_OFFSET_EXT 0x1
+#define G_FOGLINE_LINEAR_EXT 0x2
+
+#define gSPFogLineEXT(pkt, flags, value)                                               \
+{                                                                                      \
+    Gfx *_g = (Gfx *)(pkt);                                                            \
+    union { f32 f; u32 u; } _l;                                                        \
+                                                                                       \
+    _l.f = (value);                                                                    \
+    _g->words.w0 = _SHIFTL(G_SETFOGLINE_EXT, 24, 8) | _SHIFTL((flags), 0, 2);          \
+    _g->words.w1 = _l.u;                                                               \
+}
+
+/*
+ * TAA (Video.TAA): brackets a player's world - sky, rooms, props, beams,
+ * sparks - and leaves out the gun, the HUD and the glares after it. BEGIN
+ * starts the sub-pixel jitter; END stops it and resolves the world against
+ * the frame before it, reprojected through the depth buffer by the camera.
+ * mtx is 16 floats, row-vector world -> clip (the draw space's offset and
+ * scale folded in), in memory that lives until the frame is drawn; slot is
+ * the player, whose history it is.
+ */
+#define gSPTaaEXT(pkt, begin, slot, mtx)                               \
+{                                                                      \
+    Gfx *_g = (Gfx *)(pkt);                                            \
+                                                                       \
+    _g->words.w0 = _SHIFTL(G_TAA_EXT, 24, 8) | _SHIFTL((begin), 8, 1) \
+        | _SHIFTL((slot), 0, 8);                                       \
+    _g->words.w1 = (uintptr_t)(mtx);                                   \
+}
+
+/*
+ * G_MESH_EXT: the lists that follow draw one of the meshes in gfxmesh.h - the
+ * XBLA release's and GoldenEye XBLA's (xblamesh.c) - until a gSPMeshEXT() of
+ * NULL. The renderer draws them from a copy of the mesh it keeps on the GPU,
+ * posed by the draw's palette in the vertex shader, instead of transforming
+ * every vertex the lists load. draw is a struct gfxmeshdraw in memory that
+ * lives until the frame is drawn.
+ */
+#define gSPMeshEXT(pkt, draw)                                          \
+{                                                                      \
+    Gfx *_g = (Gfx *)(pkt);                                            \
+                                                                       \
+    _g->words.w0 = _SHIFTL(G_MESH_EXT, 24, 8);                         \
+    _g->words.w1 = (uintptr_t)(draw);                                  \
+}
+
+/*
+ * G_MESH_EXT for one node of a model (modelmesh.c): the lists that follow
+ * load the node's `count` vertices from `vertices`, each under one of the
+ * model's matrices in segment 3, until a gSPMeshEXT() of NULL. The renderer
+ * keeps a copy of the vertices on the GPU and draws the lists' runs from it,
+ * every vertex transformed by the matrix it was loaded under.
+ */
+#define G_MESH_MODEL_EXT 0x00800000
+
+#define gSPModelMeshEXT(pkt, vertices, count)                          \
+{                                                                      \
+    Gfx *_g = (Gfx *)(pkt);                                            \
+                                                                       \
+    _g->words.w0 = _SHIFTL(G_MESH_EXT, 24, 8) | G_MESH_MODEL_EXT       \
+        | _SHIFTL((count), 0, 16);                                     \
+    _g->words.w1 = (uintptr_t)(vertices);                              \
 }
 
 #define gSPSetExtraGeometryModeEXT(pkt, word) gSPExtraGeometryModeEXT((pkt), 0, word)

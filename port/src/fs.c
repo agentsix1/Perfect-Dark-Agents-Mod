@@ -13,7 +13,11 @@
 #include "fs.h"
 #ifdef PLATFORM_WIN32
 #include <direct.h>
+#include <windows.h>
+#else
+#include <dirent.h>
 #endif
+
 
 #define DEFAULT_BASEDIR_NAME "data"
 
@@ -291,4 +295,105 @@ s32 fsCreateDir(const char *path)
 #else
 	return mkdir(fsFullPath(path), 0777);
 #endif
+}
+
+s32 fsRemoveFile(const char *path)
+{
+	return remove(fsFullPath(path)) == 0 ? 0 : -1;
+}
+
+s32 fsScanDir(const char *path, fsScanCallback cb, void *arg)
+{
+	const char *full = fsFullPath(path);
+	s32 count = 0;
+
+#ifdef PLATFORM_WIN32
+	char pattern[FS_MAXPATH + 1];
+	WIN32_FIND_DATA fd;
+	HANDLE h;
+
+	snprintf(pattern, sizeof(pattern), "%s/*", full);
+	h = FindFirstFileA(pattern, &fd);
+	if (h == INVALID_HANDLE_VALUE) {
+		return -1;
+	}
+
+	do {
+		if (fd.cFileName[0] == '.' && (fd.cFileName[1] == '\0'
+				|| (fd.cFileName[1] == '.' && fd.cFileName[2] == '\0'))) {
+			continue;
+		}
+		if (cb) {
+			cb(fd.cFileName, arg);
+		}
+		count++;
+	} while (FindNextFileA(h, &fd));
+
+	FindClose(h);
+#else
+	DIR *dir = opendir(full);
+	struct dirent *ent;
+
+	if (!dir) {
+		return -1;
+	}
+
+	while ((ent = readdir(dir)) != NULL) {
+		if (ent->d_name[0] == '.' && (ent->d_name[1] == '\0'
+				|| (ent->d_name[1] == '.' && ent->d_name[2] == '\0'))) {
+			continue;
+		}
+		if (cb) {
+			cb(ent->d_name, arg);
+		}
+		count++;
+	}
+
+	closedir(dir);
+#endif
+
+	return count;
+}
+
+s32 fsChooseOutputDir(const char *name, char *dst, u32 dstSize)
+{
+	static const char *const roots[] = { "$E", "$S" };
+	u32 i;
+
+	for (i = 0; i < sizeof(roots) / sizeof(roots[0]); i++) {
+		snprintf(dst, dstSize, "%s/%s", roots[i], name);
+		if (fsFileSize(dst) < 0 && fsCreateDir(dst) != 0) {
+			continue;
+		}
+		if (fsPathIsWritable(fsFullPath(dst))) {
+			return 0;
+		}
+	}
+
+	dst[0] = '\0';
+	return -1;
+}
+
+s32 fsAddedContentDir(char *dst, u32 dstSize)
+{
+	static const char note[] =
+		"Place Perfect Dark XBLA packages and related added content here.\n"
+		"Texture packs go in texture-packs/. Mods go in mods/.\n";
+	char path[FS_MAXPATH + 1];
+	FILE *f;
+
+	if (fsChooseOutputDir(FS_ADDED_CONTENT_DIR, dst, dstSize) != 0) {
+		return -1;
+	}
+
+	snprintf(path, sizeof(path), "%s/WHAT GOES HERE.txt", dst);
+	if (fsFileSize(path) < 0) {
+		f = fsFileOpenWrite(path);
+		if (f) {
+			fwrite(note, 1, sizeof(note) - 1, f);
+			fclose(f);
+		}
+	}
+
+	return 0;
 }

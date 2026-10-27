@@ -2021,3 +2021,10 @@
 #else
 #define NUM_FILES 2013
 #endif
+
+#ifndef PLATFORM_N64
+#define NUM_FILE_SLOTS 4096
+#else
+#define NUM_FILE_SLOTS NUM_FILES
+#endif
+

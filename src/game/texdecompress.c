@@ -13,6 +13,7 @@
 #ifndef PLATFORM_N64
 #include "mod.h"
 #include "platform.h"
+#include "texpack.h"
 #endif
 
 struct texture *g_Textures;
@@ -2379,6 +2380,10 @@ void texLoad(texnum_t *updateword, struct texpool *pool, bool unusedarg)
 		}
 
 		*updateword = osVirtualToPhysical(tex->data);
+
+#ifndef PLATFORM_N64
+		texpackRegisterTexture(tex->data, tex->texturenum);
+#endif
 	}
 }
 

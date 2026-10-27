@@ -12,6 +12,7 @@
 #include "types.h"
 #ifndef PLATFORM_N64
 #include "video.h"
+#include "texpack.h"
 #endif
 
 void texSetBitstring(u8 *bitstring)
@@ -134,8 +135,9 @@ void texReset(void)
 		g_TexNumConfigs += tcptrs[i].count;
 	}
 
-	// reset backend texture cache
+	// reset backend texture cache and pack identity (pool addresses are invalid)
 	videoResetTextureCache();
+	texpackForgetAll();
 
 	// get backend texture settings
 	g_TexFilter2D = videoGetTextureFilter2D() ? G_TF_BILERP : G_TF_POINT;

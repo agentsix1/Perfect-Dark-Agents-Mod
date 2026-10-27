@@ -53,6 +53,10 @@ void titleSetNextMode(s32 mode);
 void titleTick(void);
 bool titleIsChangingMode(void);
 bool titleIsKeepingMode(void);
+#ifndef PLATFORM_N64
+bool titleIsBootSequence(void);
+#endif
+
 void titleExit(void);
 void titleInitFromAiCmd(u32 arg0);
 bool func0f01ad5c(void);

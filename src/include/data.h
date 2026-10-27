@@ -398,6 +398,8 @@ extern struct skeleton g_SkelDrCaroll;
 extern struct skeleton g_Skel22;
 extern struct skeleton g_SkelRobot;
 extern struct headorbody g_HeadsAndBodies[152];
+#define NUM_HEADSANDBODIES 152
+
 extern struct hatposition var8007dae4[1][6];
 extern f32 g_SkyCloudOffset;
 extern f32 g_SkyWindSpeed;

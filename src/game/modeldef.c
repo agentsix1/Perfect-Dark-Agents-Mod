@@ -23,6 +23,10 @@
 #include "lib/model.h"
 #include "data.h"
 #include "types.h"
+#ifndef PLATFORM_N64
+#include "xblamesh.h"
+#endif
+
 
 struct skeleton *g_Skeletons[] = {
 	&g_SkelChr,
@@ -195,6 +199,10 @@ struct modeldef *modeldefLoad(u16 fileid, u8 *dst, s32 size, struct texpool *arg
 
 	modelPromoteTypeToPointer(modeldef);
 	modelPromoteOffsetsToPointers(modeldef, 0x5000000, (uintptr_t) modeldef);
+#ifndef PLATFORM_N64
+	/* Match XBLA package mesh to this model while file id is still known. */
+	xblaMeshRegisterModel(modeldef, fileid);
+#endif
 	modeldef0f1a7560(modeldef, fileid, 0x5000000, modeldef, arg3, dst == NULL);
 
 	return modeldef;

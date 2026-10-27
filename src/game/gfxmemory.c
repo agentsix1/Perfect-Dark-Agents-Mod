@@ -12,6 +12,10 @@
 #include "data.h"
 #include "types.h"
 #include "platform.h"
+#ifndef PLATFORM_N64
+#include "xblamesh.h"
+#endif
+
 
 /**
  * This file handles memory usage for graphics related tasks.
@@ -210,6 +214,9 @@ void *gfxAllocate(u32 size)
 void gfxSwapBuffers(void)
 {
 	g_GfxActiveBufferIndex ^= 1;
+#ifndef PLATFORM_N64
+	xblaMeshFrameReset();
+#endif
 	g_GfxRequestedDisplayList = false;
 	g_GfxMemPos = g_VtxBuffers[g_GfxActiveBufferIndex];
 	g_GfxNumSwapsPerBuffer[g_GfxActiveBufferIndex] = g_GfxNumSwaps;

@@ -4057,6 +4057,11 @@
 #define STAGE_CREDITS       0x5c
 #define STAGE_4MBMENU       0x5d
 
+/** True for playable stages (not title / credits / pak menus). */
+#define STAGE_IS_LEVEL(s) \
+	((s) != STAGE_TITLE && (s) != STAGE_CREDITS \
+	 && (s) != STAGE_BOOTPAKMENU && (s) != STAGE_4MBMENU)
+
 #define STAGEFLAG_CI_IN_TRAINING            0x00000001
 #define STAGEFLAG_CI_HOLO_FAILED            0x00000002
 #define STAGEFLAG_CI_DEVICE_ABORTING        0x00000004

@@ -55,6 +55,11 @@ src/assets/*/fonts/*.bin
 src/assets/*/sequences/*.seq
 src/assets/*/textures/*.bin
 
+# HD texture packs + unpack cache (install locally; do not commit pack contents)
+/texture-packs/*
+!/texture-packs/.gitkeep
+/cache/texture-packs/
+
 # Runtime save / config dumps outside source
 eeprom.bin
 mpsetups.bin

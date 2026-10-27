@@ -17,6 +17,10 @@
 #include "lib/model.h"
 #include "data.h"
 #include "types.h"
+#ifndef PLATFORM_N64
+#include "xblamesh.h"
+#endif
+
 
 /**
  * -- Model Definitions --
@@ -3544,9 +3548,19 @@ void modelRender(struct modelrenderdata *renderdata, struct model *model)
 			modelRenderNodeChrGunfire(renderdata, model, node);
 			break;
 		case MODELNODETYPE_GUNDL:
+#ifndef PLATFORM_N64
+			if (xblaMeshRenderNode(renderdata, model, node)) {
+				break;
+			}
+#endif
 			modelRenderNodeGundl(renderdata, model, node);
 			break;
 		case MODELNODETYPE_DL:
+#ifndef PLATFORM_N64
+			if (xblaMeshRenderNode(renderdata, model, node)) {
+				break;
+			}
+#endif
 			modelRenderNodeDl(renderdata, model, node);
 			break;
 		case MODELNODETYPE_STARGUNFIRE:

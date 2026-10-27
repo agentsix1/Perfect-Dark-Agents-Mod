@@ -97,6 +97,14 @@
 #include "lib/vi.h"
 #include "types.h"
 #ifndef PLATFORM_N64
+#include "xblamesh.h"
+#include "xblaswitch.h"
+#include "xblaimport.h"
+#include "xblastage.h"
+#endif
+
+
+#ifndef PLATFORM_N64
 #include "net/net.h"
 #include "net/netmsg.h"
 #include "video.h"
@@ -305,6 +313,10 @@ void lvReset(s32 stagenum)
 	modelmgrSetLvResetting(true);
 	surfaceReset();
 	texReset();
+#ifndef PLATFORM_N64
+	xblaMeshResetModels();
+	xblaStageLevelReset();
+#endif
 	textReset();
 	hudmsgsReset();
 
@@ -1050,9 +1062,16 @@ Gfx *lvRender(Gfx *gdl)
 {
 	gSPSegment(gdl++, SPSEGMENT_PHYSICAL, 0x00000000);
 
+#ifndef PLATFORM_N64
+	xblaSwitchTick();
+	xblaImportTick();
+#endif
+
 #if VERSION >= VERSION_NTSC_1_0
 	func0f0d5a7c();
 #endif
+
+
 
 	if (g_Vars.stagenum == STAGE_TITLE
 			|| (g_Vars.stagenum == STAGE_TEST_OLD && titleIsKeepingMode())) {
@@ -1174,6 +1193,11 @@ Gfx *lvRender(Gfx *gdl)
 				setCurrentPlayerNum(playermgrGetPlayerAtOrder(i));
 				islastplayer = playercount == nextplayernum;
 			}
+
+#ifndef PLATFORM_N64
+			xblaMeshPassBegin();
+#endif
+
 
 			// Calculate bluramount - this will be used later
 			if (g_Vars.tickmode != TICKMODE_CUTSCENE) {

@@ -371,3 +371,31 @@ void mtxF2L(Mtxf *src, Mtxf *dst)
 	}
 #endif
 }
+
+#ifndef PLATFORM_N64
+/**
+ * Fold stage scale (scale_bg2gfx / var8005ef10) into a float matrix that
+ * skips mtxF2L — same scale the N64 path applies when converting to fixed.
+ */
+void mtxApplyGfxScale(Mtxf *mtx)
+{
+	s32 i;
+	f32 colscale;
+
+	if (!mtx) {
+		return;
+	}
+
+#ifndef GBI_FLOATS
+	colscale = var8005ef10[0] / 65536.0f;
+#else
+	colscale = var8005ef10[0];
+#endif
+	for (i = 0; i < 3; i++) {
+		mtx->m[0][i] *= colscale;
+		mtx->m[1][i] *= colscale;
+		mtx->m[2][i] *= colscale;
+		mtx->m[3][i] *= colscale;
+	}
+}
+#endif

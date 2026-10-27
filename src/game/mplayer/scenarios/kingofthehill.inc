@@ -818,11 +818,11 @@ Gfx *kohRenderHud(Gfx *gdl)
 	}
 
 	// Contested / still fighting for it = yellow.
-	// Exclusive hold while standing in it = green.
-	// Someone holds it and you're outside = red.
+	// Your team has exclusive claim (you or a teammate) = green.
+	// Enemy holds it and you're outside = red.
 	if (contested || (inhill && radarGetTeamIndex(chr->team) != g_ScenarioData.koh.occupiedteam)) {
 		colour = 0xffff00a0;
-	} else if (inhill) {
+	} else if (occupied && radarGetTeamIndex(chr->team) == g_ScenarioData.koh.occupiedteam) {
 		colour = 0x00ff00a0;
 	} else {
 		colour = 0xff0000a0;

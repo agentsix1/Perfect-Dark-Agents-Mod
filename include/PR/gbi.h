@@ -253,6 +253,9 @@
 #define G_MTX_LOAD       0x02
 #define G_MTX_NOPUSH     0x00 /* push or not */
 #define G_MTX_PUSH       0x04
+#ifndef PLATFORM_N64
+#define G_MTX_FLOATS     0x80
+#endif
 
 /*
  * flags for G_SETGEOMETRYMODE

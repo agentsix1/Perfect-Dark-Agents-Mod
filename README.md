@@ -16,7 +16,7 @@ A community mod / netplay fork of the [Perfect Dark PC port](https://github.com/
 1. [Read this first](#read-this-first)
 2. [What is this?](#what-is-this)
 3. [Supported ROM](#supported-rom)
-4. [What’s working (high level)](#whats-working-high-level)
+4. [What’s working (high level)](#what-s-next---goals-)
 5. [Network play](#network-play)
 6. [Changelog](#changelog)
 7. [Running the game](#running-the-game)
@@ -43,10 +43,14 @@ If you just want a stable single-player / split-screen experience, use the regul
 
 **Perfect Dark Agents Mod \[Full Net Support\]** builds on the early `port-net` netplay work and keeps pushing Combat Sim online further:
 
-- Host–client network matches (Combat Simulator)
-- Scenario modes over the network (not just plain Combat)
-- Challenge hosting / completion tracking improvements
-- Lots of crash, desync, and “host thinks you left the hill” style fixes
+- Full Classic Combat Simulator Support
+- Fully Suppported Simulants (AI's)
+- All Scenarios (Gamemodes) Support
+- All Challenges Support
+- Quality of life changes
+- Additional Scenario Support
+- HD Texture Support
+- XBLA Texture Support
 
 Under the hood it is still the Perfect Dark decompilation port. The goal of *this* README / mod branding is to make the net-focused work easier to find and understand.
 
@@ -71,24 +75,28 @@ Everyone in a net game must use the **same** ROM. Mixing regions will break thin
 
 ---
 
-## What’s working (high level)
+## What’s Next? (Goals)
 
-### From the base PC port
+- Add support for players to host and play with out port forwarding
+- Maintain full support for Port Forwarding
+- Co-op Support
+- Continue QOL Changes
+- Continue Bug/Crash Support
+- Additional Scenario's 
+- Ability to add or remove hills, terminal locations, gun locations, etc.
 
-- Single-player and local split-screen Combat Sim
-- Mouse look, widescreen, FOV options, 60 FPS (and experimental uncapped tickrate)
-- Controller support, remappable controls, basic mod loading
-- Transfer Pak cheat unlock emulation (optional GBC ROM)
+## Lofty Goals? (Thoughts but not something I expect to do)
 
-### Added / improved for this net mod
+- Map Editor (The ability to create our own maps)
+*I have yet to check if there is something public like this. But if there isnt I think this would be cool*
+- Scripting language to create scenarios/gamemodes
+- Scripting language to create basic game modfications
+- External Server Support
 
-- Network Combat Simulator (host + join)
-- Scenario modes online (King of the Hill, Hacker Central, Hold the Briefcase, Pop a Cap, Capture the Case, and more)
-- Challenge matches that can be hosted online
-- Better sync for pickups, objectives, timers, and lobby settings
-- Many crash / freeze / “phantom item” fixes while playing online
+## Things I dont plan to do!
 
-**Still experimental:** expect bugs. Sims, some weapons, and edge cases are incomplete. See the [changelog](#changelog) for what landed in `v0.0.1`.
+- Anti Cheat
+*I have no intrest in making a anti cheat for this at thiss time. I have no knowledge in this realm and have no intrest in learning. But if others want to create them. By all means I am here to support you!*
 
 ---
 
@@ -119,46 +127,100 @@ More technical detail lives in [`docs/netplay.md`](docs/netplay.md). Short versi
 
 ---
 
+## HD texture packs
+
+This build can load **N64-style** HD packs compatible with [Perfect Dark Plus HD Textures](https://github.com/retro-foundry/Perfect-Dark-Plus-HD-Textures) (same layout as Dab’s Mod). Packs are **local visuals only** — each player picks their own; nothing is synced over the network.
+
+### Install (Phase 1 — N64 packs)
+
+The game creates a `texture-packs` folder next to the executable (portable) or under the save directory on first launch.
+
+1. Drop a pack into `texture-packs/` as either:
+   - a **`.zip`** (recommended — keeps the folder tidy), e.g. `PD.Forever.Plus.HD.v0.10.zip`, or
+   - an **extracted folder**, e.g. `PD Forever Plus HD/` with `0001.png`, …
+2. In-game: **Extended Options → Video → Texture Pack** and choose the pack (or **Default** for built-in ROM textures).
+3. Choice is saved in `pd.ini` as `Mod.TexturePack=` (empty / missing = Default).
+
+Zips are unpacked once into `cache/texture-packs/<name>/` on first select (or when the zip changes). That can take a minute for large packs like Forever Plus (~300MB). A Perfect Dark–themed loading screen appears while unpacking; warm starts with a valid cache skip it.
+
+If the folder is empty, the pack is missing, or a texture has no replacement file, the game always falls back to **ROM textures** — never blank materials.
+
+**Recommended N64 pack:** [PD Forever Plus HD](https://github.com/retro-foundry/Perfect-Dark-Plus-HD-Textures). Credits: Retro Foundry / Perfect Dark Plus.
+
+### Xbox 360 (XBLA) package + Ultimate / XBLA Plus packs
+
+Meshes, rooms, and HD record textures from the official XBLA release are supported (ported from [Dab’s Mod](https://github.com/DabDavis/perfect-dark-dabs-mod)).
+
+1. Create / use **`added-content/`** next to the executable (or under the save directory). Drop the Perfect Dark XBLA **`.7z`** (or its unpacked package / STFS) there. Legacy `xbla/` is still searched.
+2. First use unpacks once into **`cache/xbla/`** (heavy; shows a loading screen).
+3. **Extended Options → Video:** enable **XBLA Meshes**, **XBLA Textures**, and optionally **XBLA Rooms**. F6 toggles the whole release (`Mod.XblaMeshKey`).
+4. Select an **Ultimate Plus / XBLA Plus** pack under **Texture Pack**. Pack folders `pd-xbla/` / `xbla/` replace package art by record; numbered PNGs still override ROM textures.
+
+`pd.ini` keys: `Mod.XblaMeshes`, `Mod.XblaTextures`, `Mod.XblaStages` (and related Dab keys the loaders register).
+
+#### Netplay: host-authoritative hitboxes
+
+Combat Sim damage is already decided on the **host**. XBLA mesh triangle hits run only **offline or on `NETMODE_SERVER`**. Clients draw their own meshes/packs but never use local XBLA geometry for shot resolution — `SVC_CHR_DAMAGE` from the host wins.
+
+If the host stays on Default (N64) geometry and a client draws larger XBLA models (or the reverse), aim / silhouettes can disagree visually. That is intentional: hits follow the host’s loaded geometry, not each viewer’s pack.
+
+---
+
+
 ## Changelog
+
+### Experimental v0.0.2
+
+>Still **experimental**. Matches can crash or desync. This is a milestone tag, not a release quality claim.
+
+**Features Added**
+- Added HD Texture Support
+*You can download textures at https://github.com/retro-foundry/Perfect-Dark-Plus-HD-Textures/releases*
+
+*My texture support code was refrenced from https://github.com/DabDavis/perfect-dark-dabs-mod*
+
+**Bug Fixes**
+- Hills not improperly detecting players
+- Timer text wrong color when teamate owns hill
+
 
 ### Experimental v0.0.1
 
-First Agents Mod changelog versus the early upstream `port-net` baseline. Written for players, not engineers.
+#### Network Play/Online Multiplayer Mode
 
-#### Big picture
+>Still **experimental**. Matches can crash or desync. This is a milestone tag, not a release quality claim.
 
-- Turned “barely working Combat over the net” into a broader **Combat Sim net** attempt: scenarios, challenges, lobby settings, and a pile of stability fixes.
-- Still **experimental**. Matches can crash or desync. This is a milestone tag, not a release quality claim.
+- Added ability allow other players to edit changes to the match
+- Added ability for playerse to see the current settings of the match
+- Added Challenges that count towards stars
+- Added proper explosion support
+- Added proper laptop gun support
+- Added every scenario!
+- Added support for props on glass should fall to the next solid object below when glass is broken
+- Glass is now properly synced between all players
+- Bullet Holes are now properly synced between all players
+- Paintball bullets are now properly synced between all players
+- Added support to play with simulants
+- Added all proper animations for all players
+- Added a waiting screen for when a player ends the match instead of just having the game end when a player leaves
 
-#### Multiplayer / online feel
+**King of the Hill**
+- Added a new hill to to "Grid" map
+- Added ability to change how long it takes to claim hill
+- Added timer to screen showing if the hill is being contested/is being claimed
+- Added sound for when some one enters the hill contesting the hill
 
-- Host runs the match; clients follow the host’s world (fewer “I shot you / no you didn’t” surprises for objectives).
-- Lobby settings (teams, scenario options, etc.) are shared so clients can see what the host set up — even when only the host can edit.
-- Challenges can be hosted online; finishing one can count toward your challenge stars (1–4 players → 1st–4th star), and that progress is saved.
-- Kill feed / match feedback and some explosion effects (like laptop blow-ups) show up for everyone more reliably.
+**Hacker Central**
+- Added ability to make the terminal move after a successful hack
+- Added ability to change how long it takes to hack
 
-#### Scenario modes (the fun game types)
+**Hold the Briefcase**
+- Added a timer for all players that shows how long the player who is holding the case has left
+- Added ability to change how long you have to hold the case before getting a point
 
-- **King of the Hill** — hills light and claim more reliably (including maps that used to show a radar blip but no real hill). Brief network lag is less likely to reset your hill timer while you’re still standing in it.
-- **Hacker Central** — terminals / uplink pickup sync better; fewer phantom uplinks, empty inventories, or host crashes when grabbing the device. Optional **Mobile Computer** (terminal can move after a successful hack). Mid-hack lag is less likely to instantly break the download.
-- **Hold the Briefcase** — briefcase ownership and the hold timer behave better online; timer display is clearer (including when you’re not the carrier). Case/weapons are less likely to float on broken glass.
-- **Pop a Cap** — “who is the target” is fairer and more stable for the host (less stuck / flashing host-as-cap nonsense).
-- **Capture the Case** and other non-Combat setups — fewer “everything broke after challenges” style pad/desync failures.
-
-#### Stability & “it just stopped working” fixes
-
-- Lots of host/client crash and freeze paths cleaned up (bad prop deletes, dangling models, corrupted scenario memory, etc.).
-- Leaving a match / host disconnect is less likely to leave the menu shaking forever.
-- Glass breaks drop resting props properly instead of leaving gear hanging in the air.
-- Team-colored menu title bars when teams are on (easier to tell who’s who in the lobby UI).
-
-#### What we are *not* claiming yet
-
-- A polished 8-player experience
-- Perfect gun / rocket / cloak sync
-- Simulants (bots) in net matches
-- Support beyond **NTSC Final**
-- “Ready for public matchmaking”
+**Pop a Cap**
+- Added a time for all players that shows how long the player has left to get a point
+- Added the ability to change how long the player has to be the cap to score a point
 
 ---
 
@@ -252,6 +314,8 @@ You still need your own legally obtained Perfect Dark ROM to run the game. The R
 - Mouse Injector & 1964GEPD authors for FPS / mouselook work
 - Raf (64-bit), NicNamSam (icon), and everyone who filed issues, PRs, and test reports
 - Agents Mod netplay testers and contributors working on Combat Sim online
+- [Retro Foundry](https://github.com/retro-foundry) / Perfect Dark Plus HD texture packs
+- DabDavis / perfect-dark-dabs-mod (texture-pack loader reference)
 
 ---
 

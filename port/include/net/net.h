@@ -310,4 +310,10 @@ s32 netPropIsQueuedForDelete(const struct prop *prop);
 
 Gfx *netDebugRender(Gfx *gdl);
 
+/** Dab host-look bits for XBLA room collision (unused here — always false). */
+#define NETLOOK_XBLATILES 0x01
+s32 netLookData(u32 *out);
+void netStageHashNote(s32 loadtype, u32 crc, u32 len);
+
 #endif // _IN_NET_H
+

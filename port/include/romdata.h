@@ -26,4 +26,15 @@ u32 romdataFileGetEstimatedSize(const u32 size, const u32 loadtype);
 
 s32 romdataCheckGbcRom(void);
 
+#ifndef PLATFORM_N64
+/** Bumps when the loaded file set changes (mod swap); XBLA caches key off it. */
+s32 romdataFilesGeneration(void);
+s32 romdataFileIsStock(s32 fileNum);
+/** Dab: XBLA mesh id for a stock file, or 0. */
+s32 romdataFileGetXblaId(s32 fileNum);
+/** Dab: which overlay mod directory owns a replaced file, or -1. */
+s32 romdataFileGetModDir(s32 fileNum);
 #endif
+
+#endif
+

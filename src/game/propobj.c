@@ -76,6 +76,11 @@
 #include "data.h"
 #include "textures.h"
 #include "types.h"
+#ifndef PLATFORM_N64
+#include "xblamesh.h"
+#include "net/net.h"
+#endif
+
 #include "string.h"
 #ifndef PLATFORM_N64
 #include "net/net.h"
@@ -2920,10 +2925,21 @@ bool func0f06bea0(struct model *model, struct modelnode *endnode, struct modelno
 
 	g_Vars.hitboundscount = 0;
 
+#ifndef PLATFORM_N64
+	xblaMeshHitBegin();
+#endif
+
 	while (node) {
 		u32 type = node->type & 0xff;
 		s4 = NULL;
 		s6 = NULL;
+
+#ifndef PLATFORM_N64
+		/* XBLA mesh covers this list — test release triangles after the walk. */
+		if ((type == MODELNODETYPE_DL || type == MODELNODETYPE_GUNDL) && xblaMeshHitSkipsNode(model, node)) {
+			type = 0;
+		}
+#endif
 
 		switch (type) {
 		case MODELNODETYPE_BBOX:
@@ -3022,6 +3038,24 @@ bool func0f06bea0(struct model *model, struct modelnode *endnode, struct modelno
 			}
 		}
 	}
+
+#ifndef PLATFORM_N64
+	/* Host/offline only — clients keep N64 walk; SVC_CHR_DAMAGE is authoritative. */
+	if (g_NetMode != NETMODE_CLIENT) {
+		struct modelnode *meshbbox = NULL;
+		struct modelnode *meshnode = NULL;
+		s32 meshpart = 0;
+
+		if (xblaMeshHitTest(model, arg3, &sp74, arg4, &sp98, arg5, &meshbbox, &meshpart, &meshnode)) {
+			ok = true;
+			sp88 = meshnode;
+			*arg7 = meshbbox;
+			*hitpart = meshpart;
+			g_Vars.hitboundscount = 1;
+			g_Vars.hitnodes[0] = meshbbox;
+		}
+	}
+#endif
 
 	if (ok) {
 		*arg6 = sqrtf(sp98);

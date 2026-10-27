@@ -16,4 +16,18 @@ void *modAnimationLoadData(u16 num);
 
 void *modSequenceLoad(u16 num, u32 *outSize);
 
+#ifndef PLATFORM_N64
+static inline s32 modSetTextureFromStage(s32 on)
+{
+	(void)on;
+	return 0;
+}
+static inline s32 modSetTextureSourceMod(s32 dir)
+{
+	(void)dir;
+	return -1;
+}
 #endif
+
+#endif
+

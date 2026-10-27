@@ -24,6 +24,8 @@
 #include <PR/gbi.h>
 
 #include "platform.h"
+#include "texpack.h"
+#include "xblatex.h"
 
 #include "gfx_pc.h"
 #include "gfx_cc.h"
@@ -585,6 +587,55 @@ void gfx_texture_cache_delete(const uint8_t* orig_addr) {
     }
 }
 
+/**
+ * Pad a pack image into the N64 tile's padded row shape so UVs do not stretch
+ * across unused padding (Dab gfx_pad_replacement).
+ */
+static uint8_t *gfx_pad_replacement(uint8_t *rep, int32_t *rep_width, int32_t *rep_height,
+        uint32_t tile_w, uint32_t tile_h, uint32_t pad_w, uint32_t pad_h)
+{
+    const uint32_t w = (uint32_t)*rep_width;
+    const uint32_t h = (uint32_t)*rep_height;
+
+    if ((tile_w == pad_w && tile_h == pad_h) || tile_w == 0 || tile_h == 0
+            || tile_w > pad_w || tile_h > pad_h || w == 0 || h == 0) {
+        return rep;
+    }
+
+    if ((uint64_t)w * pad_h == (uint64_t)h * pad_w) {
+        return rep;
+    }
+
+    const uint32_t out_w = (uint32_t)std::lround((double)w * pad_w / tile_w);
+    const uint32_t out_h = (uint32_t)std::lround((double)h * pad_h / tile_h);
+
+    if (out_w < w || out_h < h || out_w > 16384 || out_h > 16384) {
+        return rep;
+    }
+
+    uint8_t *out = (uint8_t *)malloc((size_t)out_w * out_h * 4);
+    if (!out) {
+        return rep;
+    }
+
+    for (uint32_t y = 0; y < out_h; y++) {
+        const uint8_t *src = rep + (size_t)(y < h ? y : h - 1) * w * 4;
+        uint8_t *dst = out + (size_t)y * out_w * 4;
+        memcpy(dst, src, (size_t)w * 4);
+        for (uint32_t x = w; x < out_w; x++) {
+            memcpy(dst + (size_t)x * 4, src + (size_t)(w - 1) * 4, 4);
+        }
+    }
+
+    /* Always free the input — it may be a keep-store pointer (no-op) or malloc'd pad result */
+    texpackFreeReplacement(rep);
+    /* If free was a no-op, we still own a separate out buffer; if free worked on a
+     * non-kept malloc we'd have a problem only for non-kept — pad always gets keep or fresh. */
+    *rep_width = (int32_t)out_w;
+    *rep_height = (int32_t)out_h;
+    return out;
+}
+
 static void import_texture_rgba16(int tile, const LoadedTexture& loaded_texture, bool importReplacement) {
     const RawTexMetadata* metadata = &loaded_texture.raw_tex_metadata;
     const uint8_t* addr = loaded_texture.addr;
@@ -883,6 +934,65 @@ static void import_texture(int i, int tile, bool importReplacement) {
         return;
     }
 
+    /* XBLA mesh stand-in tiles (record address) — ahead of numbered packs. */
+    if (xblaTexHaveTextures()) {
+        int32_t rep_width = 0;
+        int32_t rep_height = 0;
+        uint8_t *rep = xblaTexLoadReplacement(orig_addr, &rep_width, &rep_height);
+        if (rep) {
+            gfx_rapi->upload_texture(rep, (uint32_t)rep_width, (uint32_t)rep_height);
+            xblaTexFreeReplacement(rep);
+            return;
+        }
+    }
+
+    /* HD texture pack replacement (ROM path unchanged when NULL). */
+    if (texpackHaveReplacements()) {
+        int32_t rep_width = 0;
+        int32_t rep_height = 0;
+        uint8_t *rep = texpackLoadReplacement(orig_addr, &rep_width, &rep_height);
+        if (rep) {
+            const uint32_t tex_row_bytes = loaded_texture.line_size_bytes;
+            const uint32_t pad_w = tex_row_bytes ? (tex_row_bytes * 2) >> siz : 0;
+            const uint32_t pad_h = tex_row_bytes ? loaded_texture.size_bytes / tex_row_bytes : 0;
+            const uint32_t tile_w = rdp.texture_tile[tile].width;
+            const uint32_t tile_h = rdp.texture_tile[tile].height;
+            uint8_t *upload = gfx_pad_replacement(rep, &rep_width, &rep_height,
+                    tile_w, tile_h, pad_w, pad_h);
+            gfx_rapi->upload_texture(upload, (uint32_t)rep_width, (uint32_t)rep_height);
+            if (upload != rep) {
+                free(upload);
+            }
+            texpackFreeReplacement(rep);
+            return;
+        }
+    }
+
+    /* XBLA package numbered textures when the pack has no file for this number. */
+    if (xblaTexHaveNumbered()) {
+        const int32_t texturenum = texpackGetTextureNum(orig_addr);
+        if (texturenum >= 0 && !texpackHaveReplacementFor(texturenum)) {
+            int32_t rep_width = 0;
+            int32_t rep_height = 0;
+            uint8_t *rep = xblaTexLoadNumbered(texturenum, &rep_width, &rep_height);
+            if (rep) {
+                const uint32_t tex_row_bytes = loaded_texture.line_size_bytes;
+                const uint32_t pad_w = tex_row_bytes ? (tex_row_bytes * 2) >> siz : 0;
+                const uint32_t pad_h = tex_row_bytes ? loaded_texture.size_bytes / tex_row_bytes : 0;
+                const uint32_t tile_w = rdp.texture_tile[tile].width;
+                const uint32_t tile_h = rdp.texture_tile[tile].height;
+                uint8_t *upload = gfx_pad_replacement(rep, &rep_width, &rep_height,
+                        tile_w, tile_h, pad_w, pad_h);
+                gfx_rapi->upload_texture(upload, (uint32_t)rep_width, (uint32_t)rep_height);
+                if (upload != rep) {
+                    free(upload);
+                }
+                xblaTexFreeReplacement(rep);
+                return;
+            }
+        }
+    }
+
     if (fmt == G_IM_FMT_RGBA) {
         if (siz == G_IM_SIZ_16b) {
             import_texture_rgba16(tile, loaded_texture, importReplacement);
@@ -963,19 +1073,25 @@ static void gfx_sp_matrix(uint8_t parameters, const int32_t* addr) {
     float matrix[4][4];
 
 #ifndef GBI_FLOATS
-    // Original GBI where fixed point matrices are used
-    for (int i = 0; i < 4; i++) {
-        for (int j = 0; j < 4; j += 2) {
-            int32_t int_part = addr[i * 2 + j / 2];
-            uint32_t frac_part = addr[8 + i * 2 + j / 2];
-            matrix[i][j] = (int32_t)((int_part & 0xffff0000) | (frac_part >> 16)) / 65536.0f;
-            matrix[i][j + 1] = (int32_t)((int_part << 16) | (frac_part & 0xffff)) / 65536.0f;
+    /* Dab/XBLA: G_MTX_FLOATS payloads are float[4][4], not N64 s15.16. */
+    if (parameters & G_MTX_FLOATS) {
+        memcpy(matrix, addr, sizeof(matrix));
+    } else {
+        // Original GBI where fixed point matrices are used
+        for (int i = 0; i < 4; i++) {
+            for (int j = 0; j < 4; j += 2) {
+                int32_t int_part = addr[i * 2 + j / 2];
+                uint32_t frac_part = addr[8 + i * 2 + j / 2];
+                matrix[i][j] = (int32_t)((int_part & 0xffff0000) | (frac_part >> 16)) / 65536.0f;
+                matrix[i][j + 1] = (int32_t)((int_part << 16) | (frac_part & 0xffff)) / 65536.0f;
+            }
         }
     }
 #else
     // For a modified GBI where fixed point values are replaced with floats
     memcpy(matrix, addr, sizeof(matrix));
 #endif
+
 
     if (parameters & G_MTX_PROJECTION) {
         if (parameters & G_MTX_LOAD) {
