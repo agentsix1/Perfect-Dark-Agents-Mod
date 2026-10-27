@@ -16,7 +16,7 @@ A community mod / netplay fork of the [Perfect Dark PC port](https://github.com/
 1. [Read this first](#read-this-first)
 2. [What is this?](#what-is-this)
 3. [Supported ROM](#supported-rom)
-4. [What’s working (high level)](#whats-next-goals)
+4. [What’s Next? (Goals)](#whats-next-goals)
 5. [Network play](#network-play)
 6. [Changelog](#changelog)
 7. [Running the game](#running-the-game)
