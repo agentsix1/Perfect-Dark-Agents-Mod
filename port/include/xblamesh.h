@@ -1,0 +1,444 @@
+#ifndef _IN_XBLAMESH_H
+#define _IN_XBLAMESH_H
+
+#include <stdio.h>
+#include <PR/ultratypes.h>
+#include "types.h"
+
+struct objmesh;
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+struct xblameshbuilt;
+
+// For handtint.c: the mesh a model draws from in this look, and what its build
+// read off it (xblamesh.c's xblaMeshAnalyse())
+struct xblameshbuilt *xblaMeshAnalysedForModel(const struct modeldef *def);
+s32 xblaMeshAnalysedTextures(const struct xblameshbuilt *m, const void ***outtex, const u16 **outbones);
+s32 xblaMeshAnalysedBoneColour(const struct xblameshbuilt *m, s32 bone, f32 *rgb, f32 *weight);
+
+/**
+ * Drawing the XBLA release's high resolution meshes in place of the game's own
+ * display lists.
+ *
+ * The console release is the N64 game with its art replaced, and the models it
+ * replaced are 596 files in 4J's own format sitting past the game's file ids in
+ * the package's PackedSegFile. What says which one stands in for what is a mesh
+ * id 4J wrote into the two padding bytes after `struct modelnode`'s type, which
+ * this port has never read - see CLAUDE-notes/xbla.md for the format and for
+ * how all of it was checked.
+ *
+ * Two things shape this more than they look like they should.
+ *
+ * **The id is in their model file, not ours.** Our copy of a model comes from
+ * the ROM and its padding is zero, so the ids have to be read out of the
+ * release's copy of the same file and matched up node for node. They cannot be
+ * matched by file offset: the port rewrites a model file into native pointers
+ * as it loads it (filemodel.c), so a node sits somewhere else in our buffer
+ * than in theirs, and a 64-bit build moves it further. The two trees are walked
+ * together instead, and a model whose shape does not match is left alone.
+ *
+ * **The geometry is in the model's own space, 1:1.** 4J kept Perfect Dark's
+ * coordinates: an Area 51 crate is 100 units across in the ROM and 100 units
+ * across in their mesh, and a lab door 4000 by 2800 in both. So a mesh needs no
+ * transform of its own - it is drawn under the node's matrix like the display
+ * list it replaces - and the floats quantise back to the s16 the game's own
+ * vertices already are without losing anything.
+ *
+ * What it draws with is an ordinary Perfect Dark display list built once per
+ * mesh, so the renderer, the cull modes and everything else downstream need
+ * no changes at all. The one liberty taken is the size of a
+ * vertex batch: `gSP1Triangle` multiplies its indices by 10 into a byte, so a
+ * batch is 25 vertices rather than the 16 the real microcode's cache holds.
+ * That is a lie the RSP would not accept and the renderer does not care about,
+ * and it is why none of this is built for PLATFORM_N64.
+ */
+
+/** Whether a package with meshes in it was found. */
+s32 xblaMeshIsAvailable(void);
+
+/** Mod.XblaMeshes: whether to draw them. Off unless the player asks. */
+s32 xblaMeshGetEnabled(void);
+s32 xblaMeshPackageReady(s32 mayUnpack);
+
+/**
+ * A live switch either way, in a level as much as out of one: switching it on
+ * matches every model the stage has already loaded, which is what the loaded
+ * list in xblamesh.c is kept for. On a machine whose package is still inside
+ * its archive, this is also where the archive comes apart.
+ */
+void xblaMeshSetEnabled(s32 enabled);
+
+/**
+ * The key that used to switch this alone is xblaswitch.h's now, and switches
+ * every part of the release together - the meshes among them.
+ */
+
+/**
+ * Drops everything keyed on a model - the node registry, the palette uses, the
+ * list of what is loaded - because the stage pool holding all of those
+ * addresses has just been handed back. Called from lvReset(), beside the
+ * texture ids that go for the same reason. Built meshes are keyed on a slot in
+ * the package and stay.
+ *
+ * A backstop rather than the guard: memory is recycled inside a stage too, and
+ * that is caught at the load that recycles it (xblaMeshRegisterModel). What is
+ * left for this is the entries of models that are never loaded again.
+ */
+void xblaMeshResetModels(void);
+
+/**
+ * The meshes were switched on in a level that could not have any: the player's
+ * copy was still inside its archive as the level loaded, so nothing in it was
+ * matched, and it was this switch that took the archive apart. The level after
+ * this one has the meshes like anybody else's.
+ *
+ * The one thing about either checkbox that is not obvious from watching it,
+ * and true for exactly as long as it is true - xblaMeshResetModels() clears it
+ * at lvReset(), before the next stage's models load.
+ */
+s32 xblaMeshModelsAreLate(void);
+
+/**
+ * A model has just been loaded and its pointers made real: note which of its
+ * nodes the release replaces, and with what.
+ *
+ * Called from modeldefLoad(), which is the one place that has the file id, the
+ * buffer and a promoted tree at the same time.
+ *
+ * Called for every model whether or not the meshes are switched on, which is
+ * what makes switching them on a live thing to do, and so also for models the
+ * release has no copy of. Those matter too: this is where a model drops
+ * anything registered against the memory it has just been given, which is the
+ * only thing standing between a reused modeldef and the meshes of whatever
+ * held that address before it.
+ */
+void xblaMeshRegisterModel(struct modeldef *modeldef, u16 fileid);
+
+/**
+ * Builds the GoldenEye character mesh a just-registered model draws, in the
+ * look being drawn, as its first draw would (the result is the same cache):
+ * 1 built, 0 failed (gebeanBuildFailed() has been told), -1 nothing to build.
+ */
+s32 xblaMeshPrebuildBean(struct modeldef *modeldef);
+
+/**
+ * Building a GoldenEye stage's HD meshes while it loads (hdpreload.c): on, a
+ * model that registers has its mesh built there and then (xblaMeshPrebuildBean()).
+ * xblaMeshPreloadModelFile() loads a model the stage has not - a gun's
+ * first-person model - into memory of its own, builds its mesh and lets the
+ * model go again: 1 when a mesh was built. Stats: meshes built and time spent
+ * since it was switched on.
+ */
+void xblaMeshPreloadSet(s32 on);
+s32 xblaMeshPreloading(void);
+void xblaMeshPreloadStats(s32 *built, u64 *us);
+s32 xblaMeshPreloadModelFile(u16 fileid);
+
+/**
+ * Draws a node from the release's mesh instead of its own display list.
+ *
+ * Returns 0 when there is nothing to draw it from, and the caller carries on
+ * with the game's geometry.
+ */
+s32 xblaMeshRenderNode(struct modelrenderdata *renderdata, struct model *model,
+		struct modelnode *node);
+
+/**
+ * After xblaMeshRenderNode() has drawn a node: the node's own lists cut down to
+ * the triangles its mesh leaves out (the Cradle helicopter's pilot), for
+ * model.c to draw as the node's own, or 0 for none.
+ */
+s32 xblaMeshKeptLists(struct model *model, struct modelnode *node, Gfx **opa, Gfx **xlu);
+
+/**
+ * A frame is starting: the vertices posed for the last one are two frames old
+ * and their arena can be reused.
+ */
+void xblaMeshFrameReset(void);
+
+/**
+ * A player's view is starting (lvRender's loop): what a mesh keeps for the
+ * frame (its pose, its GPU palette, the matrix they are drawn under) is kept
+ * for this view only. The matrix is a copy of the model's, which each view
+ * computes under its own camera.
+ */
+void xblaMeshPassBegin(void);
+
+/**
+ * Shots tested against the release's triangles rather than the N64's, for
+ * func0f06bea0() (propobj.c): Begin() at the top of its walk, SkipsNode() for
+ * each list it passes (nonzero: the stock list is not drawn, so is not tested),
+ * Test() after the walk - nonzero when a mesh triangle is nearer than *sqdist,
+ * which it lowers, with the hit, the bbox it counts against, that bbox's part
+ * and the list node. ModelHasMesh() is the callers' gate: a model whose mesh
+ * is drawn is worth tracing even when no N64 bbox was hit, since the release's
+ * geometry is not the N64's shape.
+ */
+struct hitthing;
+void xblaMeshHitBegin(void);
+s32 xblaMeshHitSkipsNode(struct model *model, struct modelnode *node);
+s32 xblaMeshModelHasMesh(struct model *model);
+
+/**
+ * How far a held item is moved in its hand's space to sit in the GoldenEye XBLA
+ * character's hand rather than GoldenEye's N64 one; 0 where there is none.
+ */
+s32 xblaMeshHeldOffset(struct model *model, struct modelnode *handnode, f32 out[3]);
+
+/**
+ * chrBruise() (chr.c) is bruising the model at pos, in bboxnode's own space,
+ * with the bruise's alpha: the release's mesh takes the bruise where the shot
+ * landed rather than at the stock vertex nearest it. See "Wounds" in
+ * xblamesh.c.
+ */
+void xblaMeshNoteBruise(struct model *model, struct modelnode *bboxnode, const struct coord *pos, s32 alpha);
+
+/**
+ * Whether the release's mesh draws a model of this definition, building it if
+ * nothing has yet. For a caller deciding how to draw before it draws: HasMesh()
+ * answers only for a mesh already built, and only for nodes linked into the
+ * tree, which leaves out everything under a toggle that is switched off. The
+ * title asks it once as the Rare logo and the cube start (the XBLA switch is held still
+ * for the boot sequence), since it walks the whole node table.
+ */
+s32 xblaMeshModeldefDrawsMesh(const struct modeldef *modeldef);
+
+// Whether a model draws a built GoldenEye release mesh (gebean.c's) in place of its own lists
+s32 xblaMeshModelDrawsBean(struct model *model);
+
+/**
+ * While on, xblaMeshRenderNode() leaves every node to the game, so a model the
+ * release has a mesh for draws exactly as the N64 draws it: the mesh is not
+ * drawn and nothing it covers is suppressed. For a caller that wants both
+ * pictures of one model on different frames - the title shares the Nintendo
+ * logo's slot between the release's Microsoft Game Studios mesh and the N64's
+ * own Nintendo logo. Set it round the modelRender() call and clear it after.
+ */
+void xblaMeshSetBypass(s32 on);
+
+/**
+ * Which of a faded body's two passes (chrRender(): G_DEPTH_PREPASS_EXT, then
+ * G_DEPTH_FRONT_EXT) the models drawn now are in: XBLAMESH_DEPTHPASS_*. The
+ * soft spans (hair, lenses) draw differently in each - see
+ * xblaMeshRenderNode(). Set round the passes and cleared after.
+ */
+#define XBLAMESH_DEPTHPASS_NONE  0
+#define XBLAMESH_DEPTHPASS_DEPTH 1
+#define XBLAMESH_DEPTHPASS_FRONT 2
+void xblaMeshSetDepthPass(s32 pass);
+
+/**
+ * While cycle2 is non-zero, every mesh list drawn in the opaque pass takes this
+ * render mode instead of the one its node wrote - the second cycle, with the
+ * node's first cycle kept (onecycle for a one-cycle node). For the title's 4J
+ * cubes, which fade the way the release does: a depth-only pass and then a
+ * blended pass that only colours the nearest surface. Set it round the
+ * modelRender() call and clear it after with zeroes.
+ */
+void xblaMeshSetOpaqueMode(u32 cycle2, u32 onecycle);
+
+/**
+ * While on, the model being drawn is an object with OBJFLAG_ORTHOGONAL, which
+ * objRenderProp() draws under the player's `orthomtxl` projection and whose
+ * matrices it rewrites after listing them (player0f0c3320()), from the view
+ * space they are listed in to the world-relative space that projection takes.
+ * A float copy of one of those matrices made while listing - a pose's divided
+ * matrix, a rest offset taken off - stays in view space, and is turned by the
+ * camera twice. Set it round the modelRender() call and clear it after.
+ */
+void xblaMeshSetOrthogonal(s32 on);
+
+/**
+ * While set, the model is a monitor whose screens tvscreenRender() has just
+ * written, and a GoldenEye mesh leaves those nodes to the game: the programme
+ * on the screen rather than Bean's still picture of one. Set it round the
+ * modelRender() call and clear it after with NULL.
+ */
+void xblaMeshSetScreens(struct model *model);
+
+/**
+ * tvscreenRender()'s corners for a monitor's screen node, moved onto the
+ * screen of Bean's HD model when that is what the model is drawn as and its
+ * screen is not GoldenEye's quad (gebean.c's beanScreenFit()); left alone
+ * otherwise. True when the programme lies on the back of Bean's own recess
+ * for the screen (beanScreenFace()) and is to be drawn over it as a decal.
+ */
+s32 xblaMeshScreenQuad(struct model *model, struct modelnode *node, Vtx *vertices);
+
+/**
+ * Mod.XblaReflections, "Enable Reflections": the release's reflections on its
+ * meshes. Each material whose byte 16 is not zero is blended that percentage
+ * of the way towards environment map byte 24, looked up by the eye's ray
+ * reflected in the surface, in view space. On by default, like the release's
+ * other parts under the meshes' own switch, and live.
+ */
+s32 xblaMeshGetReflections(void);
+void xblaMeshSetReflections(s32 enabled);
+
+/**
+ * Mod.XblaReflectStyle, "Reflection Style": what a reflecting material shows.
+ * XBLA is the release's cube maps, per pixel. N64 is the sheen the stock guns
+ * draw - the K7 Avenger's spans under G_LIGHTING | G_TEXTURE_GEN - on the same
+ * materials by the same amount: ROM texture 0x3eb sphere-mapped per vertex off
+ * the camera's LookAt, lit by lightsSetDefault()'s white light. METAL is the
+ * same pass drawn the way the levels draw their metal and windows: Defection's
+ * grey environment map 0x006d at the rooms' scale, and walking turns the
+ * lookup (G_TEXGEN_TURN_EXT) where the K7's streaks scroll. The title's 4J
+ * cubes always take the release's. Live.
+ */
+#define XBLAMESH_REFLECT_XBLA  0
+#define XBLAMESH_REFLECT_N64   1
+#define XBLAMESH_REFLECT_METAL 2
+
+s32 xblaMeshGetReflectStyle(void);
+void xblaMeshSetReflectStyle(s32 style);
+
+/**
+ * The stand-in tile for ROM texture 0x3eb, the K7 Avenger's sheen, bound on
+ * first ask (NULL if it would not).
+ */
+const void *xblaMeshSheenTile(void);
+const void *xblaMeshLevelMetalTile(void);
+
+#define XBLAMESH_ENV_OFF     -1
+#define XBLAMESH_ENV_SETTING 0
+#define XBLAMESH_ENV_ON      1
+#define XBLAMESH_ENV_LOGO    2
+
+/**
+ * A caller's word over Mod.XblaReflections for the draws it makes until it
+ * puts XBLAMESH_ENV_SETTING back: the title's 4J cubes are the release's
+ * intro and reflect whatever the setting says (ON round the pass that colours
+ * them), and never in a depth-only pass (OFF round that one). LOGO is ON,
+ * except that a mesh carrying the marble logo's two materials draws them lit
+ * and sphere-mapped in the levels' blue and metal instead (Mod.XblaLogoMaterial).
+ */
+void xblaMeshSetEnvironment(s32 force);
+
+/**
+ * Mod.XblaLogoMaterial, "Logo Material": the title's spinning marble logo in
+ * the release's cube maps (0), or its faces in the Carrington Institute
+ * statue's blue (ROM texture 0x0042) and its bevels in Defection's grey metal
+ * (0x006d), both live under texgen the way the levels draw them (1, the
+ * default). With it on the bevels are brightened and glint, and so does
+ * the boot sequence's orange Rare logo. Live.
+ */
+s32 xblaMeshGetLogoMaterial(void);
+void xblaMeshSetLogoMaterial(s32 on);
+
+/**
+ * The title's own fade over the logo passes, 0 to 255, for a logo it fades in
+ * by its light rather than by alpha (the Rare logo). Put 255 back after.
+ */
+void xblaMeshSetLogoFade(s32 alpha);
+s32 xblaMeshHitTest(struct model *model, struct coord *pos, struct coord *far, struct coord *dir,
+		f32 *sqdist, struct hitthing *hitthing, struct modelnode **bboxnode, s32 *hitpart,
+		struct modelnode **dlnode);
+/**
+ * The first surface of the release's mesh drawn for a model on a world-space
+ * segment, into `hit`: where a stuck mine is pushed to so that it sits on
+ * what is drawn rather than inside it. 0 in the N64 look or on no surface.
+ */
+s32 xblaMeshTakeFineModel(struct model *model);
+s32 xblaMeshSurfaceAlong(struct model *model, const struct coord *from, const struct coord *to, struct coord *hit);
+s32 xblaMeshObjShotTest(struct model *model, struct coord *pos, struct coord *dir, f32 range,
+		struct hitthing *hitthing, s32 *mtxindex, struct modelnode **bboxnode, s32 *hitpart,
+		struct modelnode **dlnode);
+void xblaMeshObjShotTestEnd(void);
+
+/** --xbla-mesh-verbose: log each replaced node's box against its mesh's. */
+void xblaMeshSetVerbose(s32 verbose);
+s32 xblaMeshIsVerbose(void);
+
+/**
+ * The release's copy of one of the game's files - file id, not slot - read
+ * out of the package and inflated, in a buffer the caller frees. NULL when
+ * there is no package ready to read (this never unpacks one), no such file,
+ * or nothing in that slot. What the stage loader (xblastage.c) reads the
+ * release's bg files through.
+ */
+u8 *xblaMeshReadFile(u16 fileid, u32 *outLen);
+
+/**
+ * For the asset dump: how many slots the package's PackedSegFile has, opening
+ * the package (and unpacking the archive) if it has to - zero with none - and
+ * one slot read as a mesh in the shape objmesh.h describes, or NULL when the
+ * slot holds something else. Slot i is the game's file id i + 1, which is
+ * what name it.
+ */
+s32 xblaMeshGetNumPackageSlots(void);
+struct objmesh *xblaMeshSlotToObj(s32 slot, const char *name);
+
+/**
+ * The game's model file whose nodes name a mesh slot, or 0 - what a mesh is
+ * named for, since the slot itself is one of 4J's own files past the game's
+ * ids and says nothing. Walks every model's release copy the first time.
+ */
+s32 xblaMeshSlotModelFile(s32 slot);
+
+/**
+ * The list nodes of a model in the order the model pack numbers them - the
+ * game's own depth-first walk - and where a node's geometry sits in the
+ * model at rest, which is the sum of the position nodes above it. The asset
+ * dump writes a model's parts in the first order with the second added on,
+ * and the pack loader takes it off again (xblamesh.c, xblaMeshBuildPack()).
+ * Returns the count, filling up to max of them.
+ */
+// A material word that names an entry of the build's own table of pictures
+// rather than a record - a model pack's PNG, one of the ROM's numbered
+// textures, or a GoldenEye XBLA character's picture (gebean.c) - in its low
+// twelve bits. Bit 15 is the alpha flag as ever.
+#define XBLAMESH_MAT_TABLE 0x40000000
+// With XBLAMESH_MAT_TABLE: the draw lies flat on another of the mesh's own
+// surfaces - a label, a stencil - and is drawn in the decal z mode
+// (G_DECAL_EXT), since the two are exactly coplanar and fight in the plain one
+#define XBLAMESH_MAT_DECAL 0x4000
+// With XBLAMESH_MAT_TABLE: the picture is a cut-out card laid once across its
+// triangles (every UV within 0 to 1), and is sampled clamped rather than
+// repeating, so its filtered edge does not pick up the far edge's texels
+#define XBLAMESH_MAT_CLAMP 0x2000
+
+s32 xblaMeshEnumListNodes(struct modeldef *modeldef, struct modelnode **out, s32 max);
+// A model drawn as one of the release's GoldenEye meshes, measured round the
+// neck: a head's rim (and whether it ends at its jaw) or a body's collar
+s32 xblaMeshBeanSeat(struct modeldef *def, s32 head, f32 *out, s32 *outneckless);
+s32 xblaMeshBeanSeatAt(struct modeldef *def, s32 head, f32 *out, s32 *outneckless, f32 frac);
+// A GoldenEye hat on a head drawn as the release's HD mesh: 1 when both are
+// drawn so, with its seat in the hat's own space (measured when `maxscale`,
+// the biggest it may be made, is above 0; none otherwise): out[0-2] the
+// offset that sets it on the hair, out[3] the size it is worn at, about the
+// point out[4-6] - chrRender() uses it in place of the table. `maxlift` is
+// the most it is lifted clear of hair standing through it: a few hairs
+// through it beat a hat in the air, and a side cap lifted off a full head of
+// hair stood over it with its lining showing (F3 20261013-001948, 002134)
+#define XBLAMESH_HAT_MAXLIFT 14.0f
+#define XBLAMESH_HAT_SIDECAP_MAXLIFT 2.0f
+s32 xblaMeshHatSeat(struct model *chrmodel, struct modeldef *headdef, struct model *hatmodel, f32 maxscale, f32 maxlift, f32 out[7]);
+// Each vertex of the release's mesh for a model at rest: its main matrix and its place in that joint's frame
+s32 xblaMeshReleaseRestVertices(struct modeldef *def, s32 rigid, void (*fn)(s32 mtx, const f32 local[3], void *arg), void *arg);
+void xblaMeshNodeRestOffset(const struct modelnode *node, f32 out[3]);
+
+/**
+ * For the F3 trace dump: the loader's state and last frame's counts, and
+ * one line per node of a model that names a mesh (the count of them is
+ * returned; with f NULL nothing is written, so it doubles as "does this
+ * model draw a release mesh").
+ */
+void xblaMeshTrace(FILE *f);
+s32 xblaMeshTraceModel(FILE *f, const struct model *model, const char *indent);
+
+/** How much is loaded, for gdb. */
+extern u32 g_XblaMeshNumMeshes;
+extern u32 g_XblaMeshNumNodes;
+extern u32 g_XblaMeshNumSlots;
+extern u32 g_XblaMeshNumTris;
+extern u32 g_XblaMeshBytes;
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif

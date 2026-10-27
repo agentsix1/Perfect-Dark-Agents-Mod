@@ -1,0 +1,15705 @@
+/**
+ * Drawing the XBLA release's meshes in place of the game's display lists.
+ * See xblamesh.h for what this is and what shapes it.
+ *
+ * Three stages, each of which can fail on its own and leave the game drawing
+ * its own geometry:
+ *
+ *   * the package, opened once and kept - PackedSegFile's record table is 42KB
+ *     and stays in memory, the 30MB of data behind it does not;
+ *   * a model's nodes, matched against the release's copy of the same file as
+ *     it loads, which is the only thing that says which mesh replaces what;
+ *   * a mesh, read and turned into a display list the first time something
+ *     asks to draw it, and kept for as long as the game runs. Two lists per
+ *     group, in fact: the draws whose material carries alpha are a span of
+ *     their own, so that a node the game draws a translucent list for can
+ *     have one too.
+ *
+ * Nothing here is on the render thread's critical path except the display list
+ * pointer it ends up branching to.
+ */
+
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+#include <strings.h>
+#include <math.h>
+#include <ultra64.h>
+#include <PR/ultratypes.h>
+#include "xblaswitch.h"
+#include "constants.h"
+#include "types.h"
+#include "config.h"
+#include "system.h"
+#include "net/net.h"
+#include "input.h"
+#include "lib/main.h"
+#include "lib/model.h"
+#include "lib/mtx.h"
+#include "lib/vi.h"
+#include "game/modoptions.h"
+#include "x360.h"
+#include "xblaimport.h"
+#include "xblastage.h"
+#include "romdata.h"
+#include "xblaagent4.h"
+#include "mod.h"
+#include "gebean.h"
+#include "geguns.h"
+#include "files.h"
+#include "xblamesh.h"
+#include "handtint.h"
+#include "headfit.h"
+#include "xblatex.h"
+#include "texpack.h"
+#include "objmesh.h"
+#include "modelpack.h"
+#include "roomsheen.h"
+#include "game/bg.h"
+#include "game/camera.h"
+#include "game/dlights.h"
+#include "game/game_0b0fd0.h"
+#include "game/playermgr.h"
+#include "game/file.h"
+#include "bss.h"
+#include "game/modeldef.h"
+#include "modloader.h"
+#include "lib/lib_2f490.h"
+#include "data.h"
+#include "trace.h"
+#include "gfxmesh.h"
+
+#ifndef PLATFORM_N64
+
+// Inside the package. The models and the game's own files share this one.
+#define XBLAMESH_PACKED "DataFiles/PackedSegFile"
+
+// {offset, uncompressedSize, compressedSize, flags}. Slot i is file id i + 1.
+#define XBLAMESH_RECORD 16
+
+// The fixed part of a mesh header. Everything past it the header measures.
+#define XBLAMESH_HEADER 32
+
+// Every table between the header and the vertices is three words wide, and a
+// matrix is three rows of four floats.
+#define XBLAMESH_ENTRY 12
+#define XBLAMESH_MATRIX 48
+
+// A mesh whose header asks for more than this is not one.
+#define XBLAMESH_MAXVERTS  0x40000
+#define XBLAMESH_MAXDRAWS  0x1000
+#define XBLAMESH_MAXFILE   (16 * 1024 * 1024)
+
+/**
+ * Vertices addressable by one batch.
+ *
+ * gSP1Triangle multiplies its indices by 10 into a byte, which is what caps
+ * this at 25 rather than at the renderer's 128 slots. The real microcode holds
+ * 16; nothing this builds ever reaches an RSP.
+ */
+#define XBLAMESH_BATCH 25
+
+// The three spans a group's draws are sorted into; what each one is, is
+// explained above xblaMeshDrawSpan().
+#define XBLAMESH_SPAN_SOLID 0
+#define XBLAMESH_SPAN_ALPHA 1
+#define XBLAMESH_SPAN_FADE  2
+
+// The two strides, unskinned and skinned. Everything before the weights is
+// laid out the same in both.
+#define XBLAMESH_STRIDE_RIGID 36
+#define XBLAMESH_STRIDE_SKIN 48
+
+// A power of two; open addressed. Every list node of a matched model takes an
+// entry now, not only the ones the release named - a character body is one
+// named node and fifteen more the mesh covers - so this is ten times the
+// nodes a level used to file, plus the tombstones a stage's reloads leave.
+#define XBLAMESH_HASHSIZE 16384
+
+// Plain list nodes of one model collected while its tree is walked, to be
+// filed as covered once the walk says the model really did match. The most any
+// model in the release has is 22 (the Nintendo logo); a character body has 15.
+#define XBLAMESH_COVERED 64
+
+// What a suppressed entry is suppressed for.
+#define XBLAMESH_SUPPRESS_HAIR 1    // a head's stock hair, which the mesh paints on
+#define XBLAMESH_SUPPRESS_COVERED 2 // geometry the model's own mesh has already
+
+// How many draws --xbla-mesh-verbose names before it stops
+#define XBLAMESH_DRAWLOG 12
+
+// How far up a node's parents to look for the model that is drawing it. A head
+// hangs off a body, so its nodes are the head's own depth plus the body's.
+#define XBLAMESH_PARENTSCAN 32
+
+// Commands into a node's own list to look for its matrix in. The game's own
+// lists load one inside the first handful, before any geometry.
+#define XBLAMESH_MTXSCAN 32
+
+// A model's vertices go through a segment, so one built list can draw from
+// either the bind pose or a posed copy of it.
+#define XBLAMESH_VTXSEG (SPSEGMENT_MODEL_VTX << 24)
+
+// And its colours, for the same reason: a chr that has been shot draws the
+// same list from a copy of the colours with the game's bruises carried over -
+// see xblaMeshBruiseColours(). Segment 5 is the one the game's own node draw
+// binds to a model's colour table, and it is rebound before every node.
+#define XBLAMESH_COLSEG (SPSEGMENT_MODEL_COL1 << 24)
+
+// A texel between these is part of a pane, not of a cutout's edge - see
+// xblaMeshTriIsPane().
+#define XBLAMESH_PANE_LO 0x10
+#define XBLAMESH_PANE_HI 0xe0
+
+// How far round a pane sample xblaMeshTriIsPane() looks for the clear and the
+// opaque texels that make it a cutout's fringe instead, in the alpha map's
+// texels.
+#define XBLAMESH_PANE_FRINGE 4
+
+// A body's lists a bruise map reads, and the stock vertices one of the
+// release's takes its bruise from - see xblaMeshBruiseMap().
+#define XBLAMESH_BRUISENODES 64
+#define XBLAMESH_BRUISEREFS 3
+
+// Parts a model can have. The id's nibble counts sixteen, which is what the
+// release's meshes are built to; a model pack's file for one of the game's
+// own models is a group per list node, and a character body has thirty.
+#define XBLAMESH_MAXPARTS 64
+
+// A node that is not one of a model pack's parts.
+#define XBLAMESH_NOPART 0xffff
+
+// XBLAMESH_MAT_TABLE is in xblamesh.h, which gebean.c writes it from.
+#define XBLAMESH_MAXMATS 256
+
+// Palette entries a mesh can have. The largest in the release has 46.
+#define XBLAMESH_MAXMTX 64
+
+// The textures of a mesh handtint.c keeps apart (xblaMeshAnalyse())
+#define XBLAMESH_ANATEX 32
+
+u32 g_XblaMeshNumMeshes = 0;
+u32 g_XblaMeshNumNodes = 0;
+u32 g_XblaMeshNumSlots = 0; // taken, live or tombstoned - the table's headroom
+u32 g_XblaMeshNumTris = 0;
+u32 g_XblaMeshBytes = 0;
+
+/**
+ * What is known about one list node, which is both things at once.
+ *
+ * A node can have a mesh of the release's and a model pack's file for the
+ * model it belongs to, and which of the two draws is not decided here - it is
+ * decided at the draw (xblaMeshRenderNode()), so that the pack, the switch
+ * that turns packs on, and the preference between the two are all live. Both
+ * halves are filed as the model loads; either may be empty.
+ */
+struct xblameshentry {
+	const struct modelnode *node;      // key
+	const struct modeldef *modeldef;   // which load of which model it belongs to
+
+	// The release's mesh, from the matcher.
+	u16 slot;
+	u16 part;
+	s32 use;                           // into uses[], or -1
+	s32 suppress;                      // XBLAMESH_SUPPRESS_*: stock geometry that draws nothing
+	u8 matched;                        // whether the four above say anything
+	u8 releaseonly;                    // a file only the release has: drawn in both looks (xblaMeshEntryLive())
+	u8 xraystock;                      // drawn as the game's own model through the X-ray scanner: see xblaMeshXrayStock()
+
+	// The model pack's side: this node's place in the model's list nodes, and
+	// the file id the pack's n64/ folder is looked up by. Filed for every
+	// model that loads while a pack is installed at all, whether or not the
+	// pack has a file for this one and whether or not packs are switched on.
+	u16 fileid;
+	u16 packpart;                      // or XBLAMESH_NOPART
+	s32 packuse;                       // into uses[], or -1
+	u8 packhasmesh;                    // whether any node of this model matched a mesh
+
+	// The GoldenEye XBLA release's character for a GoldenEye X model
+	// (gebean.h): the table row, or -1. Filed with the pack's side, whose
+	// packpart and packuse it draws by.
+	s16 beanrow;
+};
+
+/**
+ * One model's use of one mesh: which node is which entry of its palette.
+ *
+ * A mesh replaces a whole model and every part of the model carries its id
+ * with that part's number in the top nibble, so this is the map a skinned draw
+ * needs - palette entry i is posed by whatever the game has done to the node
+ * that carries part i.
+ */
+struct xblameshuse {
+	const struct modeldef *modeldef;
+	u16 slot;      // a mesh slot, or a file id when pack is set
+	u8 pack;       // whose parts these are: the release's mesh, or the pack's file
+	u16 numparts;
+	struct modelnode *parts[XBLAMESH_MAXPARTS];
+	s16 partmtx[XBLAMESH_MAXPARTS];   // which of the model's matrices poses it
+	struct xblameshbruise *bruise;    // made the first time the model is shot, or NULL
+	s8 restfit;                       // 0 not asked, 1 drawn as it is, 2 restshift taken off
+	f32 restshift[3];                 // the first part's rest offset, where the mesh includes it
+};
+
+/**
+ * Which stock vertices each of the mesh's takes its bruise from.
+ *
+ * The game bruises a chr by writing a low alpha into the colour of the stock
+ * vertex nearest the shot (chrBruise()), and chrDisfigure() darkens them the
+ * same way, in a copy of the node's colour table. The model's combiner reads
+ * that alpha as (texel - env) * shade alpha + env, so the vertex goes to the
+ * body's blood tint and the Gouraud spreads it over the triangles round it.
+ * The release's vertices are none of those, so the mesh drew clean however
+ * often its chr was shot.
+ *
+ * What is mirrored is the tables rather than the shot: a map, made once per
+ * model and mesh, from each of the release's vertices to the three stock
+ * vertices nearest it in the rest pose, and at the draw the stock tables'
+ * colour against their untouched originals, blended by that map. That keeps
+ * whatever the game does to the tables - a bruise, a burn, the vertex store
+ * handing a copy back - on the mesh with nothing to keep in step.
+ */
+struct xblameshbruiseref {
+	u16 node;     // into nodes[], or XBLAMESH_NOPART for a vertex that takes none
+	u16 colour;   // into that node's colour table
+	u16 vtx;      // the stock vertex, into that node's vertices
+	u16 base;     // the table entry its colour byte counts from (the list's G_COL)
+	f32 weight;
+};
+
+struct xblameshbruise {
+	const Gfx *gdl;                   // the build the map was made for
+	s32 numvertices;
+	s32 numnodes;
+	struct modelnode *nodes[XBLAMESH_BRUISENODES];
+	s32 state;                        // 0 not made, 1 made, -1 could not be
+	struct xblameshbruiseref *refs;   // XBLAMESH_BRUISEREFS per emitted vertex
+	u8 *solid;                        // per emitted vertex: whether it takes colour
+	f32 *mappos;                      // a skinned mesh's: each vertex where the map matched it
+};
+
+static void xblaMeshBruiseFree(struct xblameshuse *use)
+{
+	if (use->bruise) {
+		free(use->bruise->solid);
+		free(use->bruise->mappos);
+		free(use->bruise->refs);
+		free(use->bruise);
+		use->bruise = NULL;
+	}
+}
+
+// The title logos' materials: see xblaMeshBuildLogo().
+#define XBLAMESH_LOGO_MATS 3
+
+struct xblameshbuilt {
+	Gfx *gdl;
+	Vtx *vertices;
+	Col *colours;
+	f32 *grad;         // four per emitted vertex: ds/dx dt/dx ds/dy dt/dy; NULL when skinned
+	s32 numvertices;   // as emitted, which repeats one shared between batches
+	s32 numtris;
+	s32 state;         // 0 untried, 1 built, -1 no good
+	s32 logged;
+	s32 xlulogged;
+	s32 fadelogged;
+	s32 posedlog;
+
+	// Skinning, for a mesh that has a matrix palette. The vertices above are
+	// the bind pose; these are what it takes to put them in a pose of the
+	// game's. Positions are kept as they were read rather than as the s16 the
+	// Vtx holds, since they are transformed before they are rounded.
+	s32 nummatrices;
+	s32 numgroups;
+	f32 scale;         // mesh units to the game's, out of the header
+	s32 groupgfx[XBLAMESH_MAXPARTS]; // into gdl: where each group's opaque list starts
+	s32 groupxlu[XBLAMESH_MAXPARTS]; // its alpha materials, or -1 if it has none
+	s32 groupfade[XBLAMESH_MAXPARTS]; // its draws that fade by vertex alpha, or -1
+	u64 groupxlucut;                 // groups whose alpha span is cutouts only: see xblaMeshBuildLists()
+	s32 allgfx;                      // and the ones that call every group
+	s32 allxlu;
+	s32 allfade;
+	s32 allxlucut;
+
+	// The posed copy already made this frame, and who for. Every part of a
+	// model draws its own group now, so without this Dr Carroll would pose
+	// thirteen copies of himself a frame and fill the arena with twelve of
+	// them. One entry is enough: the renderer walks a model's tree in one go,
+	// so a model's parts are drawn one after another.
+	const struct model *posedmodel;
+	u32 posedframe;
+	Vtx *posedvtx;
+	Mtxf *posedmtx;    // the matrix that copy is drawn under, when it is not the bone's own
+	s32 posedfine;     // and how many steps of that copy make one of the game's units
+
+	// The renderer's copy of the mesh on the GPU (G_MESH_EXT, gfxmesh.h), and
+	// the palette that poses it there instead, made once a frame per model the
+	// way the posed copy is: see xblaMeshGpuPalette()
+	struct gfxmesh gpu;
+	struct gfxmesh envgpu;   // the same over envst, for the reflection passes
+	Vtx *envst;              // the vertices with each reflecting one's atlas cell in s and t: see xblaMeshEnvStatic()
+	const struct model *gpumodel;
+	u32 gpuframe;
+	f32 *gpupal;
+	Mtxf *gpumtx;
+
+	// The bruised colours made this frame, and who for; NULL for a model with
+	// no bruise on it, which draws the mesh's own. See xblaMeshBruiseColours().
+	const struct model *bruisemodel;
+	u32 bruiseframe;
+	Col *bruisecol;
+	const u8 *bruisewound;   // how wounded each vertex is, with bruisecol; see "Wounds"
+	const struct model *deformmodel;   // objDeform()'s vertices, mirrored for one model a frame
+	u32 deformframe;
+	Vtx *deformvtx;
+	const struct model *deformoffmodel;   // and the offsets they are made from
+	u32 deformoffframe;
+	f32 *deformoff;
+
+	// The trimmed copy already made this frame, for a door the game is
+	// drawing from trimmed vertices - see xblaMeshNodeTrim(). Keyed the way
+	// the posed copy is, plus the trim itself, since two doors of one model
+	// can be open by different amounts in one frame.
+	const struct model *trimmodel;
+	u32 trimframe;
+	s32 trimaxis;
+	s16 trimref;
+	Vtx *trimvtx;
+	s32 trimlogged;
+	Mtxf *invbind;     // one per palette entry
+	f32 *bindpos;      // three per emitted vertex
+	f32 *normals;      // three per emitted vertex, only for a mesh that reflects
+	u8 *vink;          // one per emitted vertex, how light its paint is, for a classic gun only: see xblaMeshInkFile()
+	u8 *venv;          // two per emitted vertex: its atlas cell and reflection amount, the same
+	u8 *vmatte;        // one per emitted vertex, 1 + its row of xblaMeshMattes, or 0; NULL when none is
+	u32 mattemask;     // and the rows that are, a bit each
+	s32 numgfx;        // commands in gdl
+	Gfx *envgdl;       // gdl, binding the reflection atlas: see xblaMeshBuildEnvironment()
+	Gfx *sheengdl;     // envgdl, lit and sphere-mapped the N64 way: see xblaMeshBuildSheen()
+	Gfx *metalgdl;     // sheengdl on the levels' metal: the same, see xblaMeshBuildSheen()
+	Gfx *logobase;     // gdl without the materials the logos replace: see xblaMeshBuildLogo()
+	Gfx *logogdl[XBLAMESH_LOGO_MATS]; // gdl with one replaced material, on the level's picture
+	Gfx *logoglint;    // gdl with the materials that glint, on the glint's picture
+	Gfx *logometal;    // gdl with the materials the levels' metal is added over
+	Gfx *tintgdl;      // gdl with only the tinted panes, in a flat colour: see xblaMeshTintCopy()
+	s32 tintonly;      // and the mesh is nothing but those panes (the window prop)
+	Col *logocol;      // the bind normals as colours, for the logo passes' lighting
+	s32 logotried;
+	s32 numenvcells;
+	u32 *envidx;       // the vertices that reflect, which is all the per-frame work visits
+	s32 numenvidx;
+	f32 envradius;     // how far the mesh reaches from its origin, for the distance cutoff
+	Col *dimcol;       // colours, dimmed by each vertex's full amount: the common case, made once
+	s32 envown;        // the atlas is a GoldenEye prop's own maps, added undimmed: see xblaMeshBuildEnvironment()
+	s32 envsheen;      // whether envvtx/envcol were made at the N64 sheen's share
+	const u8 *envwound;      // the wounds envcol was scaled down by, or NULL
+
+	// The posed normals made with posedvtx, for a mesh that reflects; NULL when
+	// that pose had no room for them.
+	f32 *posednrm;
+
+	// The reflection pass's vertices made this frame, and what they were made
+	// from - a skinned model's fifteen parts all draw under the first part's
+	// matrix, so one copy serves every one of them. See xblaMeshEnvironmentVertices().
+	const struct model *envmodel;
+	u32 envframe;
+	const f32 *envnormals;
+	const Vtx *envposed;
+	s32 envlight;
+	Vtx *envvtx;
+	Col *envcol;
+
+	// And the colours the lists draw from under it, scaled by what the
+	// reflection leaves of them.
+	const struct model *keptmodel;
+	u32 keptframe;
+	const Col *keptsrc;
+	s32 keptreach;
+	Col *keptcol;
+	f32 *weights;      // three per emitted vertex, zero past the bone count
+	u8 *bones;         // three per emitted vertex, and how many of them count in the fourth
+	f32 bindlo[3];     // the box the bind positions stand in, which bounds the posed ones
+	f32 bindhi[3];
+
+	// A model pack's mesh for one of the game's own models: a group per list
+	// node in that node's own space, drawn under the node's own matrix -
+	// see xblaMeshBuildPack(). groupabsent marks nodes the file has no group
+	// for, which keep their own geometry.
+	s32 local;
+	u64 groupabsent;
+	s32 frompack;      // the mesh came out of a model pack's file (either kind)
+	s32 frombean;      // a GoldenEye XBLA character, skinned, a group per list node: xblaMeshBuildBean()
+	u64 beanneck;      // its groups blanked for a neck its own head carries (gebeanmats.neckblank)
+	s8 beanneckfill[64]; // a neck node's group of the body's own neck, for a fitted head (gebeanmats.neckfill)
+	s8 beanhood[64];   // a node's group with the parka's hood (gebeanmats.hood)
+	s8 beanneckof[64]; // a head node's group with a neck made under it (gebeanmats.neck)
+	s8 beanbare[64];   // a neck node's group of the collar the hood covers (gebeanmats.bare)
+	s8 beanownneck[64]; // a neck node's group of the body's whole neck (gebeanmats.ownneck)
+	s8 beannoskin[64]; // a node's group less the body's own neck skin (gebeanmats.noskin)
+	u64 beanspent;     // a first-person launcher's nodes with a group for an empty tube
+	s8 beanspentgroup[64]; // and that group (gebeanmats.spent)
+	s32 beanhead;      // the mesh is a head's (gebeanmats.head)
+	s32 beanneckback;  // and its palette entry 1 is the joint above its own (gebeanmats.neckback)
+	f32 beanseat[GEBEAN_SEAT_SAMPLES]; // a head's underside or a body's collar round the neck (gebeanmats.seat)
+	u32 beanseathit;
+	f32 beanneckshift[3]; // a body's own neck joint from the model's (gebeanmats.neckshift)
+	s32 beanhasneckshift;
+	f32 beancollarshift; // gebeanmats.collarshift
+	s32 beanhascollarshift;
+	s32 beanfromchar;  // gebeanmats.fromchar
+	f32 beanopenrim;   // gebeanmats.openrim
+	const struct modeldef *neckbackdef; // the body that joint was last found on,
+	s32 neckbackmtx;   // its matrix there (-1 for none)
+	f32 neckbackofs[3]; // and the head's joint from it at rest
+	s32 beanrow;       // the row it was built from, for the hood's test (gebeanRowKeepsHood())
+	s32 beangen;       // romdataFilesGeneration() it was built under: see xblaMeshResetBeanMeshes()
+	// What handtint.c asks of a skinned mesh (xblaMeshAnalyse()): the
+	// textures its materials bind, with how many triangles of each hang off
+	// each bone, and - for a character - the colour each bone is painted,
+	// as a sum of r, g, b and a weight per palette entry. NULL for a mesh
+	// that was not asked.
+	s32 numanatex;
+	const void *anatex[XBLAMESH_ANATEX];
+	u16 *anatexbone;   // XBLAMESH_ANATEX rows of XBLAMESH_MAXMTX
+	f32 *anabonecol;   // XBLAMESH_MAXMTX rows of four
+	u32 packgen;       // modelpackGetGeneration() when it was built
+	u8 beanscreenfit;  // a monitor's screens moved onto Bean's own (gebeanmats.screenfit)
+	f32 beanscreenquad[4][4][3]; // and where to (gebeanmats.screenquad)
+	u8 beanscreenrecess; // screens on Bean's recess, drawn as decals (gebeanmats.screenrecess)
+	// A rigid prop's list whose own triangles the mesh leaves out, drawn in
+	// GoldenEye's look inside it (gebeanmats.keepvtx, xblaMeshKeptLists()):
+	// the vertices kept, the list node, and the lists made from the node's
+	// for this stage, with what they were made from
+	u8 *beankeepvtx;
+	s32 beannumkeepvtx;
+	s32 beankeeplist;
+	Gfx *beankeptgdl[2];
+	const Gfx *beankeptsrc[2];
+	// Parts turned about hubs of their own (gebeanmats.hubmtx, xblaMeshHubShift())
+	s32 beannumhubs;
+	s8 beanhubmtx[GEBEAN_MAXHUBS];
+	s8 beanhubparent[GEBEAN_MAXHUBS];
+	f32 beanhubshift[GEBEAN_MAXHUBS][3];
+	// The menu hudpiece's rotor, turned about its own ring: see xblaMeshRotorShift()
+	s32 rotorstate;    // 0 not looked at, 1 rotorcentre is good, -1 nothing to do
+	s8 rotormtx;
+	f32 rotorcentre[3];
+};
+
+// The pictures a build's materials draw with, when they are not records.
+struct xblameshmats {
+	const void *tile[XBLAMESH_MAXMATS];
+	u8 alpha[XBLAMESH_MAXMATS];
+	u8 soft[XBLAMESH_MAXMATS];
+	s32 num;
+	// A material's own reflection, for a GoldenEye prop's (gebeanmats.env):
+	// its sphere map and amount, and the key the mesh's maps are bound under
+	const u8 *env[XBLAMESH_MAXMATS];
+	u8 envamount[XBLAMESH_MAXMATS];
+	const char *envkey;
+};
+
+/**
+ * Materials of the release a texture pack repaints as something that does not
+ * shine, whose reflection is taken away while that pack is selected - in all
+ * three of Mod.XblaReflectStyle's styles, read when the frame is drawn so an
+ * F10 to another pack follows without a rebuild (xblaMeshMatteActive()).
+ *
+ * A row is a record and the percentage the release's material reflects at
+ * (byte 16), which is what tells one draw of a body from another on the same
+ * record, and a word the pack's folder name has in it, case-blind. The pack has
+ * to repaint the record as well, itself: a pack of that name without the
+ * picture is drawing the release's art, which shines, or another source's
+ * (a textures/ under $B or an overlay mod), which is not this pack's repaint
+ * (texpackXblaReplacementIsSelectedPack()).
+ *
+ * Joanna's combat suit (Cdark_combatZ, slot 2370, the only mesh on 0x12a6):
+ * 4J's body gives the torso's side panels 15% and the white pads 50%. PD
+ * Ultimate Plus HD paints the panels as matte fabric (Parabolee's board item
+ * 20261002-034647: "should not be reflective other than the metal parts"), so
+ * they go to nothing and the pads keep theirs.
+ */
+struct xblameshmatte {
+	u16 record;
+	u8 percent;
+	const char *packword;
+};
+
+static const struct xblameshmatte xblaMeshMattes[] = {
+	{ 0x12a6, 15, "ultimate" },
+};
+
+#define XBLAMESH_NUM_MATTES ((s32)(sizeof(xblaMeshMattes) / sizeof(xblaMeshMattes[0])))
+
+// 1 + the row of xblaMeshMattes for a material, or 0
+static s32 xblaMeshMatteRow(u32 record, u32 percent)
+{
+	for (s32 i = 0; i < XBLAMESH_NUM_MATTES && i < 32; i++) {
+		if (xblaMeshMattes[i].record == record && xblaMeshMattes[i].percent == percent) {
+			return i + 1;
+		}
+	}
+
+	return 0;
+}
+
+static s32 xblaMeshContainsWord(const char *name, const char *word)
+{
+	const size_t len = strlen(word);
+
+	for (; *name; name++) {
+		if (strncasecmp(name, word, len) == 0) {
+			return 1;
+		}
+	}
+
+	return 0;
+}
+
+/**
+ * The rows of xblaMeshMattes the selected pack makes matte, a bit each. Asked
+ * per mesh drawn, so it is worked out again only when the pack's index changes
+ * (texpackGetIndexSerial(): a reload, F10, packs turned off).
+ */
+static u32 xblaMeshMatteActive(void)
+{
+	static s32 seenSerial = -1;
+	static u32 active = 0;
+	const s32 serial = texpackGetIndexSerial();
+
+	if (serial != seenSerial) {
+		const s32 pack = texpackLoadEnabled() ? texpackGetSelectedPack() : -1;
+		const char *name = pack >= 0 ? texpackGetPackName(pack) : NULL;
+		u32 now = 0;
+
+		for (s32 i = 0; name && i < XBLAMESH_NUM_MATTES && i < 32; i++) {
+			if (xblaMeshContainsWord(name, xblaMeshMattes[i].packword) &&
+					texpackXblaReplacementIsSelectedPack(xblaMeshMattes[i].record)) {
+				now |= 1u << i;
+			}
+		}
+
+		// the scan above can move the serial on: read it after
+		seenSerial = texpackGetIndexSerial();
+
+		if (now != active) {
+			sysLogPrintf(LOG_NOTE, "xblamesh: matte materials 0x%x under pack \"%s\"", now, name ? name : "");
+		}
+
+		active = now;
+	}
+
+	return active;
+}
+
+// A vertex's reflection amount, less a matte material's under the pack that
+// makes it so. matte is m->mattemask & xblaMeshMatteActive(), 0 for nearly
+// every mesh.
+static inline u32 xblaMeshVertexAmount(const struct xblameshbuilt *m, u32 i, u32 matte)
+{
+	if (matte && m->vmatte[i] && (matte >> (m->vmatte[i] - 1) & 1)) {
+		return 0;
+	}
+
+	return m->venv[i * 2 + 1];
+}
+
+static s32 optEnabled;
+
+// Whether any model has loaded from a file the release alone has (Agent 4,
+// xblaagent4.c), which keeps its mesh with the meshes off: it has no N64 form
+// to fall back to, and its file's own lists are a placeholder
+static s32 releaseOnlyLoaded;
+
+// The mesh being built is for a file only the release has (Agent 4, past the
+// ROM's file ids), which is drawn in both looks, so its pictures are too
+static s32 xblaMeshBuildKeepArt = 0;
+
+// Whether the mesh being built is analysed for handtint.c: 1 its textures by
+// bone, 2 and the colour each bone is painted (a character's)
+static s32 xblaMeshBuildAnalyse = 0;
+static s32 optOnlySlot; // Mod.XblaMeshOnly: draw one mesh and leave the rest alone
+static s32 optBoth;     // Mod.XblaMeshBoth: draw the game's geometry over it too
+
+/**
+ * Mod.XblaMeshPose: drive a skinned mesh's palette from the game's matrices.
+ *
+ * On, and what makes a character out of a skinned mesh: without it the whole
+ * body draws in its bind pose under one bone's matrix, which is a heap of
+ * limbs rather than a person. Turning it off is how a shape that is wrong is
+ * told apart from a pose that is - the same job Mod.XblaMeshTextures does for
+ * the art.
+ */
+static s32 optPose = 1;
+
+// While non-zero, the model is drawn under the orthogonal projection: see
+// xblaMeshSetOrthogonal().
+static s32 orthogonal = 0;
+static s32 opened; // 0 untried, 1 open, -1 no package
+
+/**
+ * The switch is what opened the package, and it did it in a level.
+ *
+ * True only in the one case the meshes cannot be live in: a player whose copy
+ * was still inside its .7z matched nothing as the level loaded, because a
+ * model load never unpacks, so the level standing behind the menu has no mesh
+ * in it and turning the switch on does not change a thing that is drawn. It is
+ * cleared by xblaMeshResetModels(), which runs at lvReset() before a stage's
+ * models load - so it is set for exactly as long as it is true, and the menu
+ * can say so rather than guess.
+ */
+static s32 openedLate;
+
+static struct x360stfs stfs;
+static struct x360stfsstream packed;
+static u32 *recOffset;
+static u32 *recUncSize;
+static u32 *recCompSize;
+static s32 numRecords;
+
+static struct xblameshbuilt *built;      // one per slot, allocated with the table
+
+// Which of the game's model files names each mesh slot, as the matching
+// finds out - the file id, or 0. A mesh is not the release's copy of the model
+// (that sits at file id - 1); it is a file of 4J's own past the game's ids,
+// and the only thing that ties it to a model is the id on the model's nodes.
+// A model pack names its xbla/ files for the model, so this is what a mesh
+// slot is looked up by.
+static u16 *slotFile;
+
+// The same for every mesh at once, walked out of every model's release copy
+// on the first ask: what the asset dump names the meshes by.
+static u16 *slotFileAll;
+static struct xblameshentry hash[XBLAMESH_HASHSIZE];
+static struct xblameshuse *uses;
+static s32 numUses, capUses;
+
+static u32 xblaMeshBE32(const u8 *p)
+{
+	return ((u32)p[0] << 24) | ((u32)p[1] << 16) | ((u32)p[2] << 8) | p[3];
+}
+
+static u16 xblaMeshBE16(const u8 *p)
+{
+	return (u16)(((u32)p[0] << 8) | p[1]);
+}
+
+static f32 xblaMeshBEF32(const u8 *p)
+{
+	union { u32 u; f32 f; } bits;
+	bits.u = xblaMeshBE32(p);
+	return bits.f;
+}
+
+static void xblaMeshRegisterPackModel(struct modeldef *modeldef, u16 fileid);
+static void xblaMeshPreloadModel(struct modeldef *modeldef);
+static void xblaMeshFreePackMeshes(void);
+static void xblaMeshDropKeptSlot(void);
+static void xblaMeshResetBeanMeshes(void);
+
+/* -------------------------------------------------------------------------
+ * The package
+ * ------------------------------------------------------------------------- */
+
+static void xblaMeshCloseUp(void)
+{
+	for (s32 i = 0; built && i < numRecords; i++) {
+		gfxMeshForget(&built[i].gpu);
+		gfxMeshForget(&built[i].envgpu);
+	}
+
+	x360StfsStreamClose(&packed);
+	x360StfsClose(&stfs);
+	free(recOffset);
+	free(recUncSize);
+	free(recCompSize);
+	free(built);
+	free(slotFile);
+	free(slotFileAll);
+	slotFile = NULL;
+	slotFileAll = NULL;
+	recOffset = NULL;
+	recUncSize = NULL;
+	recCompSize = NULL;
+	built = NULL;
+	numRecords = 0;
+	opened = -1;
+	xblaMeshDropKeptSlot();
+}
+
+/**
+ * Opens the package and reads PackedSegFile's record table.
+ *
+ * The table is {count, count x 16 bytes}: an offset, an inflated size, a
+ * compressed size (zero when the file is stored as it is) and flags. Unused
+ * slots hold leftover bytes rather than zeros and give themselves away by
+ * having no inflated size.
+ */
+static s32 xblaMeshOpen(s32 mayUnpack)
+{
+	const char *path;
+	s32 index;
+	u8 head[4];
+	u8 *table;
+	u32 tableLen;
+
+	if (opened) {
+		return opened > 0;
+	}
+
+	// Every model load asks for this, so it must not be the thing that unpacks
+	// a 250MB archive on somebody who only wanted the texture pack: at a model
+	// load the package is taken only if it is ready to read. The switch asks
+	// with mayUnpack, which is where that cost belongs - somebody has just
+	// asked for the meshes.
+	path = mayUnpack ? xblaImportGetStfsPath() : xblaImportGetReadyStfsPath();
+
+	if (!path || !path[0]) {
+		// Not a failure while the package is still in its archive: asking
+		// again after the switch has unpacked it has to be able to succeed.
+		return 0;
+	}
+
+	opened = -1;
+
+	if (!x360StfsOpen(&stfs, path)) {
+		sysLogPrintf(LOG_ERROR, "xblamesh: %s is not a package", path);
+		return 0;
+	}
+
+	index = x360StfsFind(&stfs, XBLAMESH_PACKED);
+
+	if (index < 0 || !x360StfsStreamOpen(&stfs, index, &packed)) {
+		sysLogPrintf(LOG_ERROR, "xblamesh: no " XBLAMESH_PACKED " in %s", path);
+		x360StfsClose(&stfs);
+		return 0;
+	}
+
+	if (!x360StfsStreamRead(&packed, 0, sizeof(head), head)) {
+		xblaMeshCloseUp();
+		return 0;
+	}
+
+	numRecords = (s32)xblaMeshBE32(head);
+
+	if (numRecords <= 0 || numRecords > 0x10000) {
+		sysLogPrintf(LOG_ERROR, "xblamesh: %d records is not a PackedSegFile", numRecords);
+		xblaMeshCloseUp();
+		return 0;
+	}
+
+	tableLen = (u32)numRecords * XBLAMESH_RECORD;
+	table = malloc(tableLen);
+	recOffset = malloc(sizeof(u32) * numRecords);
+	recUncSize = malloc(sizeof(u32) * numRecords);
+	recCompSize = malloc(sizeof(u32) * numRecords);
+	built = calloc(numRecords, sizeof(struct xblameshbuilt));
+	slotFile = calloc(numRecords, sizeof(u16));
+
+	if (!table || !recOffset || !recUncSize || !recCompSize || !built) {
+		free(table);
+		xblaMeshCloseUp();
+		return 0;
+	}
+
+	if (!x360StfsStreamRead(&packed, 4, tableLen, table)) {
+		free(table);
+		sysLogPrintf(LOG_ERROR, "xblamesh: record table is short");
+		xblaMeshCloseUp();
+		return 0;
+	}
+
+	for (s32 i = 0; i < numRecords; i++) {
+		const u8 *r = table + (u32)i * XBLAMESH_RECORD;
+		recOffset[i] = xblaMeshBE32(r);
+		recUncSize[i] = xblaMeshBE32(r + 4);
+		recCompSize[i] = xblaMeshBE32(r + 8);
+	}
+
+	free(table);
+
+	opened = 1;
+
+	sysLogPrintf(LOG_NOTE, "xblamesh: %d slots in %s", numRecords, path);
+
+	return 1;
+}
+
+/**
+ * The slot the last read inflated, kept so that the next read of the same one
+ * is a copy rather than an inflate.
+ *
+ * One slot, not a cache of them, because the repeats come in a run: the game
+ * loads a model and matches it against the release's copy, and a chr that
+ * shares a body with another loads the same file again straight away. Eighty
+ * simulants sharing one body read file 412 **eighty-one times in a row** at a
+ * level load, each time seeking the package and inflating the same 20KB of
+ * LZX to read a few hundred bytes of node types out of it - 30 of the 35 ms a
+ * whole match spends in here, all inside 46 ms of the load. A second slot
+ * asked for in between costs only the re-read it always did.
+ *
+ * Not a saving worth a budget and an eviction rule: one slot is 20KB for a
+ * model and the bound is XBLAMESH_MAXFILE either way.
+ */
+static s32 keptSlot = -1;
+static u8 *keptSlotBytes;
+static u32 keptSlotLen;
+
+static void xblaMeshDropKeptSlot(void)
+{
+	free(keptSlotBytes);
+	keptSlotBytes = NULL;
+	keptSlotLen = 0;
+	keptSlot = -1;
+}
+
+static void xblaMeshKeepSlot(s32 slot, const u8 *bytes, u32 len)
+{
+	u8 *copy = malloc(len);
+
+	if (!copy) {
+		return;
+	}
+
+	memcpy(copy, bytes, len);
+	free(keptSlotBytes);
+	keptSlotBytes = copy;
+	keptSlotLen = len;
+	keptSlot = slot;
+}
+
+/**
+ * One slot, inflated. The caller frees it.
+ *
+ * A zero compressed size means the file is stored as it is; everything else is
+ * one chunked XMemCompress stream.
+ */
+static u8 *xblaMeshReadSlot(s32 slot, u32 *outLen)
+{
+	u8 *packedBytes;
+	u8 *out;
+	u32 usize;
+	u32 csize;
+
+	if (slot < 0 || slot >= numRecords) {
+		return NULL;
+	}
+
+	usize = recUncSize[slot];
+	csize = recCompSize[slot];
+
+	if (usize == 0 || usize > XBLAMESH_MAXFILE) {
+		return NULL;
+	}
+
+	out = malloc(usize);
+
+	if (!out) {
+		return NULL;
+	}
+
+	// The same slot as last time, which at a level load is most of them.
+	if (slot == keptSlot && keptSlotBytes && keptSlotLen == usize) {
+		memcpy(out, keptSlotBytes, usize);
+		*outLen = usize;
+		return out;
+	}
+
+	if (csize == 0) {
+		if (!x360StfsStreamRead(&packed, recOffset[slot], usize, out)) {
+			free(out);
+			return NULL;
+		}
+
+		xblaMeshKeepSlot(slot, out, usize);
+		*outLen = usize;
+		return out;
+	}
+
+	if (csize > XBLAMESH_MAXFILE) {
+		free(out);
+		return NULL;
+	}
+
+	packedBytes = malloc(csize);
+
+	if (!packedBytes) {
+		free(out);
+		return NULL;
+	}
+
+	if (!x360StfsStreamRead(&packed, recOffset[slot], csize, packedBytes) ||
+			x360LzxDecompress(packedBytes, csize, out, usize) != usize) {
+		free(packedBytes);
+		free(out);
+		return NULL;
+	}
+
+	free(packedBytes);
+
+	xblaMeshKeepSlot(slot, out, usize);
+	*outLen = usize;
+	return out;
+}
+
+/* -------------------------------------------------------------------------
+ * Matching a model's nodes against the release's copy of the same file
+ * ------------------------------------------------------------------------- */
+
+/**
+ * One step of the walk over their copy, which has to be the same walk the
+ * promotion does over ours.
+ *
+ * A node is {u16 type, u16 meshid, u32 rodata, parent, next, prev, child} of
+ * big-endian words at segment 0x05 addresses. The only place the two walks
+ * could disagree is a distance node, whose child the promotion overwrites with
+ * the rodata's target, so that is done here too.
+ */
+static u32 xblaMeshFileChild(const u8 *file, u32 len, u32 off, u32 type)
+{
+	u32 rodata;
+
+	if (type == MODELNODETYPE_DISTANCE) {
+		rodata = xblaMeshBE32(file + off + 4) & 0xffffff;
+
+		// The word is at +8, so the bytes it takes reach +12.
+		if (rodata && rodata + 12 <= len) {
+			// struct modelrodata_distance: near, far, then the target
+			return xblaMeshBE32(file + rodata + 8) & 0xffffff;
+		}
+
+		return 0;
+	}
+
+	return xblaMeshBE32(file + off + 20) & 0xffffff;
+}
+
+/**
+ * Which of the model's matrices a node is drawn under.
+ *
+ * Not modelFindNodeMtxIndex(): that walks up to the nearest chrinfo or position
+ * node, which for every model here is the same one for all of its parts - Dr
+ * Carroll's thirteen parts all come back with one matrix. The index that
+ * actually poses a part is the offset in the `G_MTX` its own display list
+ * loads out of segment 3, and the only place to read that before the game has
+ * rewritten the list is the model file itself. The release's copy is byte for
+ * byte ours apart from the mesh ids, so it does just as well.
+ *
+ * -1 when the node's list does not load one.
+ */
+static s16 xblaMeshNodeMtx(const u8 *file, u32 len, u32 nodeoff)
+{
+	const u32 rodata = xblaMeshBE32(file + nodeoff + 4) & 0xffffff;
+	u32 gdl;
+
+	if (!rodata || rodata + 4 > len) {
+		return -1;
+	}
+
+	// Both dl and gundl keep the opaque list first.
+	gdl = xblaMeshBE32(file + rodata) & 0xffffff;
+
+	for (s32 i = 0; gdl && i < XBLAMESH_MTXSCAN; i++, gdl += 8) {
+		u32 w0;
+		u32 w1;
+
+		if (gdl + 8 > len) {
+			return -1;
+		}
+
+		w0 = xblaMeshBE32(file + gdl);
+		w1 = xblaMeshBE32(file + gdl + 4);
+
+		switch (w0 >> 24) {
+		case G_MTX:
+			return (s16)((w1 & 0xffffff) / sizeof(Mtxf));
+		case G_VTX:
+		case (u8)G_ENDDL:
+		case G_DL:
+			return -1;
+		}
+	}
+
+	return -1;
+}
+
+/**
+ * The entry for this node, or the slot one would go in.
+ *
+ * Open addressing cannot leave a hole behind, so a dropped entry keeps its node
+ * as a tombstone and only loses its model - a probe has to walk over it to
+ * reach whatever was filed behind it. **Which means a tombstone has to be
+ * handed back for reuse**, because models are freed and loaded again all the
+ * way through a stage - every weapon the player switches to, every body and
+ * head a simulant spawns with - and each of those loads leaves its nodes behind
+ * as tombstones. Taking only empty slots fills the table with the dead in one
+ * long match: registration stops working, and every lookup in the draw path
+ * walks all 4096 entries before giving up. So the probe runs to the end of the
+ * chain looking for the node and hands back the first slot it could take.
+ */
+/**
+ * Whether an entry's mesh is drawn in the look being drawn: all of them with
+ * the meshes on, and with them off only a model the release alone has - an
+ * Agent 4 already spawned when F6 went to the N64 look keeps his mesh until
+ * his next spawn gives him the Shock Trooper (xblaagent4.c), since his file's
+ * own lists are 4J's placeholder.
+ */
+static s32 xblaMeshEntryLive(const struct xblameshentry *e)
+{
+	return xblaMeshGetEnabled() || e->releaseonly;
+}
+
+static struct xblameshentry *xblaMeshSlotFor(const struct modelnode *node)
+{
+	u32 h = (u32)(((uintptr_t)node >> 4) * 2654435761u) & (XBLAMESH_HASHSIZE - 1);
+	struct xblameshentry *reusable = NULL;
+
+	for (s32 i = 0; i < XBLAMESH_HASHSIZE; i++) {
+		struct xblameshentry *e = &hash[(h + i) & (XBLAMESH_HASHSIZE - 1)];
+
+		if (e->node == node) {
+			return e;
+		}
+
+		// The end of the chain: nothing is filed past here, so the search is
+		// over and this slot - or a tombstone passed on the way - is the one.
+		if (!e->node) {
+			return reusable ? reusable : e;
+		}
+
+		if (!e->modeldef && !reusable) {
+			reusable = e;
+		}
+	}
+
+	return reusable;
+}
+
+/**
+ * The entry for one node of one model, taken or made, ready to be written.
+ *
+ * Both halves of an entry are written by different passes of the same model
+ * load - the matcher first, then the pack's filing - so a writer that finds
+ * the entry already belongs to this model must leave the other half alone.
+ * One that finds anything else (an empty slot, or a tombstone another model
+ * left behind) starts it from nothing, since none of what is on it is about
+ * this model.
+ */
+static struct xblameshentry *xblaMeshEntryFor(struct modelnode *node, const struct modeldef *modeldef)
+{
+	struct xblameshentry *e = xblaMeshSlotFor(node);
+
+	if (!e) {
+		return NULL;
+	}
+
+	if (e->node != node || e->modeldef != modeldef) {
+		e->slot = 0;
+		e->part = 0;
+		e->use = -1;
+		e->suppress = 0;
+		e->matched = 0;
+		e->releaseonly = 0;
+		e->fileid = 0;
+		e->packpart = XBLAMESH_NOPART;
+		e->packuse = -1;
+		e->packhasmesh = 0;
+		e->beanrow = -1;
+	}
+
+	// A slot with no model in it is empty or a tombstone, and either way this
+	// is one more live entry. One that has a model is an entry being taken
+	// over, which is one out and one in.
+	if (!e->modeldef) {
+		g_XblaMeshNumNodes++;
+	}
+
+	if (!e->node) {
+		g_XblaMeshNumSlots++;
+	}
+
+	e->node = node;
+	e->modeldef = modeldef;
+
+	return e;
+}
+
+/**
+ * The record of this model's use of this mesh, made if there is not one.
+ *
+ * A model can hold two of these at once - the release's mesh and the pack's
+ * file for the model - and the two are keyed on different numbers (a slot of
+ * the package against a file id of the game's), so the kind is part of the
+ * key: without it a model whose file id happens to equal its mesh slot would
+ * find the other one's parts.
+ */
+static s32 xblaMeshUseFor(const struct modeldef *modeldef, s32 slot, s32 pack)
+{
+	s32 free = -1;
+
+	for (s32 i = 0; i < numUses; i++) {
+		if (uses[i].modeldef == modeldef && uses[i].slot == slot && uses[i].pack == (pack ? 1 : 0)) {
+			return i;
+		}
+
+		if (!uses[i].modeldef && free < 0) {
+			free = i;
+		}
+	}
+
+	if (free < 0) {
+		if (numUses >= capUses) {
+			s32 cap = capUses ? capUses * 2 : 64;
+			struct xblameshuse *grown = realloc(uses, (size_t)cap * sizeof(*uses));
+
+			if (!grown) {
+				return -1;
+			}
+
+			uses = grown;
+			capUses = cap;
+		}
+
+		free = numUses++;
+	}
+
+	memset(&uses[free], 0, sizeof(uses[free]));
+	uses[free].modeldef = modeldef;
+	uses[free].slot = (u16)slot;
+	uses[free].pack = (u8)(pack ? 1 : 0);
+
+	for (s32 i = 0; i < XBLAMESH_MAXPARTS; i++) {
+		uses[free].partmtx[i] = -1;
+	}
+
+	return free;
+}
+
+/**
+ * Drops every entry belonging to one modeldef, live or dead.
+ *
+ * Every model load comes through here now (see xblaMeshMatchModel), including
+ * on a machine that has no package at all, so the table walk is skipped when
+ * there is nothing in the table to walk over.
+ */
+static void xblaMeshForgetModel(const struct modeldef *modeldef)
+{
+	for (s32 i = 0; i < numUses; i++) {
+		if (uses[i].modeldef == modeldef) {
+			uses[i].modeldef = NULL;
+			xblaMeshBruiseFree(&uses[i]);
+		}
+	}
+
+	if (!g_XblaMeshNumNodes) {
+		return;
+	}
+
+	// Open addressing cannot leave a hole behind, so a dropped entry keeps its
+	// node as a tombstone and loses its model: a probe still walks over it,
+	// and a lookup that lands on it sees no model and gives up.
+	for (s32 i = 0; i < XBLAMESH_HASHSIZE; i++) {
+		if (hash[i].node && hash[i].modeldef == modeldef) {
+			hash[i].modeldef = NULL;
+			hash[i].slot = 0;
+			hash[i].matched = 0;
+			hash[i].releaseonly = 0;
+			hash[i].fileid = 0;
+			hash[i].packpart = XBLAMESH_NOPART;
+			hash[i].packuse = -1;
+			hash[i].packhasmesh = 0;
+			g_XblaMeshNumNodes--;
+		}
+	}
+}
+
+static s32 xblaMeshVerbose;
+static s32 xblaMeshDrawLog;
+static s32 xblaMeshFileId;
+
+/**
+ * What the node was going to draw, next to what will be drawn instead.
+ *
+ * The release's geometry is meant to be the model's own coordinates 1:1, so
+ * the two boxes should sit on top of each other. --xbla-mesh-verbose is how
+ * that gets checked on something the game is actually drawing rather than on
+ * a file.
+ */
+static void xblaMeshLogNode(const struct modelnode *node, u32 type, s32 slot, s32 part)
+{
+	const Vtx *vertices = NULL;
+	s32 numvertices = 0;
+	s16 lo[3];
+	s16 hi[3];
+
+	if (type == MODELNODETYPE_DL) {
+		vertices = node->rodata->dl.vertices;
+		numvertices = node->rodata->dl.numvertices;
+	} else {
+		vertices = node->rodata->gundl.vertices;
+		numvertices = node->rodata->gundl.numvertices;
+	}
+
+	if (!vertices || numvertices <= 0) {
+		sysLogPrintf(LOG_NOTE, "xblamesh: node %p slot %d part %d, no stock vertices",
+				node, slot, part);
+		return;
+	}
+
+	for (s32 i = 0; i < 3; i++) {
+		lo[i] = vertices[0].v[i];
+		hi[i] = vertices[0].v[i];
+	}
+
+	for (s32 i = 1; i < numvertices; i++) {
+		for (s32 j = 0; j < 3; j++) {
+			if (vertices[i].v[j] < lo[j]) {
+				lo[j] = vertices[i].v[j];
+			}
+
+			if (vertices[i].v[j] > hi[j]) {
+				hi[j] = vertices[i].v[j];
+			}
+		}
+	}
+
+	sysLogPrintf(LOG_NOTE, "xblamesh: node %p slot %d part %d, stock %d verts "
+			"[%d %d %d]..[%d %d %d]",
+			node, slot, part, numvertices, lo[0], lo[1], lo[2], hi[0], hi[1], hi[2]);
+}
+
+/**
+ * Whether this node is the near copy of a head's hair, which is the one piece
+ * of stock geometry the release's mesh has already.
+ *
+ * Walked on our side rather than theirs, since the two trees are the same tree
+ * here by construction, and a head is not grafted onto a body yet at the load
+ * this runs from - so the walk ends at the head model's own root.
+ *
+ * The game names it: a head model's parts number its toggled pieces, and
+ * `MODELPART_HEAD_HAT` (1) is the hair - `Cheadwlab`'s slab of it, the piece
+ * that came out hanging in the air over the release's own short hair. 53 of
+ * the 76 heads have one and the release gives **none** of the 53 a mesh id,
+ * where it gives the sunglasses beside them one in 45 of the 51 heads that
+ * have those. A piece 4J modelled gets a group; the hair never does, in any
+ * head, because it is painted into the head itself.
+ *
+ * One thing this will not do, which the code it replaced did (the sunglasses
+ * the release left at zero are xblaMeshIsGlassesList()'s):
+ *
+ *   * **a far LOD alternative** keeps its own geometry, hair included. The
+ *     head a chr is drawn from past 6000 units is the game's own - of the
+ *     132 ids the release gives a head, the 124 under a distance node are
+ *     every one on an alternative that starts at 0 - so a distant head that
+ *     lost its hair would just be bald. Only the alternative drawn where the
+ *     mesh is drawn is the one the mesh has already.
+ *
+ * And it is asked of a head only. Part 1 is a toggle in one other model,
+ * `MODELPART_DRCAROLL_0001`, and a part number means nothing outside the
+ * skeleton that numbered it - so the model's skeleton is checked first. A
+ * head's is the one skeleton the game never promotes to a pointer (there is no
+ * `g_SkelHead` in `g_Skeletons[]`), so it is still the number `SKEL_HEAD` here,
+ * which is how body.c reads it too.
+ */
+static s32 xblaMeshIsHeadModel(const struct modeldef *modeldef)
+{
+	return (uintptr_t)modeldef->skel < 0x10000 && (s16)(uintptr_t)modeldef->skel == SKEL_HEAD;
+}
+
+/** Whether the model's parts table names this node at all. */
+static s32 xblaMeshNodeIsNumbered(const struct modeldef *modeldef, const struct modelnode *node)
+{
+	for (s32 i = 0; i < modeldef->numparts; i++) {
+		if (modeldef->parts[i] == node) {
+			return 1;
+		}
+	}
+
+	return 0;
+}
+
+static s32 xblaMeshIsHairList(struct modeldef *modeldef, const struct modelnode *node)
+{
+	const struct modelnode *hat;
+
+	if (!xblaMeshIsHeadModel(modeldef)) {
+		return 0;
+	}
+
+	hat = modelGetPart(modeldef, MODELPART_HEAD_HAT);
+
+	if (hat && (hat->type & 0xff) != MODELNODETYPE_TOGGLE) {
+		return 0;
+	}
+
+	if (!hat && xblaMeshFileId != FILE_CHEADROBIN) {
+		// One head keeps its hair under a toggle its parts table does not
+		// number - Robin's (`CheadrobinZ`: parts 0x191 and the sunglasses,
+		// and the hair's toggle in neither). The game can reach a toggle
+		// only through its part number, so that one is on for ever, and it
+		// was the last hair slab still hanging over a release head once the
+		// numbered ones were gone. For Robin the hair is "the toggle no part
+		// names"; for every other head without a hat part there is nothing
+		// to suppress.
+		return 0;
+	}
+
+	for (s32 i = 0; node && i < XBLAMESH_PARENTSCAN; i++) {
+		const u32 type = node->type & 0xff;
+
+		if (type == MODELNODETYPE_TOGGLE) {
+			// The hair's toggle, or some other toggled piece. A toggle no part
+			// names is hair as well where a head has a hat part: Beau's
+			// (`CheadbeauZ`) ponytail is the one such list in the release's
+			// heads, on for ever beside the release's own slicked-back hair
+			// (F3 20261007-073921: "Beau's N64 ponytail remains").
+			if (hat) {
+				return node == hat || !xblaMeshNodeIsNumbered(modeldef, node);
+			}
+
+			return !xblaMeshNodeIsNumbered(modeldef, node);
+		}
+
+		if (type == MODELNODETYPE_DISTANCE) {
+			// The far alternative of the pair, which the mesh does not stand
+			// in for. Both of a hair piece's two lists are under one of these.
+			if (!node->rodata || node->rodata->distance.near != 0.0f) {
+				return 0;
+			}
+		} else if (node == modeldef->rootnode) {
+			// The whole way up without meeting the hair's toggle.
+			return 0;
+		}
+
+		node = node->parent;
+	}
+
+	return 0;
+}
+
+/**
+ * The sunglasses of a head whose mesh has none, which the release does not draw.
+ *
+ * Six heads have a toggled sunglasses list the release left at zero with a
+ * bare face beside it - `Cheadanka`, `Cheaddarling`, `Cheaddavec`,
+ * `Cheadfem_guard`, `Cheadjon`, `Cheadjonathan`: one group, one draw, one
+ * texture each - and `Cheadfem_guard2` keeps hers under a toggle no part
+ * numbers, her parts table being empty. The release draws nothing for them:
+ * its own Villa intro has Jon bare-faced where the N64 puts sunglasses on
+ * him. So in the XBLA look they are filed as covered whatever the game has
+ * switched on - the Air Base stewardess, spawned SPAWNFLAG_FORCESUNGLASSES in
+ * Anka's head, included - and the N64 look keeps them. The 45 heads whose sunglasses the
+ * release remodelled carry a mesh id on the list and never reach here; the
+ * game switches those on and off as it always did.
+ *
+ * Until 2026-09-25 the six were moved onto the mesh's face instead (a
+ * tester's F3 in Villa's intro had them across Jon's forehead), and Female
+ * Guard 2's with them; a later F3 asked for hers off, and the user for all
+ * of them bare, like the release.
+ *
+ * The near alternative only: a far LOD keeps its own geometry, as the hair's
+ * does (xblaMeshIsHairList()).
+ */
+static s32 xblaMeshIsGlassesList(struct modeldef *modeldef, const struct modelnode *node)
+{
+	const struct modelnode *glasses;
+
+	if (!xblaMeshIsHeadModel(modeldef)) {
+		return 0;
+	}
+
+	glasses = modelGetPart(modeldef, MODELPART_HEAD_SUNGLASSES);
+
+	if (glasses && (glasses->type & 0xff) != MODELNODETYPE_TOGGLE) {
+		return 0;
+	}
+
+	if (!glasses && xblaMeshFileId != FILE_CHEADFEM_GUARD2) {
+		return 0;
+	}
+
+	for (s32 i = 0; node && i < XBLAMESH_PARENTSCAN; i++) {
+		const u32 type = node->type & 0xff;
+
+		if (type == MODELNODETYPE_TOGGLE) {
+			if (glasses) {
+				return node == glasses;
+			}
+
+			return !xblaMeshNodeIsNumbered(modeldef, node);
+		}
+
+		if (type == MODELNODETYPE_DISTANCE) {
+			if (!node->rodata || node->rodata->distance.near != 0.0f) {
+				return 0;
+			}
+		} else if (node == modeldef->rootnode) {
+			return 0;
+		}
+
+		node = node->parent;
+	}
+
+	return 0;
+}
+
+/**
+ * A first person gun's toggled piece the release left at zero, other than a
+ * muzzle flash: a piece of the gun the release's mesh has already.
+ *
+ * Eighteen guns name one: part 0x42, which the game hides in the hand
+ * (bgun0f098030()) and shows only on the inventory page and in the menus, and
+ * on the Falcon 2 part 0x2f, the front half of the silencer beside the
+ * remodelled back half (part 0x2d, mesh part 4). Drawn as the game's, the
+ * inventory's Falcon 2 (silencer) ended in the N64's flat ten-sided cap and
+ * black bore in front of the release's round one (F3 20261005-232941); the
+ * release's own inventory, in Xenia, shows its round cap and nothing of the
+ * N64's. The muzzle flashes stay: they are the toggled zeros the game turns
+ * on (xblaMeshIsCovered()).
+ */
+static s32 xblaMeshIsGunHiddenPiece(struct modeldef *modeldef, const struct modelnode *node)
+{
+	const s16 *partnums;
+
+	if (!node || (node->type & 0xff) != MODELNODETYPE_GUNDL || modeldef->numparts <= 0) {
+		return 0;
+	}
+
+	partnums = (const s16 *)&modeldef->parts[modeldef->numparts];
+
+	for (s32 depth = 0; node && depth < XBLAMESH_PARENTSCAN; depth++) {
+		const u32 type = node->type & 0xff;
+
+		if (type == MODELNODETYPE_TOGGLE) {
+			for (s32 i = 0; i < modeldef->numparts; i++) {
+				if (modeldef->parts[i] == node) {
+					return partnums[i] != MODELPART_GUN_MUZZLEFLASH1
+						&& partnums[i] != MODELPART_GUN_MUZZLEFLASH2
+						&& partnums[i] != MODELPART_GUN_MUZZLEFLASH3;
+				}
+			}
+
+			return 0;
+		}
+
+		if (type == MODELNODETYPE_DISTANCE && (!node->rodata || node->rodata->distance.near != 0.0f)) {
+			return 0;
+		}
+
+		if (node == modeldef->rootnode) {
+			return 0;
+		}
+
+		node = node->parent;
+	}
+
+	return 0;
+}
+
+/**
+ * A boot logo the release draws (see xblaMeshIsBootLogo()), whose mesh is the
+ * whole picture: every other list of the model is covered by it, the toggled
+ * ones as well, since both logos are a different picture and nothing of the
+ * N64's belongs beside them.
+ */
+static s32 xblaMeshIsReleaseBootLogo(s32 fileid)
+{
+	return fileid == FILE_PRARELOGO || fileid == FILE_PNINTENDOLOGO || fileid == FILE_PNLOGO
+			|| fileid == FILE_PNLOGO2;
+}
+
+/**
+ * A model whose toggled pieces 4J remodelled into the mesh while leaving their
+ * ids at zero, so the toggled-piece rule below would keep the game's copy
+ * drawing inside the release's.
+ *
+ * `PdropshipZ`: the second of its seventeen lists is the ship's interior (the
+ * ceiling grille 0aed and the hazard band 0aeb) under a toggle beside the named
+ * list. The release's mesh has an interior of its own, its ceiling within two
+ * units of the stock one's, and in Villa's intro the two z-fought - the hazard
+ * strip above the door trading places with the grille from frame to frame.
+ */
+static s32 xblaMeshTogglesAreInMesh(s32 fileid)
+{
+	return fileid == FILE_PDROPSHIP;
+}
+
+/**
+ * A model drawn as the game's own while the X-ray scanner is on.
+ *
+ * Pelagic II's communications hubs (PcomhubZ) have three screens inside the
+ * casing - lists 1 to 3, which the release leaves at zero and the game draws
+ * beside the mesh - and through the scanner, which draws every prop
+ * see-through and writing no depth, those screens are the green and red
+ * panels the mission shows the player. The release's casing is drawn with
+ * its own depth wherever it is solid, so through the scanner it hid them and
+ * the hubs showed no screens at all (F3 20261004-072609). Under the scanner
+ * the hub is a tinted silhouette either way, so it is drawn as the game's.
+ */
+static s32 xblaMeshXrayStock(s32 fileid)
+{
+	return fileid == FILE_PCOMHUB;
+}
+
+/**
+ * Whether the model's own mesh has this node's geometry already.
+ *
+ * **A mesh is the whole model, and the release names it on one node.** The id
+ * is written into one list node's padding and the fourteen or fifteen others
+ * of a character - a thigh, a forearm, a shoulder - are left at zero, because
+ * 4J had no reason to mark what their own art already contains. Read as "a
+ * zero keeps its own geometry", which is what this did, every guard in the
+ * game drew the release's body *and* the N64 body inside it: `CcarringtonZ` is
+ * thirty list nodes, one of them named, and the mesh named on it is 4792
+ * vertices over fifteen palette entries - the whole standing figure - while
+ * the other twenty-nine draw 2391 vertices of a complete second character in
+ * the same place. 127 of the 134 character models are that shape, and so are
+ * the Carrington Institute's sofa, its hovercopter and its autosurgeon: 946
+ * list nodes across the release, against 1796 the old reading kept.
+ *
+ * What the mesh does *not* stand in for is the two kinds of list the game
+ * draws instead of, rather than beside, the one it was named on:
+ *
+ *   * **a far LOD alternative** - a distance node whose near threshold is not
+ *     zero. The mesh's own node is under the near alternative of its pair, so
+ *     past that distance nothing of the mesh is drawn and the game's low-poly
+ *     copy is the whole model. Suppressed, a distant guard would be nothing at
+ *     all. (This is the same test xblaMeshMatchBySize's leftovers must pass.)
+ *   * **a toggled piece** - geometry the game switches on and off: a gun's
+ *     muzzle flash (eleven of them), the pieces of the two Nintendo logos.
+ *     4J marked the toggled pieces they *did* remodel with an id and the ones
+ *     they kept with 0xFFFF, so a toggled zero is one they never looked at.
+ *     The exceptions are a head's, and are asked about before this: its
+ *     hair, which is toggled and *is* in the mesh (xblaMeshIsHairList(),
+ *     named from the game's own MODELPART_HEAD_HAT), and the sunglasses the
+ *     release left at zero, which it does not draw (xblaMeshIsGlassesList()).
+ */
+static s32 xblaMeshIsCovered(struct modeldef *modeldef, const struct modelnode *node)
+{
+	for (s32 i = 0; node && i < XBLAMESH_PARENTSCAN; i++) {
+		const u32 type = node->type & 0xff;
+
+		if (node == modeldef->rootnode) {
+			return 1;
+		}
+
+		if (type == MODELNODETYPE_DISTANCE) {
+			if (!node->rodata || node->rodata->distance.near != 0.0f) {
+				return 0;
+			}
+		} else if (type == MODELNODETYPE_TOGGLE) {
+			return 0;
+		}
+
+		node = node->parent;
+	}
+
+	return 0;
+}
+
+/**
+ * Files a node that draws nothing while the model's mesh is drawn.
+ */
+static void xblaMeshSuppressNode(struct modeldef *modeldef, struct modelnode *node,
+		s32 slot, s32 kind)
+{
+	struct xblameshentry *e = xblaMeshEntryFor(node, modeldef);
+
+	if (!e) {
+		return;
+	}
+
+	e->slot = (u16)(slot > 0 ? slot : 0);
+	e->part = 0;
+	e->use = -1;
+	e->suppress = kind;
+	e->matched = 1;
+}
+
+/**
+ * Walks our tree and theirs together, recording every node they replace.
+ *
+ * The two files hold the same nodes in the same order - the release edited two
+ * padding bytes and nothing else - so the walk is a straight zip, and any
+ * disagreement about a node's type means we are not looking at the same model
+ * and the whole file is left alone.
+ */
+static s32 xblaMeshMatchNodes(struct modeldef *modeldef, const u8 *file, u32 len)
+{
+	struct modelnode *ournode = modeldef->rootnode;
+	u32 theiroff = xblaMeshBE32(file) & 0xffffff;
+	struct modelnode *covered[XBLAMESH_COVERED];
+	s32 numcovered = 0;
+	s32 firstslot = -1;
+	s32 found = 0;
+	s32 suppressed = 0;
+	s32 walked = 0;
+
+	// Both walks are the same depth-first order the game's own iteration uses:
+	// down to the child, then along next, then back up to the parent's next.
+	while (ournode && theiroff) {
+		u32 ourtype;
+		u32 theirtype;
+		u32 theirchild;
+		u16 id;
+
+		if (theiroff + 24 > len) {
+			return 0;
+		}
+
+		ourtype = ournode->type & 0xff;
+		theirtype = xblaMeshBE16(file + theiroff) & 0xff;
+
+		if (ourtype != theirtype) {
+			return 0;
+		}
+
+		if (++walked > 4096) {
+			return 0;
+		}
+
+		id = xblaMeshBE16(file + theiroff + 2);
+
+		// 0xFFFF is not an id: it means this node keeps its own geometry.
+		if (id && id != 0xffff &&
+				(ourtype == MODELNODETYPE_DL || ourtype == MODELNODETYPE_GUNDL)) {
+			struct xblameshentry *e;
+
+			// The low 12 bits are a PackedSegFile file id, and slot i is file
+			// id i + 1 the way the game's own files are - so the mesh is one
+			// slot below the number in the node. Reading it as the slot itself
+			// gives a mesh for every model and the wrong one for nearly all of
+			// them, which is a much harder mistake to see than a miss: a chair
+			// comes back as the chair beside it.
+			s32 slot = (s32)(id & 0xfff) - 1;
+
+			e = (slot >= 0 && slot < numRecords && recUncSize[slot])
+					? xblaMeshEntryFor(ournode, modeldef) : NULL;
+
+			if (e) {
+				e->slot = (u16)slot;
+				e->part = (u16)(id >> 12);
+
+				if (slotFile) {
+					slotFile[slot] = (u16)xblaMeshFileId;
+				}
+
+				// Which mesh the model's covered lists wait on, and whether
+				// there is one at all: only a mesh named on a list the game
+				// draws beside them can stand in for them. `CheadgreyZ` names
+				// its only mesh on a toggled alternative, and suppressing the
+				// head beside it would leave the Grey with no head whenever
+				// that toggle is off.
+				//
+				// The boot logos are the exception: both the Rare logo's mesh and
+				// the cube's are named under a toggle, and the title shows that
+				// toggle whenever the mesh is to draw (the cube's never is,
+				// otherwise). Without this their covered lists were counted and
+				// never filed - the N64's gold R drew over 4J's Rare logo, and
+				// the cube's normals drew as colours around 4J's cube.
+				if (firstslot < 0 && (xblaMeshIsCovered(modeldef, ournode) ||
+						xblaMeshIsReleaseBootLogo(xblaMeshFileId))) {
+					firstslot = slot;
+				}
+
+				e->use = xblaMeshUseFor(modeldef, slot, 0);
+				e->suppress = 0;
+				e->matched = 1;
+				e->xraystock = xblaMeshXrayStock(xblaMeshFileId);
+				found++;
+
+				if (e->use >= 0 && e->part < XBLAMESH_MAXPARTS) {
+					struct xblameshuse *use = &uses[e->use];
+
+					use->parts[e->part] = ournode;
+					use->partmtx[e->part] = xblaMeshNodeMtx(file, len, theiroff);
+
+					if (e->part >= use->numparts) {
+						use->numparts = (u16)(e->part + 1);
+					}
+				}
+
+				if (xblaMeshVerbose) {
+					xblaMeshLogNode(ournode, ourtype, slot, id >> 12);
+				}
+
+				if (xblaMeshVerbose) {
+					sysLogPrintf(LOG_NOTE, "xblamesh:   walked %d nodes to it", walked);
+				}
+
+				if (xblaMeshVerbose) {
+					sysLogPrintf(LOG_NOTE, "xblamesh:   file %d node %p -> slot %d",
+							xblaMeshFileId, ournode, slot);
+				}
+			}
+		} else if (!id && (ourtype == MODELNODETYPE_DL || ourtype == MODELNODETYPE_GUNDL)) {
+			// A zero is not "this node keeps what it has". The release names a
+			// mesh on one node of a model and leaves the rest of that model's
+			// lists at zero, and the mesh is the whole model - so a zero is
+			// geometry the mesh has already, unless it is one of the lists the
+			// game draws *instead of* the named one. xblaMeshIsCovered() is
+			// where that is decided, and the hair is asked about first because
+			// it is a toggled piece that the mesh does have.
+			//
+			// 4J marked a toggled piece they kept with 0xFFFF and gave one
+			// they remodelled an id; the hair gets neither, in any of the 53
+			// heads that have one, because it is painted into the head.
+			// Drawing the game's over the top gives a guard two hairdos - the
+			// N64 one hanging above the release's head, where the scalp it was
+			// cut to fit no longer is. Which node that is comes from the game
+			// rather than from the shape of the tree: xblaMeshIsHairList()
+			// asks the model for its MODELPART_HEAD_HAT.
+			if (xblaMeshIsHairList(modeldef, ournode)) {
+				xblaMeshSuppressNode(modeldef, ournode, 0, XBLAMESH_SUPPRESS_HAIR);
+				suppressed++;
+			} else if ((xblaMeshIsCovered(modeldef, ournode) || xblaMeshIsGlassesList(modeldef, ournode)
+						|| xblaMeshIsGunHiddenPiece(modeldef, ournode)
+						|| xblaMeshIsReleaseBootLogo(xblaMeshFileId) || xblaMeshTogglesAreInMesh(xblaMeshFileId))
+					&& numcovered < XBLAMESH_COVERED) {
+				// Held until the walk is over: a model whose tree stops
+				// matching part way through leaves through one of the returns
+				// above, and nothing of it may be left filed.
+				covered[numcovered++] = ournode;
+			}
+		}
+
+		theirchild = xblaMeshFileChild(file, len, theiroff, theirtype);
+
+		if (ournode->child && theirchild) {
+			ournode = ournode->child;
+			theiroff = theirchild;
+			continue;
+		}
+
+		if ((ournode->child == NULL) != (theirchild == 0)) {
+			return 0;
+		}
+
+		while (ournode) {
+			// Every read here is a word out of the node at theiroff, and after
+			// a step up to the parent that offset came out of the file and has
+			// not been looked at - so it is checked against the node's whole
+			// 24 bytes before either link is read out of it.
+			if (theiroff + 24 > len) {
+				return 0;
+			}
+
+			if (ournode->next) {
+				ournode = ournode->next;
+				theiroff = xblaMeshBE32(file + theiroff + 12) & 0xffffff;
+				break;
+			}
+
+			ournode = ournode->parent;
+			theiroff = xblaMeshBE32(file + theiroff + 8) & 0xffffff;
+		}
+
+		if (!ournode) {
+			break;
+		}
+
+		if (!theiroff) {
+			return 0;
+		}
+	}
+
+	// Only a model that really did match: the walk registers as it goes, and a
+	// model that names no mesh at all must keep every list it has.
+	if (found && firstslot >= 0) {
+		for (s32 i = 0; i < numcovered; i++) {
+			xblaMeshSuppressNode(modeldef, covered[i], firstslot,
+					XBLAMESH_SUPPRESS_COVERED);
+		}
+	}
+
+	if (found && xblaMeshVerbose) {
+		if (suppressed) {
+			sysLogPrintf(LOG_NOTE, "xblamesh:   %d toggled stock pieces the mesh has already",
+					suppressed);
+		}
+
+		if (numcovered) {
+			sysLogPrintf(LOG_NOTE, "xblamesh:   %d more lists the mesh covers, drawing nothing",
+					numcovered);
+		}
+	}
+
+	return found;
+}
+
+/**
+ * How many vertices one of our nodes draws, or -1 if it is not a list node.
+ */
+static s32 xblaMeshNodeNumVertices(const struct modelnode *node)
+{
+	const u32 type = node->type & 0xff;
+
+	if (!node->rodata) {
+		return -1;
+	}
+
+	if (type == MODELNODETYPE_DL) {
+		return node->rodata->dl.numvertices;
+	}
+
+	if (type == MODELNODETYPE_GUNDL) {
+		return node->rodata->gundl.numvertices;
+	}
+
+	return -1;
+}
+
+/** The next node of our tree, in the order the game's own iteration takes. */
+static struct modelnode *xblaMeshNextNode(struct modelnode *node)
+{
+	if (node->child) {
+		return node->child;
+	}
+
+	while (node) {
+		if (node->next) {
+			return node->next;
+		}
+
+		node = node->parent;
+	}
+
+	return NULL;
+}
+
+/**
+ * The last resort for a model the release rebuilt: pair the parts by size.
+ *
+ * Three files in the release are not ours with two bytes changed - they are
+ * ours with the nodes rearranged, and the zip above refuses them because a
+ * type does not line up. All three are Joanna's own head (combat, frock and
+ * aqua), which is the model a player looks at most in multiplayer, so they are
+ * worth having. What 4J did to them was to move the toggled piece - the
+ * earpiece on the right of her head - in front of the head itself, and in the
+ * aqua one to add a node.
+ *
+ * The pairing that gets all three right is by size: our biggest list is the
+ * head and takes part 0, our next biggest is the earpiece and takes part 1.
+ * That holds because the mesh's own groups come the same way round - the head
+ * group of her mesh is 2341 vertices against the earpiece's 672 - and because
+ * the part number is what says which group a node stands for.
+ *
+ * It is deliberately narrow. It runs only once the zip has failed, it wants
+ * the release's copy to name exactly one mesh and to number its parts 0..n-1
+ * with no gaps, and it wants at least that many lists on our side. Anything
+ * else keeps its own geometry, which is what all three of these did before.
+ */
+static s32 xblaMeshMatchBySize(struct modeldef *modeldef, const u8 *file, u32 len)
+{
+	u32 theiroff[XBLAMESH_MAXPARTS];
+	struct modelnode *ours[XBLAMESH_MAXPARTS];
+	s32 ourverts[XBLAMESH_MAXPARTS];
+	struct modelnode *node;
+	s32 slot = -1;
+	s32 numparts = 0;
+	s32 numours = 0;
+	s32 walked = 0;
+	u32 off = xblaMeshBE32(file) & 0xffffff;
+
+	for (s32 i = 0; i < XBLAMESH_MAXPARTS; i++) {
+		theiroff[i] = 0;
+	}
+
+	// Their side: every node that names a mesh, by part number.
+	while (off && walked++ < 4096) {
+		u32 type;
+		u32 id;
+		u32 child;
+
+		if (off + 24 > len) {
+			return 0;
+		}
+
+		type = xblaMeshBE16(file + off) & 0xff;
+		id = xblaMeshBE16(file + off + 2);
+
+		if (id && id != 0xffff &&
+				(type == MODELNODETYPE_DL || type == MODELNODETYPE_GUNDL)) {
+			const s32 theirslot = (s32)(id & 0xfff) - 1;
+			const u32 part = id >> 12;
+
+			if ((slot >= 0 && theirslot != slot) || part >= XBLAMESH_MAXPARTS ||
+					theiroff[part]) {
+				return 0;
+			}
+
+			slot = theirslot;
+			theiroff[part] = off;
+
+			if ((s32)part + 1 > numparts) {
+				numparts = (s32)part + 1;
+			}
+		}
+
+		child = xblaMeshFileChild(file, len, off, type);
+
+		if (child) {
+			off = child;
+			continue;
+		}
+
+		while (off) {
+			const u32 next = xblaMeshBE32(file + off + 12) & 0xffffff;
+
+			if (next) {
+				off = next;
+				break;
+			}
+
+			off = xblaMeshBE32(file + off + 8) & 0xffffff;
+
+			if (off && off + 24 > len) {
+				return 0;
+			}
+		}
+	}
+
+	if (slot < 0 || slot >= numRecords || !recUncSize[slot]) {
+		return 0;
+	}
+
+	for (s32 i = 0; i < numparts; i++) {
+		if (!theiroff[i]) {
+			return 0; // a gap in the part numbers
+		}
+	}
+
+	// Our side: the lists, biggest first. An insertion sort, because a model
+	// that gets this far has a handful of them.
+	for (node = modeldef->rootnode; node; node = xblaMeshNextNode(node)) {
+		const s32 verts = xblaMeshNodeNumVertices(node);
+		s32 at = numours < XBLAMESH_MAXPARTS ? numours : XBLAMESH_MAXPARTS - 1;
+
+		if (verts <= 0) {
+			continue;
+		}
+
+		while (at > 0 && ourverts[at - 1] < verts) {
+			ours[at] = ours[at - 1];
+			ourverts[at] = ourverts[at - 1];
+			at--;
+		}
+
+		ours[at] = node;
+		ourverts[at] = verts;
+
+		if (numours < XBLAMESH_MAXPARTS) {
+			numours++;
+		}
+	}
+
+	if (numours < numparts) {
+		return 0;
+	}
+
+	for (s32 part = 0; part < numparts; part++) {
+		struct xblameshentry *e = xblaMeshEntryFor(ours[part], modeldef);
+
+		if (!e) {
+			return 0;
+		}
+
+		e->slot = (u16)slot;
+		e->part = (u16)part;
+		e->use = xblaMeshUseFor(modeldef, slot, 0);
+
+		if (slotFile && slot >= 0 && slot < numRecords) {
+			slotFile[slot] = (u16)xblaMeshFileId;
+		}
+		e->suppress = 0;
+		e->matched = 1;
+
+		if (e->use >= 0) {
+			struct xblameshuse *use = &uses[e->use];
+
+			use->parts[part] = ours[part];
+			use->partmtx[part] = xblaMeshNodeMtx(file, len, theiroff[part]);
+
+			if (part >= use->numparts) {
+				use->numparts = (u16)(part + 1);
+			}
+		}
+
+		if (xblaMeshVerbose) {
+			sysLogPrintf(LOG_NOTE, "xblamesh:   by size: part %d -> node %p, "
+					"%d verts, slot %d", part, ours[part], ourverts[part], slot);
+		}
+	}
+
+	// Everything the pairing did not take has to be something it was right to
+	// leave. A model that gets this far is one whose tree did not zip against
+	// the release's copy, so there is nothing to say which of its lists the
+	// mesh stands for beyond their sizes - and the three heads this path
+	// exists for leave exactly one thing behind: a far LOD alternative, which
+	// the game draws instead of the near list rather than beside it.
+	//
+	// Anything else left over is drawn *with* what the mesh replaced, over the
+	// top of it, and that is not a pairing that has understood the model. A
+	// mod's model is the case that showed it: one 159-vertex list took the
+	// whole of a release mesh and the other twenty-four - near lists, toggled
+	// pieces, a head's hair - carried on drawing the game's own geometry
+	// through it. Refused here, the model keeps all of its own geometry, which
+	// is the right answer for a model this cannot read.
+	for (node = modeldef->rootnode; node; node = xblaMeshNextNode(node)) {
+		const struct modelnode *up;
+		s32 paired = 0;
+		s32 lod = 0;
+
+		if (xblaMeshNodeNumVertices(node) <= 0) {
+			continue;
+		}
+
+		for (s32 i = 0; i < numparts; i++) {
+			if (ours[i] == node) {
+				paired = 1;
+				break;
+			}
+		}
+
+		if (paired) {
+			continue;
+		}
+
+		// The far half of an LOD pair: a distance node whose near threshold is
+		// not zero, reached before the root and before any toggle.
+		for (up = node; up && !lod; up = up->parent) {
+			const u32 t = up->type & 0xff;
+
+			if (t == MODELNODETYPE_DISTANCE) {
+				lod = up->rodata && up->rodata->distance.near != 0.0f;
+				break;
+			}
+
+			if (t == MODELNODETYPE_TOGGLE || up == modeldef->rootnode) {
+				break;
+			}
+		}
+
+		if (!lod) {
+			if (xblaMeshVerbose) {
+				sysLogPrintf(LOG_NOTE, "xblamesh:   by size refused slot %d: a %d vertex "
+						"list is neither paired nor an LOD alternative, so the game "
+						"would draw it over the mesh", slot,
+						xblaMeshNodeNumVertices(node));
+			}
+
+			return 0;
+		}
+	}
+
+	return numparts;
+}
+
+/**
+ * The models of the boot sequence the release's meshes may not draw.
+ *
+ * 4J's package holds a mesh for the boot sequence's models, and three of them
+ * are the Xbox 360 release's own intro rather than better models of the N64's:
+ * file 1376's mesh is the orange Rare logo where the game's is the gold R on a
+ * blue plaque, file 221's is "Microsoft Game Studios" where the game's is the
+ * Nintendo wordmark, and file 224's is 4J's spinning Perfect Dark cube. Those
+ * draw whenever the meshes do, which is the release's intro on the release's
+ * switch (all were refused until 2026-09-13, when "the Rare logo, Microsoft
+ * logo and Nintendo 64 logo are all discoloured" was the complaint rather than
+ * the request). title.c scales the Rare logo, and shows the cube's mesh, which
+ * is written on the morph's target sides under a toggle the N64 never shows.
+ *
+ * File 222, the N64's first cube, is the fourth, and it was refused until
+ * 2026-09-13 as "a flat red box": it is 4J's own logo, a red cube with the 4J
+ * emblem cut into its top and bottom faces, which only shows as a box from the
+ * side the N64's spin looks at. The release running in Xenia shows it face on
+ * as the 4J Studios card, spinning, tipping back and crossfading into the
+ * Perfect Dark cube; title.c draws that.
+ *
+ * What is still refused is what 4J never drew: the other two have no mesh.
+ */
+static s32 xblaMeshIsBootLogo(u16 fileid)
+{
+	switch (fileid) {
+	case FILE_PNLOGO3:
+	case FILE_PJPNLOGO:
+		return 1;
+	}
+
+	return 0;
+}
+
+/**
+ * Matches one model's nodes against the release's copy of the same file.
+ *
+ * Runs for every model that loads. It will not unpack an archive to do it -
+ * see xblaMeshRegisterModel() - so on a machine whose package is not ready
+ * this does nothing at all.
+ */
+static void xblaMeshMatchModel(struct modeldef *modeldef, u16 fileid)
+{
+	u8 *file;
+	u32 len;
+	s32 found;
+
+	if (!modeldef || !modeldef->rootnode) {
+		return;
+	}
+
+	// Whatever is registered at this address belongs to a model that has been
+	// freed, since this one has only just been loaded into it. Dropped here,
+	// before anything can return: a model the release has no copy of leaves
+	// through one of the three returns below, and if it kept the dead entries
+	// it would inherit their meshes with them - the draw path's definition
+	// test cannot tell the two apart, both models being the same address. That
+	// is a stage's own doing rather than a stage change's, so lvReset() is not
+	// where it can be caught.
+	xblaMeshForgetModel(modeldef);
+
+	// A model load never unpacks a 250MB archive on somebody who might only
+	// want the texture pack - unless they have already asked for the meshes, in
+	// which case the first model load is exactly who should pay for it. Without
+	// that, Mod.XblaMeshes=1 in pd.ini with the release still inside its .7z
+	// drew no mesh at all and said nothing: nothing unpacked, so nothing was
+	// ever matched, and the checkbox that would have unpacked it was already
+	// on. Off, this is still the speculative pass that keeps the switch live.
+	if (!xblaMeshOpen(xblaMeshGetEnabled())) {
+		return;
+	}
+
+	// A mod's model is not the model this mesh is a mesh for.
+	//
+	// The release's package is keyed on the game's own file ids, and a mod
+	// replaces a file's contents while keeping its id: GoldenEye X's file 447
+	// is a GoldenEye character where the release's 447 is CbiotechZ. Matched
+	// anyway, the node-for-node zip refuses it - the trees disagree - and the
+	// pairing by size then takes it, hands the model's biggest list the whole
+	// of somebody else's mesh, and leaves its other twenty-four lists drawing
+	// their own geometry over it. That is what "the release's models and the
+	// game's are both on the screen, and the hair floats above the head" is:
+	// the head's hair is one of the twenty-four.
+	//
+	// So a model is only paired when its bytes came out of the ROM. A mod that
+	// leaves a file alone still gets the release's mesh for it, which is most
+	// of them.
+	if (!romdataFileIsStock(fileid)) {
+		if (xblaMeshVerbose) {
+			sysLogPrintf(LOG_NOTE, "xblamesh: model file %d is a mod's, not the "
+					"release's - left alone", fileid);
+		}
+
+		return;
+	}
+
+	// And a stock file drawn with a mod's pictures is the mod's look, not the
+	// release's. A mod can keep the game's door or crate and repaint it through
+	// its textures/, and the release's mesh brings the release's own pictures
+	// with it - the door the mod never had. The configs are still texture
+	// numbers here: modeldefLoad() matches before modeldef0f1a7560() loads them,
+	// so the mod is asked by number. A Stage Loader map's textures are not
+	// asked (xblaMeshRegisterModel()): they are its rooms', and a stock model
+	// on the map loads the ROM's.
+	for (s32 i = 0; modeldef->texconfigs && i < modeldef->numtexconfigs; i++) {
+		const uintptr_t num = (uintptr_t)modeldef->texconfigs[i].texturenum;
+
+		if (num < NUM_TEXTURES && modTextureExists((u16)num)) {
+			if (xblaMeshVerbose) {
+				sysLogPrintf(LOG_NOTE, "xblamesh: model file %d draws the mod's "
+						"texture %04x, not the release's - left alone", fileid, (u32)num);
+			}
+
+			return;
+		}
+	}
+
+	// A file read out of the release itself (Agent 4, xblaagent4.c) is in a
+	// slot of its own, and its copy in the package is under the release's id
+	if (romdataFileGetXblaId(fileid)) {
+		fileid = (u16)romdataFileGetXblaId(fileid);
+	}
+
+	if (xblaMeshIsBootLogo(fileid)) {
+		if (xblaMeshVerbose) {
+			sysLogPrintf(LOG_NOTE, "xblamesh: model file %d is a boot logo - the "
+					"release's is a different logo, left alone", fileid);
+		}
+
+		return;
+	}
+
+	// Slot i is the game's file id i + 1.
+	file = xblaMeshReadSlot((s32)fileid - 1, &len);
+
+	if (!file) {
+		return;
+	}
+
+	xblaMeshFileId = fileid;
+
+	if (xblaMeshVerbose) {
+		sysLogPrintf(LOG_NOTE, "xblamesh: model file %d, %u bytes", fileid, len);
+	}
+
+	found = xblaMeshMatchNodes(modeldef, file, len);
+
+	if (xblaMeshVerbose) {
+		sysLogPrintf(LOG_NOTE, "xblamesh: model file %d matched %d", fileid, found);
+	}
+
+	if (found == 0) {
+		// Either the release replaced nothing in this model, or the two trees
+		// disagreed and the partial matching has to come back out.
+		xblaMeshForgetModel(modeldef);
+
+		found = xblaMeshMatchBySize(modeldef, file, len);
+
+		if (found == 0) {
+			xblaMeshForgetModel(modeldef);
+		} else if (xblaMeshVerbose) {
+			sysLogPrintf(LOG_NOTE, "xblamesh: model file %d matched %d by size",
+					fileid, found);
+		}
+	}
+
+	free(file);
+}
+
+/**
+ * Every model is matched as it loads, whether or not the meshes are switched
+ * on, so that switching them on is a live thing to do.
+ *
+ * This used to be gated on the switch, which meant a level loaded with the
+ * meshes off had nothing to draw when they were turned on: the models had
+ * never been looked at, and a register of loaded models to go back over is not
+ * something that can be kept - a modeldef can be freed inside a stage and its
+ * address handed out again, and walking one that has been is a wild pointer
+ * away from a crash (it was: file 1369 in the G5 Building, whose rootnode had
+ * become 0xbe0003ffe0 by the time the switch was flipped).
+ *
+ * So the work is done up front instead, and it is affordable: 55 models in the
+ * G5 Building carry a mesh, matching them is a slot read and a tree walk each,
+ * and five loads of the level with this always on and five with it gated came
+ * out inside each other's run-to-run spread. What is *not* affordable is
+ * unpacking a 250MB archive for somebody who only ever wanted the texture
+ * pack, so this asks for the package only if there is one ready to read -
+ * xblaMeshOpen(0). A player whose copy is still inside its .7z pays for the
+ * unpack the first time they switch the meshes on, and from the next level
+ * load onwards is in the same place as everybody else.
+ */
+void xblaMeshRegisterModel(struct modeldef *modeldef, u16 fileid)
+{
+	// Asked the way the model's textures will be loaded (modeldef0f1a7560()):
+	// a Stage Loader map's own textures are its rooms', never a stock model's,
+	// so they are no reason to keep the release's mesh off one
+	const s32 prevtexstage = modSetTextureFromStage(0);
+	const s32 prevtexsrc = modSetTextureSourceMod(romdataFileGetModDir(fileid));
+
+	xblaMeshMatchModel(modeldef, fileid);
+
+	if (romdataFileGetXblaId(fileid)) {
+		for (s32 i = 0; i < XBLAMESH_HASHSIZE; i++) {
+			if (hash[i].node && hash[i].modeldef == modeldef && hash[i].matched) {
+				hash[i].releaseonly = 1;
+				releaseOnlyLoaded = 1;
+			}
+		}
+	}
+
+	modSetTextureSourceMod(prevtexsrc);
+	modSetTextureFromStage(prevtexstage);
+
+	// And the model pack's side of the same nodes, which is filed beside the
+	// matcher's rather than over it: a node can have both, and which of the
+	// two draws is decided at the draw, live.
+	xblaMeshRegisterPackModel(modeldef, fileid);
+
+	// While a GoldenEye stage loads in the HD look, its GoldenEye meshes are
+	// built now rather than on their first frame on screen
+	xblaMeshPreloadModel(modeldef);
+}
+
+// Both sides of the pose arena: kilobytes held and chunks taken.
+static void xblaMeshArenaStats(u32 *kb, s32 *chunks);
+
+/**
+ * Drops everything keyed on a model, because the stage pool that held all of
+ * those addresses has just been handed back.
+ *
+ * Called from lvReset() beside the texture ids, which are dropped there for
+ * exactly the same reason: the addresses are about to be given out again to
+ * different things. Without it the registry carries a stage's worth of dead
+ * nodes into the next stage, where an address that comes back has to be caught
+ * by the modeldef test at draw time; with it there is nothing to catch. The
+ * built meshes themselves stay - they are keyed on a slot in the release's
+ * package, which no stage load can change.
+ *
+ * This is not the only place a dead entry goes, and it must not be the one
+ * that is relied on: a modeldef is freed and reused inside a stage as well,
+ * which no reset sees. What covers that is the load itself - a model forgets
+ * whatever was registered at its own address before it looks at anything, so
+ * the table only ever holds entries put there by a model that is still in the
+ * memory they name. This reset is then what clears the ones whose model is
+ * never loaded again.
+ */
+static void xblaMeshHatSeatsReset(void);
+
+void xblaMeshResetModels(void)
+{
+	// Read before the table is emptied: this is the level that is ending.
+	const u32 nodes = g_XblaMeshNumNodes;
+	const u32 slots = g_XblaMeshNumSlots;
+
+	for (s32 i = 0; i < numUses; i++) {
+		xblaMeshBruiseFree(&uses[i]);
+	}
+
+	numUses = 0;
+	openedLate = 0;
+	xblaMeshDrawLog = 0;
+
+	memset(hash, 0, sizeof(hash));
+	g_XblaMeshNumNodes = 0;
+	g_XblaMeshNumSlots = 0;
+
+	for (s32 i = 0; i < numRecords && built; i++) {
+		built[i].posedmodel = NULL;
+		built[i].bruisemodel = NULL;
+		built[i].envmodel = NULL;
+		built[i].keptmodel = NULL;
+	}
+
+	// A model pack's meshes for the game's own models go with the stage: they
+	// are node-local to models in the pool being handed back.
+	xblaMeshFreePackMeshes();
+	xblaMeshResetBeanMeshes();
+
+	// the hats' seats are the stage's chrs'
+	xblaMeshHatSeatsReset();
+
+	// What the meshes built so far are holding. They are kept for the life of
+	// the process on purpose - a mesh is the same in every level that uses it,
+	// and the alternative is freeing a display list the render thread may
+	// still be running - and the ceiling is what makes that affordable: there
+	// are 595 meshes in the release and building every one of them comes to
+	// about 69MB, against the 250MB package the player already has on disk. A
+	// level's own set is a small fraction of that (14 meshes in the G5
+	// Building), so this line is how a session that has drifted upwards would
+	// show itself.
+	if (g_XblaMeshNumMeshes) {
+		// The pose arena is named beside them because it is the other thing
+		// that only ever grows, and the two are read together: a level that
+		// wants more poses than the last one keeps the chunks it took for
+		// them.
+		u32 arenakb;
+		s32 chunks;
+
+		xblaMeshArenaStats(&arenakb, &chunks);
+
+		// The node table is named too, since every list of a matched model is
+		// filed now and not only the ones the release named - fifteen entries
+		// a character rather than one - and a full table stops registering
+		// anything at all.
+		sysLogPrintf(LOG_NOTE, "xblamesh: %u meshes built, %u KB; pose arena %u KB "
+				"in %d chunks; %u nodes in %u of %d table slots",
+				g_XblaMeshNumMeshes, (g_XblaMeshBytes + 1023) / 1024, arenakb,
+				chunks, nodes, slots, XBLAMESH_HASHSIZE);
+	}
+}
+
+/* -------------------------------------------------------------------------
+ * Turning a mesh into a display list
+ * ------------------------------------------------------------------------- */
+
+struct xblameshhdr {
+	u32 numvertices;
+	u32 vertexoffset;
+	u32 indexoffset;
+	u32 numdraws;
+	u32 drawoffset;
+	u32 nummatrices;
+	f32 unknown;
+	u32 groupoffset;
+};
+
+/**
+ * Reads a header and checks it against the file, which is what says this slot
+ * holds a mesh at all - the same slots also hold the game's own files.
+ *
+ * Every invariant here holds over all 595 meshes that parse (xbla.md): the
+ * matrices reach the group table, the draws reach the vertices, and the stride
+ * that falls out of the vertex span is one of the two.
+ */
+static s32 xblaMeshReadHeader(struct xblameshhdr *h, const u8 *file, u32 len, u32 *stride)
+{
+	u32 span;
+
+	if (len < XBLAMESH_HEADER) {
+		return 0;
+	}
+
+	h->numvertices = xblaMeshBE32(file);
+	h->vertexoffset = xblaMeshBE32(file + 4);
+	h->indexoffset = xblaMeshBE32(file + 8);
+	h->numdraws = xblaMeshBE32(file + 12);
+	h->drawoffset = xblaMeshBE32(file + 16);
+	h->nummatrices = xblaMeshBE32(file + 20);
+	h->unknown = xblaMeshBEF32(file + 24);
+	h->groupoffset = xblaMeshBE32(file + 28);
+
+	if (h->numvertices == 0 || h->numvertices > XBLAMESH_MAXVERTS) {
+		return 0;
+	}
+
+	if (h->numdraws == 0 || h->numdraws > XBLAMESH_MAXDRAWS) {
+		return 0;
+	}
+
+	// The palette is read straight out of the header's count, and the count is
+	// what the group offset below is checked against - so it is bounded here,
+	// where a slot that holds one of the game's own files rather than a mesh is
+	// still being told apart from one that does. The largest palette in the
+	// release has 46 entries; an unskinned mesh has none.
+	if (h->nummatrices > XBLAMESH_MAXMTX) {
+		return 0;
+	}
+
+	if (h->vertexoffset < XBLAMESH_HEADER || h->indexoffset <= h->vertexoffset ||
+			h->indexoffset > len) {
+		return 0;
+	}
+
+	if (h->groupoffset != XBLAMESH_HEADER + XBLAMESH_MATRIX * h->nummatrices) {
+		return 0;
+	}
+
+	// The draw table sits between the groups and the vertices and fills the gap
+	// exactly. Named as the two ends rather than as one sum, since a wild
+	// offset plus the table's length can wrap round to the right answer.
+	if (h->drawoffset < h->groupoffset || h->drawoffset >= h->vertexoffset ||
+			h->vertexoffset - h->drawoffset != XBLAMESH_ENTRY * h->numdraws) {
+		return 0;
+	}
+
+	span = h->indexoffset - h->vertexoffset;
+
+	if (span % h->numvertices) {
+		return 0;
+	}
+
+	*stride = span / h->numvertices;
+
+	if (*stride != XBLAMESH_STRIDE_RIGID && *stride != XBLAMESH_STRIDE_SKIN) {
+		return 0;
+	}
+
+	return 1;
+}
+
+/**
+ * A skinned vertex's three weights: two stored, the third what is left of one.
+ *
+ * Except where the fourth byte says two and the three bones are three: then
+ * the second float is not a weight and the rest belongs to bone1, not bone2.
+ * The byte is the number of influences the release's draw blends - every
+ * vertex of the 154 meshes that say 1 is on one bone; in the 87 that say 2
+ * the second float is never a weight at all, it is two small bytes read as a
+ * denormal (00 00 0c 0d - 4.7e-42); in the 90 that say 3 it is the second
+ * weight. Read the usual way, a two-influence vertex gave what is left of
+ * one to bone2, which in 95% of them repeats bone1 and so did no harm - but in
+ * the G5 guard (`CG5_GUARDZ`, mesh 2390), the dataDyne sniper (`CDDSNIPERZ`,
+ * 2377) and the dataDyne guard in stripes (`CSTRIPESZ`, 2498) bone2 is any
+ * bone at all: of their 2279 two-influence vertices that name three bones,
+ * bone1 is the parent, child or sibling of bone0 in every one and bone2 in
+ * only 742. A hand's 16% went to the hips, and a raised arm drew its fist as
+ * a spike pointing back at them (F3 20261007-224918, a dead G5 guard in
+ * Chicago). The crossbow's twelve string vertices (2513, 2514) are the only
+ * others: half on each limb tip now, where the rest went to the bow's mount.
+ *
+ * Only three distinct bones changes anything. A head's neck ring is written
+ * {b, other, b} - the rest back on bone0, the vertex rigid - and is left so:
+ * read as two influences it would be half on the neck, which may well be
+ * what the release draws, but the grafted head's palette is posed its own
+ * way (xbla.md, "The heads") and that is a change for the heads to make.
+ */
+static void xblaMeshSkinWeights(const u8 *v, f32 out[3])
+{
+	const u8 *bn = v + 44;
+
+	out[0] = xblaMeshBEF32(v + 36);
+
+	if (bn[3] == 2 && bn[0] != bn[1] && bn[1] != bn[2] && bn[0] != bn[2]) {
+		out[1] = out[0] < 1.0f ? 1.0f - out[0] : 0.0f;
+		out[2] = 0.0f;
+		return;
+	}
+
+	out[1] = xblaMeshBEF32(v + 40);
+	out[2] = 1.0f - out[0] - out[1];
+
+	if (out[2] < 0.0f) {
+		out[2] = 0.0f;
+	}
+}
+
+/**
+ * What one of a mesh's units is worth in the game's.
+ *
+ * The float at +0x18 is a scale: 100.0 means the mesh is in the model file's
+ * own coordinates and 1000.0 means it is at a tenth of them. Every unskinned
+ * mesh says 100 and draws 1:1 against the geometry it replaces - an Area 51
+ * crate is 100 units across in both - and 267 of the 277 skinned ones say
+ * 1000, with 200.0 twice, 750.0 once and 100.0 seven times.
+ *
+ * What says it is a scale rather than a number that happens to sort them: take
+ * every model that names a mesh, walk its joints, and compare the offset the
+ * model file states for each one against the offset the mesh's palette implies
+ * for the same pair of bones. Of the 100 models with eight or more joints to
+ * compare, 96 come out at this exactly. The four that do not are 4J's
+ * remodelled Bonds - Connery, Dalton, Moore and the DJ - which are a uniform
+ * 10% larger than the skeleton the game poses them with.
+ *
+ * A mesh whose header says zero - there is one - keeps its own units rather
+ * than collapsing to a point.
+ */
+static f32 xblaMeshScale(const struct xblameshhdr *h)
+{
+	if (h->unknown <= 0.0f || h->unknown > 100000.0f) {
+		return 1.0f;
+	}
+
+	return h->unknown / 100.0f;
+}
+
+static s16 xblaMeshRound(f32 v)
+{
+	f32 r = v < 0 ? v - 0.5f : v + 0.5f;
+
+	if (r > 32767.0f) {
+		return 32767;
+	}
+
+	if (r < -32768.0f) {
+		return -32768;
+	}
+
+	return (s16)r;
+}
+
+struct xblameshbuilder {
+	Gfx *gdl;
+	Vtx *vertices;
+	Col *colours;
+	f32 *bindpos;
+	f32 *weights;
+	u8 *bones;
+	s32 skinned;
+	f32 scale;
+
+	// A unit normal per emitted vertex, kept only for a mesh the title draws
+	// with the release's reflections - see xblaMeshBuildEnvironment() - and
+	// with it, two bytes a vertex: the environment map its material reflects
+	// (byte 24) and how much of it, out of 255 (byte 16 is a percentage).
+	// envindex and envamount are what the current material says, set by
+	// xblaMeshSetMaterial().
+	s32 keepnormals;
+	s32 envindex;
+	s32 envamount;
+	f32 *normals;
+	u8 *venv;
+
+	// And which row of xblaMeshMattes the vertex's material is, if any (1 +
+	// the row): a pack that repaints it takes its reflection away.
+	s32 envmatte;
+	u8 *vmatte;
+
+	// For a classic gun, how light the paint under each vertex is (vink), read
+	// off the current material's picture - see xblaMeshInkFile().
+	s32 ink;
+	s32 inkrecord;
+	u8 *inkrgba;
+	s32 inkw, inkh;
+	u8 *vink;
+
+	// The face the lists cull (G_CULL_FRONT or G_CULL_BACK), or 0 to draw
+	// both: see xblaMeshBuildCullBack.
+	s32 cullback;
+	s32 meshcull;     // the mesh's own (xblaMeshBuildCullBack), cullback being each group's
+	u64 twosided;     // groups drawn both sides whatever the mesh culls (xblaMeshBuildTwoSided)
+
+	// For a culled mesh, the triangles drawn turned round or both ways (one
+	// byte a triangle, or NULL), and how many were: see xblaMeshFindWinding().
+	u8 *turn;
+	s32 numturned;
+
+	// Whether the list being built has G_DECAL_EXT on (XBLAMESH_MAT_DECAL),
+	// which its end turns off again
+	s32 decal;
+
+	// The texture gradient along x and along y at every emitted vertex, and
+	// how good the triangle it came from was for the purpose - see
+	// xblaMeshNoteTriangle(). Unskinned meshes only: a door is never skinned,
+	// and a character is most of the vertices there are.
+	f32 *grad;
+	f32 *gradscore;
+
+	// One list per group, by index into gdl until the array stops moving, and
+	// the little list that calls all of them for a model whose parts and
+	// groups do not line up.
+	//
+	// Twice over: a group's draws are split by the alpha flag of the material
+	// each one names, so that the piece of a model the game draws in the
+	// translucent pass can be drawn there. groupxlu is -1 for a group with no
+	// alpha material in it, which is most of them.
+	s32 groupgfx[XBLAMESH_MAXPARTS];
+	s32 groupxlu[XBLAMESH_MAXPARTS];
+	s32 groupfade[XBLAMESH_MAXPARTS];
+	u64 groupxlucut;
+	s32 numgroups;
+	s32 allgfx;
+	s32 allxlu;
+	s32 allfade;
+	s32 allxlucut;
+
+	s32 numgfx, capgfx;
+	s32 numvtx, capvtx;
+	s32 numtris;
+
+	// Which span of the group is being built, which is what says whether a
+	// vertex's alpha is kept - see xblaMeshAddVertex().
+	s32 span;
+
+	// The batch being filled: which mesh vertex is in each slot, where its
+	// vertices start, and the two commands reserved at its head for the colour
+	// table and the vertex load, which cannot be written until the batch is
+	// closed and its count is known.
+	s32 slotof[XBLAMESH_BATCH];
+	s32 numslots;
+	s32 batchvtx;
+	s32 batchgfx;
+	s32 batchopen;
+
+	// And every batch closed so far. The two commands hold addresses inside
+	// the vertex and colour arrays, and those arrays are still growing - a
+	// realloc after the command was written would leave it pointing into freed
+	// memory, which draws as one enormous triangle across the screen. So the
+	// batches are remembered by index and the addresses are filled in at the
+	// end, when nothing can move any more.
+	struct xblameshbatch {
+		s32 gfx;
+		s32 vtx;
+		s32 count;
+	} *batches;
+	s32 numbatches, capbatches;
+
+	// The pictures XBLAMESH_MAT_TABLE materials name, for the build only:
+	// the list keeps the tile addresses and nothing else.
+	const struct xblameshmats *mats;
+};
+
+// What the colour table is put back to when a mesh has finished drawing.
+static const Col xblaMeshWhite[64] = {
+	[0 ... 63] = { .r = 0xff, .g = 0xff, .b = 0xff, .a = 0xff },
+};
+
+static s32 xblaMeshRoomForGfx(struct xblameshbuilder *b, s32 want)
+{
+	Gfx *grown;
+
+	if (b->numgfx + want <= b->capgfx) {
+		return 1;
+	}
+
+	b->capgfx = b->capgfx ? b->capgfx * 2 : 256;
+
+	while (b->numgfx + want > b->capgfx) {
+		b->capgfx *= 2;
+	}
+
+	grown = realloc(b->gdl, (size_t)b->capgfx * sizeof(Gfx));
+
+	if (!grown) {
+		return 0;
+	}
+
+	b->gdl = grown;
+
+	return 1;
+}
+
+static s32 xblaMeshRoomForVtx(struct xblameshbuilder *b, s32 want)
+{
+	Vtx *grownv;
+	Col *grownc;
+
+	if (b->numvtx + want <= b->capvtx) {
+		return 1;
+	}
+
+	b->capvtx = b->capvtx ? b->capvtx * 2 : 256;
+
+	while (b->numvtx + want > b->capvtx) {
+		b->capvtx *= 2;
+	}
+
+	grownv = realloc(b->vertices, (size_t)b->capvtx * sizeof(Vtx));
+
+	if (!grownv) {
+		return 0;
+	}
+
+	b->vertices = grownv;
+
+	grownc = realloc(b->colours, (size_t)b->capvtx * sizeof(Col));
+
+	if (!grownc) {
+		return 0;
+	}
+
+	b->colours = grownc;
+
+	if (!b->skinned) {
+		f32 *g = realloc(b->grad, (size_t)b->capvtx * 4 * sizeof(f32));
+
+		if (!g) {
+			return 0;
+		}
+
+		b->grad = g;
+		g = realloc(b->gradscore, (size_t)b->capvtx * 2 * sizeof(f32));
+
+		if (!g) {
+			return 0;
+		}
+
+		b->gradscore = g;
+	}
+
+	if (b->skinned) {
+		f32 *pos = realloc(b->bindpos, (size_t)b->capvtx * 3 * sizeof(f32));
+		f32 *wt;
+		u8 *bn;
+
+		if (!pos) {
+			return 0;
+		}
+
+		b->bindpos = pos;
+		wt = realloc(b->weights, (size_t)b->capvtx * 3 * sizeof(f32));
+
+		if (!wt) {
+			return 0;
+		}
+
+		b->weights = wt;
+		bn = realloc(b->bones, (size_t)b->capvtx * 4);
+
+		if (!bn) {
+			return 0;
+		}
+
+		b->bones = bn;
+	}
+
+	if (b->keepnormals) {
+		f32 *nrm = realloc(b->normals, (size_t)b->capvtx * 3 * sizeof(f32));
+		u8 *env;
+
+		if (!nrm) {
+			return 0;
+		}
+
+		b->normals = nrm;
+		env = realloc(b->venv, (size_t)b->capvtx * 2);
+
+		if (!env) {
+			return 0;
+		}
+
+		b->venv = env;
+		env = realloc(b->vmatte, (size_t)b->capvtx);
+
+		if (!env) {
+			return 0;
+		}
+
+		b->vmatte = env;
+
+		if (b->ink) {
+			u8 *ink = realloc(b->vink, (size_t)b->capvtx);
+
+			if (!ink) {
+				return 0;
+			}
+
+			b->vink = ink;
+		}
+	}
+
+	return 1;
+}
+
+static s32 xblaMeshFindSlot(const struct xblameshbuilder *b, u32 index)
+{
+	for (s32 i = 0; i < b->numslots; i++) {
+		if (b->slotof[i] == (s32)index) {
+			return i;
+		}
+	}
+
+	return -1;
+}
+
+/**
+ * How light a classic gun's paint is round a vertex, 0 to 255: the mean
+ * luminance of the 7x7 texels about its UV, since a vertex lands on one texel
+ * of an atlas drawn with grain and scratches. s and t are the vertex's, and t
+ * counts rows in the decode's own order - see xblaMeshAddVertex().
+ */
+static u8 xblaMeshInkAt(const struct xblameshbuilder *b, s16 s, s16 t)
+{
+	f32 u = s / XBLATEX_TILE_SCALE;
+	f32 v = t / XBLATEX_TILE_SCALE;
+	const s32 w = b->inkw;
+	const s32 h = b->inkh;
+	s32 cx, cy;
+	u32 sum = 0;
+
+	u -= floorf(u);
+	v -= floorf(v);
+	cx = (s32)(u * w);
+	cy = (s32)(v * h);
+
+	for (s32 dy = -3; dy <= 3; dy++) {
+		const s32 y = ((cy + dy) % h + h) % h;
+
+		for (s32 dx = -3; dx <= 3; dx++) {
+			const s32 x = ((cx + dx) % w + w) % w;
+			const u8 *p = &b->inkrgba[(y * w + x) * 4];
+
+			sum += (p[0] * 77u + p[1] * 150u + p[2] * 29u) >> 8;
+		}
+	}
+
+	return (u8)(sum / 49);
+}
+
+/**
+ * Loads one mesh vertex into the batch.
+ *
+ * A Perfect Dark vertex names its colour by a byte offset into a table rather
+ * than carrying one, so the table is built alongside and a vertex points at
+ * its own entry. That is also why the table is per batch: the offset is a
+ * byte, so one table can hold 64 colours, and the release gives every vertex
+ * its own. A batch is 25 vertices, so it always fits and nothing has to be
+ * quantised away.
+ */
+static s32 xblaMeshAddVertex(struct xblameshbuilder *b, const u8 *file,
+		const struct xblameshhdr *h, u32 stride, u32 index)
+{
+	const u8 *v = file + h->vertexoffset + index * stride;
+	Vtx *vtx;
+	Col *col;
+	u32 colour;
+
+	if (!xblaMeshRoomForVtx(b, 1)) {
+		return -1;
+	}
+
+	vtx = &b->vertices[b->numvtx];
+	col = &b->colours[b->numvtx];
+
+	if (b->grad) {
+		for (s32 i = 0; i < 4; i++) {
+			b->grad[b->numvtx * 4 + i] = 0.0f;
+		}
+
+		b->gradscore[b->numvtx * 2] = -1.0f;
+		b->gradscore[b->numvtx * 2 + 1] = -1.0f;
+	}
+
+	// position, then the UV pair, then a unit normal, then the colour. The
+	// position is in the mesh's own units, which the header's scale turns into
+	// the model file's - the identity for everything unskinned.
+	vtx->x = xblaMeshRound(xblaMeshBEF32(v) * b->scale);
+	vtx->y = xblaMeshRound(xblaMeshBEF32(v + 4) * b->scale);
+	vtx->z = xblaMeshRound(xblaMeshBEF32(v + 8) * b->scale);
+	vtx->flags = 0;
+	vtx->colour = (u8)(b->numslots * 4);
+
+	// The UVs, on to the stand-in tile the texture is bound through. A Perfect
+	// Dark vertex measures s and t in texels of the tile as 10.5 fixed point
+	// and the renderer normalises them by the tile, so a UV of one is one
+	// tile's width whatever size the picture that lands on it turns out to be
+	// - which is the same arrangement a texture pack's larger image draws
+	// under. XBLATEX_TILE_SCALE is what a UV of one comes to; a coordinate
+	// past what a Vtx holds is clamped rather than wrapped round, since a
+	// wrapped one would draw a stripe of the wrong part of the picture.
+	//
+	// **v is turned over on the way in.** The two halves of this meet here and
+	// they count rows from opposite ends: the picture is uploaded in the row
+	// order x360DecodeTexture() produced, which is Perfect Dark's own order
+	// and is why a texture pack needs no flip either, while a mesh's v is
+	// Direct3D's and is measured from the top of the picture as it was drawn.
+	// Left alone, every mesh in the release draws its texture mirrored top to
+	// bottom - which reads as art that is merely wrong rather than as anything
+	// upside down, since a body's own pieces move about: the CI's lab tech
+	// wears her sleeves across her chest and her waistband round her hips.
+	vtx->s = xblaMeshRound(xblaMeshBEF32(v + 12) * XBLATEX_TILE_SCALE);
+	vtx->t = xblaMeshRound((1.0f - xblaMeshBEF32(v + 16)) * XBLATEX_TILE_SCALE);
+
+	// ARGB. The alpha is real: the roof fan's column of light is written
+	// with 0x7d at the fan and 0 at the top, and that fade is the whole of
+	// what makes it a beam rather than a slab - see xblaMeshDrawFades().
+	//
+	// Kept only in the fading span. Everywhere else it goes in as 255, because
+	// the combiner the game lights a model with reads the vertex alpha - mode 7
+	// is (texel - env) * shade alpha + env - and the three opaque models with
+	// a few stray zeros on a vertex would draw those vertices in the
+	// environment tint, a dark red, where the release means nothing by them.
+	colour = xblaMeshBE32(v + 32);
+	col->r = (u8)(colour >> 16);
+	col->g = (u8)(colour >> 8);
+	col->b = (u8)colour;
+	col->a = b->span == XBLAMESH_SPAN_FADE ? (u8)(colour >> 24) : 0xff;
+
+	if (b->skinned) {
+		// Two weights and a packed {bone0, bone1, bone2, count}. The third
+		// weight is what is left of one: the two stored ones sum to 1.0 on 93%
+		// of the release's skinned vertices and to as little as 0.5 on the
+		// rest, so the remainder belongs to the third bone and dropping it
+		// pulls those vertices towards the origin.
+		//
+		// The fourth byte is the number of influences the release blends (1 to
+		// 6, the same for every vertex of a draw). Where it says two, the
+		// second float is not a weight and what is left of one belongs to
+		// bone1 - which matters only where bone2 names a third bone
+		// (xblaMeshSkinWeights()); everywhere else all three are read, and the
+		// repeats and the zero weights are folded together once by
+		// xblaMeshCompactSkin() - which writes the real count over the fourth
+		// byte - rather than being added up again for nothing every frame the
+		// vertex is posed.
+		f32 *pos = &b->bindpos[b->numvtx * 3];
+		f32 *wt = &b->weights[b->numvtx * 3];
+		u8 *bn = &b->bones[b->numvtx * 4];
+		const u32 packed = xblaMeshBE32(v + 44);
+
+		pos[0] = xblaMeshBEF32(v) * b->scale;
+		pos[1] = xblaMeshBEF32(v + 4) * b->scale;
+		pos[2] = xblaMeshBEF32(v + 8) * b->scale;
+
+		xblaMeshSkinWeights(v, wt);
+
+		bn[0] = (u8)(packed >> 24);
+		bn[1] = (u8)(packed >> 16);
+		bn[2] = (u8)(packed >> 8);
+		bn[3] = (u8)(packed & 0xff);
+	}
+
+	if (b->keepnormals) {
+		f32 *nrm = &b->normals[b->numvtx * 3];
+
+		nrm[0] = xblaMeshBEF32(v + 20);
+		nrm[1] = xblaMeshBEF32(v + 24);
+		nrm[2] = xblaMeshBEF32(v + 28);
+
+		// A batch holds one material's vertices, so this is the material's.
+		b->venv[b->numvtx * 2] = (u8)b->envindex;
+		b->venv[b->numvtx * 2 + 1] = (u8)b->envamount;
+		b->vmatte[b->numvtx] = (u8)b->envmatte;
+
+		if (b->ink) {
+			b->vink[b->numvtx] = b->inkrgba ? xblaMeshInkAt(b, vtx->s, vtx->t) : 255;
+		}
+	}
+
+	b->slotof[b->numslots] = (s32)index;
+	b->numvtx++;
+
+	return b->numslots++;
+}
+
+/** Notes the open batch for writing later, and forgets it. */
+static s32 xblaMeshCloseBatch(struct xblameshbuilder *b)
+{
+	struct xblameshbatch *grown;
+
+	if (!b->batchopen) {
+		return 1;
+	}
+
+	b->batchopen = 0;
+
+	if (b->numslots == 0) {
+		// Nothing went into it. The two commands reserved at its head will
+		// never be written now, so they are taken back rather than left in the
+		// list as whatever the allocation happened to hold. A batch that did
+		// take a vertex also took a triangle, so this cannot swallow one.
+		b->numgfx = b->batchgfx;
+
+		return 1;
+	}
+
+	if (b->numbatches >= b->capbatches) {
+		b->capbatches = b->capbatches ? b->capbatches * 2 : 64;
+		grown = realloc(b->batches, (size_t)b->capbatches * sizeof(*b->batches));
+
+		if (!grown) {
+			return 0;
+		}
+
+		b->batches = grown;
+	}
+
+	b->batches[b->numbatches].gfx = b->batchgfx;
+	b->batches[b->numbatches].vtx = b->batchvtx;
+	b->batches[b->numbatches].count = b->numslots;
+	b->numbatches++;
+
+	b->numslots = 0;
+
+	return 1;
+}
+
+/** The addresses, once the arrays have stopped moving. */
+static void xblaMeshWriteBatches(struct xblameshbuilder *b)
+{
+	for (s32 i = 0; i < b->numbatches; i++) {
+		const struct xblameshbatch *batch = &b->batches[i];
+		Gfx *g = &b->gdl[batch->gfx];
+
+		// G_COL carries a byte length, which is what the renderer divides by
+		// four to get the count. The table is named through a segment like the
+		// vertices, so a bruised copy of it can stand in (XBLAMESH_COLSEG).
+		g->words.w0 = ((u32)G_COL << 24) | (u32)(batch->count * 4);
+		g->words.w1 = (uintptr_t)SEGADDR(XBLAMESH_COLSEG | (uintptr_t)(batch->vtx * sizeof(Col)));
+
+		// The vertices are named by a segment rather than by address, so the
+		// same list can be pointed at a posed copy of them - see the drawing
+		// below. Segment 4 is the game's own for a model's vertices, and it is
+		// rebound before this list is branched to either way.
+		gSPVertex(&b->gdl[batch->gfx + 1],
+				SEGADDR(XBLAMESH_VTXSEG | (uintptr_t)(batch->vtx * sizeof(Vtx))),
+				batch->count, 0);
+	}
+}
+
+/** Reserves the head of a new batch. */
+static s32 xblaMeshOpenBatch(struct xblameshbuilder *b)
+{
+	if (!xblaMeshRoomForGfx(b, 2)) {
+		return 0;
+	}
+
+	b->batchgfx = b->numgfx;
+	b->batchvtx = b->numvtx;
+	b->numgfx += 2;
+	b->numslots = 0;
+	b->batchopen = 1;
+
+	return 1;
+}
+
+/**
+ * The state one draw's material asks for, written into the list.
+ *
+ * The material word is a Textures.raw record in its low 13 bits and an alpha
+ * flag in bit 15 - the flag is exactly the records whose format carries alpha,
+ * which is what says it is a flag and not part of the number. The two bytes
+ * above that are not understood and are not read here.
+ *
+ * A record that will not bind - no package, or a number past the table - draws
+ * shaded and untextured, which is what the whole mesh looked like before any
+ * of this. So a texture that cannot be found costs that one material rather
+ * than the mesh.
+ *
+ * What a material does *not* write is the combiner, the cycle type and the
+ * render mode. Those belong to the node, because they are how a Perfect Dark
+ * model is lit: there is no G_LIGHTING in it anywhere. modelRenderNodeDl()
+ * writes, round each of its own lists, a two-cycle combiner against the
+ * environment colour and a G_RM_FOG_PRIM_A blend towards the fog colour, and
+ * the fog colour is the prop's shade colour - the room's brightness and the
+ * floor's colour, as propCalculateShadeColour() worked them out. A list that
+ * wrote a one-cycle texture-times-shade in their place, as this one did, drew
+ * every mesh at full brightness in the darkest room, which was the "the XBLA
+ * models are not affected by lights, they stay bright" report.
+ * xblaMeshRenderNode() writes the same state the game writes for the node,
+ * and the list leaves it alone.
+ *
+ * The fading span is the one exception and carries its own combiner: a beam
+ * of light is not lit by the room, and the game's combiner reads the vertex
+ * alpha as (texel - env) * alpha + env, which would turn the beam's zero into
+ * the environment colour, opaque. G_CC_PASS2 in the second cycle keeps it
+ * right under whichever cycle type the node left behind.
+ *
+ * Tile 1 is declared as a copy of tile 0, as texWriteTileLods() does for a
+ * texture with one level: the props' combiner is G_CC_TRILERP, and the lod
+ * fraction this port feeds it runs 0.7 to 1.0, so TEXEL1 is most of what a
+ * prop draws with. Left undeclared it is whatever the last texture the game
+ * loaded left there.
+ */
+// A white RGBA16 tile, for a record that will not bind. The node's combiner
+// reads a texel whatever the material says, so a draw with no picture has to
+// be given a white one to be shade times the room's light like the rest.
+static u16 xblaMeshWhiteTile[XBLATEX_TILE * XBLATEX_TILE] __attribute__((aligned(64)));
+
+static s32 xblaMeshSetMaterial(struct xblameshbuilder *b, u32 material, s32 span)
+{
+	const u32 record = material & 0x1fff;
+	const s32 alpha = (material >> 15) & 1;
+	// A cut-out card of the build's own is clamped (XBLAMESH_MAT_CLAMP)
+	const u32 cm = (material & XBLAMESH_MAT_TABLE) && (material & XBLAMESH_MAT_CLAMP) ? G_TX_CLAMP : G_TX_WRAP;
+	// Always bound, whether or not the art is switched on: what a stand-in
+	// holds is white, so a material with the pictures turned off draws the
+	// same flat solid a list built without a texture would. That is what lets
+	// Mod.XblaMeshTextures be a live toggle rather than a rebuild - see
+	// xblaTexSetEnabled(). A picture of the build's own is bound already.
+	const void *tile = (material & XBLAMESH_MAT_TABLE)
+			? ((b->mats && (s32)(material & 0xfff) < b->mats->num) ? b->mats->tile[material & 0xfff] : NULL)
+			: xblaMeshBuildKeepArt ? xblaTexBindKept(record) : xblaTexBind(record);
+	Gfx *gdl;
+
+	if (!xblaMeshRoomForGfx(b, 14)) {
+		return 0;
+	}
+
+	// What the material reflects, for a mesh that keeps its normals. In the
+	// release's draw log a draw whose byte 16 is not zero samples a second
+	// texture, a cube map: byte 24 says which (the four the boot logos bind sit
+	// in that order in memory) and byte 16 how much, a percentage the fit to
+	// the release's frames confirms (0.57 for 50 and 0.41 for 40 through the
+	// recording's own darkening). A model pack's material is a picture of its
+	// own and reflects nothing.
+	if (material & XBLAMESH_MAT_TABLE) {
+		const s32 index = material & 0xfff;
+
+		// A GoldenEye prop's material the release reflects over, with a
+		// sphere map of its own (xblaMeshBuildEnvironment())
+		if (b->mats && index < b->mats->num && index < XBLAMESH_MAXMATS && b->mats->env[index]) {
+			b->envindex = index;
+			b->envamount = b->mats->envamount[index];
+		} else {
+			b->envindex = 0;
+			b->envamount = 0;
+		}
+
+		b->envmatte = 0;
+	} else {
+		const u32 percent = (material >> 16) & 0xff;
+
+		b->envindex = (material >> 24) & 0xff;
+		b->envamount = percent >= 100 ? 255 : (s32)(percent * 255 / 100);
+		b->envmatte = percent ? xblaMeshMatteRow(record, percent) : 0;
+
+		// A classic gun's paint, for its vertices' ink. Whether or not the
+		// material reflects, since a third-person mesh with none borrows an
+		// amount for every vertex afterwards (xblaMeshBorrowEnvironment()).
+		if (b->ink && (s32)record != b->inkrecord) {
+			free(b->inkrgba);
+			b->inkrecord = (s32)record;
+			b->inkrgba = xblaTexDecodeRecord(record, &b->inkw, &b->inkh);
+		}
+	}
+
+	gdl = &b->gdl[b->numgfx];
+
+	gDPPipeSync(gdl++);
+
+	if (((material & XBLAMESH_MAT_TABLE) && (material & XBLAMESH_MAT_DECAL)) != b->decal) {
+		b->decal = !b->decal;
+
+		if (b->decal) {
+			gSPSetExtraGeometryModeEXT(gdl++, G_DECAL_EXT);
+		} else {
+			gSPClearExtraGeometryModeEXT(gdl++, G_DECAL_EXT);
+		}
+	}
+
+	if (span == XBLAMESH_SPAN_FADE) {
+		// Texel times vertex, and in the second cycle the primitive alpha laid
+		// over it, (1 - a) * prim + a: what the game's mode-9 combiner adds for
+		// a windowed door's fade or a tinted pane's opacity. It is nought
+		// everywhere else - xblaMeshRenderNode() sets it round this span.
+		gDPSetCombineLERP(gdl++, TEXEL0, 0, SHADE, 0, TEXEL0, 0, SHADE, 0,
+				0, 0, 0, COMBINED, 1, COMBINED, PRIMITIVE, COMBINED);
+	}
+
+	if (!tile) {
+		if (xblaMeshWhiteTile[0] != 0xffff) {
+			memset(xblaMeshWhiteTile, 0xff, sizeof(xblaMeshWhiteTile));
+		}
+
+		tile = xblaMeshWhiteTile;
+	}
+
+	gSPTexture(gdl++, 0xffff, 0xffff, 0, G_TX_RENDERTILE, G_ON);
+
+	// The stand-in tile. Its texels are never read - the renderer swaps the
+	// real picture in against this address, see xblatex.h - but the tile it
+	// declares is real, and is what every texture coordinate is measured
+	// against.
+	gDPLoadTextureBlock(gdl++, tile, G_IM_FMT_RGBA, G_IM_SIZ_16b,
+			XBLATEX_TILE, XBLATEX_TILE, 0,
+			cm | G_TX_NOMIRROR, cm | G_TX_NOMIRROR,
+			XBLATEX_TILE_MASK, XBLATEX_TILE_MASK, G_TX_NOLOD, G_TX_NOLOD);
+
+	gDPSetTile(gdl++, G_IM_FMT_RGBA, G_IM_SIZ_16b,
+			((XBLATEX_TILE * G_IM_SIZ_16b_LINE_BYTES) + 7) >> 3, 0, 1, 0,
+			cm | G_TX_NOMIRROR, XBLATEX_TILE_MASK, G_TX_NOLOD,
+			cm | G_TX_NOMIRROR, XBLATEX_TILE_MASK, G_TX_NOLOD);
+	gDPSetTileSize(gdl++, 1, 0, 0,
+			(XBLATEX_TILE - 1) << G_TEXTURE_IMAGE_FRAC,
+			(XBLATEX_TILE - 1) << G_TEXTURE_IMAGE_FRAC);
+
+	b->numgfx = (s32)(gdl - b->gdl);
+
+	if (xblaMeshVerbose) {
+		sysLogPrintf(LOG_NOTE, "xblamesh:   material %08x -> %s %u%s%s%s",
+				material, (material & XBLAMESH_MAT_TABLE) ? "picture" : "record",
+				(material & XBLAMESH_MAT_TABLE) ? (material & 0xfff) : record, alpha ? " alpha" : "",
+				span == XBLAMESH_SPAN_FADE ? " (fades)" : "",
+				tile == xblaMeshWhiteTile ? " (no texture; white)" : "");
+	}
+
+	return 1;
+}
+
+/**
+ * Builds one mesh's display list.
+ *
+ * The batch split depends on how the triangles happen to share vertices, so it
+ * is decided here as they are walked and the arrays grow behind it. A triangle
+ * that would not fit closes the batch before any of it is loaded, which is
+ * what keeps a vertex from being stranded in the batch it is not drawn in.
+ */
+/**
+ * One group's worth of the mesh, as a display list of its own.
+ *
+ * A group is one part of the model - the same order and the same count, in all
+ * 542 (model, mesh) pairs the release has, with the parts numbered 0..n-1 and
+ * no gaps - so a list per group is a list per part, and the node that carries
+ * part p draws group p. That is what makes a piece the game hides stay hidden:
+ * a head's earpiece is its own part under a toggle, and one list for the whole
+ * mesh drew it whatever the toggle said.
+ *
+ * Each list stands alone: it sets the geometry mode it wants at the top and
+ * puts the state back at the bottom, because any one of them can be entered
+ * without the others having run.
+ *
+ * Built twice per group, once for the draws whose material carries alpha and
+ * once for the rest, so that the two can go in different passes. The split is
+ * by material and the order within each half is the file's own.
+ */
+/**
+ * The three spans a group's draws are sorted into.
+ *
+ * XBLAMESH_SPAN_FADE is the release's own volumetric light: geometry whose
+ * vertex alpha runs below 255. The roof fan on dataDyne's helipad is the
+ * type - a 9 vertex disc in the game's model, and in the release a column
+ * of light a thousand units tall, its vertices 0x7d alpha at the fan and 0 at
+ * the top, textured with a soft beam whose alpha never reaches 179. Drawn as
+ * a cutout with that alpha thrown away it was a solid lavender sheet from the
+ * roof to the sky, which is what the "fans have light pouring out but it
+ * looks like a sheet" report was. A draw like that wants blending and no
+ * depth write, in the translucent pass, whatever the node it hangs off says
+ * about itself - the fan's node has no translucent list of its own for the
+ * span to ride on.
+ *
+ * The same span takes a draw whose fade is in its texture rather than its
+ * vertices: a material whose picture has next to no opaque texel (the comhub's
+ * screen glow, record 4134, never reaches 108; a tinted pane at a flat 104; a
+ * green glow at 138). Those were cutouts, and a cutout of a soft picture is a
+ * solid wherever the alpha clears the threshold - a white half-disc on every
+ * screen of the comhub. xblaTexRecordIsSoft() is the test.
+ */
+// (The XBLAMESH_SPAN_* values are defined at the top of the file, since the
+// vertex loader and the material setup need them first.)
+
+// Below this a vertex alpha is a fade and not a rounding. Counted over the
+// release: 26 draws in 18 meshes carry any alpha under 255, and 13 of those
+// meshes mean it - the two fans, the five hovercars' lights, four glass panes
+// at a flat 127 or 153 and a set of lamps running 0 to 232 - while a
+// speaker's 254 on every vertex, a 251 on one vertex of 168 and three
+// vertices of a 794 vertex body are texture cutouts that would lose their
+// depth write for nothing. The material's own alpha flag is required as
+// well: a fade on a material with no alpha channel is a few stray zeros on
+// three opaque models, and those draw as they always did.
+#define XBLAMESH_FADE_ALPHA 0xf0
+
+/** Whether any vertex of a draw carries an alpha that reads as a fade. */
+static s32 xblaMeshDrawFades(const u8 *file, u32 len, const struct xblameshhdr *h,
+		u32 stride, u32 firsttri, u32 drawtris)
+{
+	for (u32 t = 0; t < drawtris; t++) {
+		const u8 *idx = file + h->indexoffset + (firsttri + t) * 6;
+
+		for (s32 i = 0; i < 3; i++) {
+			const u32 v = xblaMeshBE16(idx + i * 2);
+
+			if (v < h->numvertices && file[h->vertexoffset + v * stride + 32] < XBLAMESH_FADE_ALPHA) {
+				return 1;
+			}
+		}
+	}
+
+	return 0;
+}
+
+static s32 xblaMeshDrawSpan(const struct xblameshbuilder *b, const u8 *file, u32 len,
+		const struct xblameshhdr *h, u32 stride, u32 d)
+{
+	const u8 *draw = file + h->drawoffset + d * XBLAMESH_ENTRY;
+	const u32 firsttri = xblaMeshBE32(draw);
+	const u32 drawtris = xblaMeshBE32(draw + 4);
+	const u32 material = xblaMeshBE32(draw + 8);
+	const u32 numtris = (len - h->indexoffset) / 6;
+
+	if (!((material >> 15) & 1)) {
+		return XBLAMESH_SPAN_SOLID;
+	}
+
+	if (firsttri <= numtris && drawtris <= numtris - firsttri &&
+			xblaMeshDrawFades(file, len, h, stride, firsttri, drawtris)) {
+		return XBLAMESH_SPAN_FADE;
+	}
+
+	// The fade can be in the picture instead of the vertices: a material
+	// whose texture has no opaque texel to speak of is a glow or a tinted
+	// pane, and a cutout has no edge to cut it at - it draws a solid wherever
+	// the alpha clears the threshold, which was the white half-disc on the
+	// comhub's screens. Blended, then, like the beams; the vertex alpha is
+	// 255 and drops out of the product. Answered from the package once per
+	// record and remembered, so this costs a decode the first time only. A
+	// picture of the build's own was looked at when it was bound.
+	if (material & XBLAMESH_MAT_TABLE) {
+		if (b->mats && (s32)(material & 0xfff) < b->mats->num && b->mats->soft[material & 0xfff]) {
+			return XBLAMESH_SPAN_FADE;
+		}
+	} else if (xblaTexRecordIsSoft(material & 0x1fff)) {
+		return XBLAMESH_SPAN_FADE;
+	}
+
+	return XBLAMESH_SPAN_ALPHA;
+}
+
+/**
+ * The alpha map a cutout draw's triangles are sorted against, or NULL where
+ * they all stay cutouts.
+ *
+ * A record is an atlas, so "this picture has alpha" says nothing about the
+ * part of it a triangle draws with: the Villa's tables take their glass top
+ * from a pane at a flat 140 in one corner of a wood picture and their shadow
+ * from a soft blob in the corner of a leather one, and drawn as cutouts those
+ * came out an opaque dark pane and a black square. xblaMeshTriIsPane() looks
+ * under each triangle instead.
+ *
+ * Rigid meshes, and on a skinned one only a record that is a flat pane
+ * (xblaTexRecordIsFlatPane()). The skinned ones are characters and guns, and
+ * on those the same test finds the hair (4770, 4901) and the sunglasses'
+ * lenses (4870) on seventy-odd heads, which are cutouts and have to stay
+ * cutouts - a blended strand of hair has no depth to sort by and draws through
+ * the face behind it. A flat pane has no strands: the DD shock trooper's visor
+ * (0x132c) drew as a solid slab of glass until it was let through.
+ */
+static const u8 *xblaMeshPaneMap(u32 stride, u32 material, s32 drawspan, s32 *size)
+{
+	if (drawspan != XBLAMESH_SPAN_ALPHA || (material & XBLAMESH_MAT_TABLE)) {
+		return NULL;
+	}
+
+	if (stride != XBLAMESH_STRIDE_RIGID && !xblaTexRecordIsFlatPane(material & 0x1fff)) {
+		return NULL;
+	}
+
+	return xblaTexRecordAlphaMap(material & 0x1fff, size);
+}
+
+/**
+ * Whether a triangle of a cutout draw samples a pane - alpha that is neither
+ * clear nor opaque - rather than a hard edge. Seven points of the triangle,
+ * the middle one of them decides, so a fringe of antialiasing along a
+ * cutout's edge is outvoted by the texels either side of it. The coordinates
+ * are the ones the builder writes, t turned over (xblaMeshAddVertex()), and
+ * the map is in the same row order as the picture that is uploaded.
+ */
+static s32 xblaMeshTriIsPane(const u8 *file, const struct xblameshhdr *h, u32 stride,
+		u32 tri, const u8 *map, s32 size)
+{
+	static const f32 bary[7][3] = {
+		{ 1.0f / 3, 1.0f / 3, 1.0f / 3 },
+		{ 0.6f, 0.2f, 0.2f }, { 0.2f, 0.6f, 0.2f }, { 0.2f, 0.2f, 0.6f },
+		{ 0.8f, 0.1f, 0.1f }, { 0.1f, 0.8f, 0.1f }, { 0.1f, 0.1f, 0.8f },
+	};
+	const u8 *idx = file + h->indexoffset + tri * 6;
+	f32 uv[3][2];
+	u8 samples[7];
+
+	for (s32 i = 0; i < 3; i++) {
+		const u32 v = xblaMeshBE16(idx + i * 2);
+		const u8 *p;
+
+		if (v >= h->numvertices) {
+			return 0;
+		}
+
+		p = file + h->vertexoffset + v * stride;
+		uv[i][0] = xblaMeshBEF32(p + 12);
+		uv[i][1] = 1.0f - xblaMeshBEF32(p + 16);
+	}
+
+	for (s32 s = 0; s < 7; s++) {
+		f32 u = bary[s][0] * uv[0][0] + bary[s][1] * uv[1][0] + bary[s][2] * uv[2][0];
+		f32 t = bary[s][0] * uv[0][1] + bary[s][1] * uv[1][1] + bary[s][2] * uv[2][1];
+		s32 x;
+		s32 y;
+		s32 j;
+		u8 a;
+
+		u -= floorf(u);
+		t -= floorf(t);
+		x = (s32)(u * size);
+		y = (s32)(t * size);
+		x = x < 0 ? 0 : x >= size ? size - 1 : x;
+		y = y < 0 ? 0 : y >= size ? size - 1 : y;
+
+		a = map[y * size + x];
+
+		// A partial texel with clear and opaque texels both close by is the
+		// fringe of a cutout's edge, and counts as the edge. A lettered label
+		// is all edge: Investigation's "SECTOR THREE" door sign (record 4205,
+		// DXT, whose edges step through 68, 119 and 187) had its middle
+		// sample on a letter's fringe in one of its two triangles, so half the
+		// sign was blended in the translucent pass and half cut out - and
+		// blended, it takes the windowed door's fade over its clear texels as
+		// the door's pane does (xblaMeshRenderNode()). The same rule moved a
+		// few triangles of four other records: 4202 (a "HAZARDOUS" sign), 4211
+		// and 4437 (leaves) and 4331 (dots); and 107 of 3741, a nearly opaque
+		// atlas. A pane has no clear texel beside it where it meets its frame,
+		// and no opaque one round a shadow's rim, so neither is taken for a
+		// fringe.
+		if (a >= XBLAMESH_PANE_LO && a <= XBLAMESH_PANE_HI) {
+			bool clear = false;
+			bool opaque = false;
+
+			for (s32 dy = -XBLAMESH_PANE_FRINGE; dy <= XBLAMESH_PANE_FRINGE && !(clear && opaque); dy++) {
+				const s32 ny = y + dy;
+
+				if (ny < 0 || ny >= size) {
+					continue;
+				}
+
+				for (s32 dx = -XBLAMESH_PANE_FRINGE; dx <= XBLAMESH_PANE_FRINGE; dx++) {
+					const s32 nx = x + dx;
+					u8 n;
+
+					if (nx < 0 || nx >= size) {
+						continue;
+					}
+
+					n = map[ny * size + nx];
+					clear |= n < XBLAMESH_PANE_LO;
+					opaque |= n > XBLAMESH_PANE_HI;
+				}
+			}
+
+			if (clear && opaque) {
+				a = 0xff;
+			}
+		}
+
+		// Kept in order as they come, seven at most.
+		for (j = s; j > 0 && samples[j - 1] > a; j--) {
+			samples[j] = samples[j - 1];
+		}
+
+		samples[j] = a;
+	}
+
+	// A pane by its middle sample, or a triangle with no opaque texel under it
+	// at all and some pane: the thin triangles round the rim of a shadow blob
+	// sample mostly clear, and as cutouts their few half-alpha texels drew a
+	// black sliver along the shadow's edge. A cutout's own edge has opaque
+	// texels beside its fringe and stays a cutout.
+	return (samples[3] >= XBLAMESH_PANE_LO && samples[3] <= XBLAMESH_PANE_HI) ||
+		(samples[6] >= XBLAMESH_PANE_LO && samples[6] <= XBLAMESH_PANE_HI);
+}
+
+/**
+ * What one triangle says about how its texture runs along x and along y, kept
+ * at each of its three emitted vertices.
+ *
+ * This is for the door trim (xblaMeshNodeTrim()). The game trims a door by
+ * moving a vertex on to the trim plane and sliding its texture coordinate
+ * along the edge to the vertex next to it, so the picture stays put and the
+ * door looks cut rather than squashed. Its models are quads with an edge
+ * along the slide, so "the vertex next to it" is a neighbour on the same
+ * row; the release's meshes are triangles at any angle, so the equivalent is
+ * the texture's gradient along the axis within the triangle's own plane -
+ * the same thing for a face that runs along the axis, which is every face
+ * of a door that the trim can cross. The gradient is the least-squares
+ * answer to "which in-plane direction is the axis", so a face at right
+ * angles to the axis - the door's end - gets a gradient of nothing and keeps
+ * its coordinates, exactly as the game's rule leaves those alone.
+ *
+ * A vertex is shared between the triangles of its batch, so it keeps the
+ * gradient from the triangle whose plane holds the axis best: the score is
+ * the square of how much of the axis lies in the plane, one for a face along
+ * it and nothing for a face across it.
+ */
+static void xblaMeshNoteTriangle(struct xblameshbuilder *b, s32 i0, s32 i1, s32 i2)
+{
+	const Vtx *p0 = &b->vertices[i0];
+	const Vtx *p1 = &b->vertices[i1];
+	const Vtx *p2 = &b->vertices[i2];
+	const s32 idx[3] = { i0, i1, i2 };
+	f32 e1[3], e2[3], n[3];
+	f32 du1, dv1, du2, dv2;
+	f32 a, bb, c, det, nn;
+
+	for (s32 j = 0; j < 3; j++) {
+		e1[j] = (f32)(p1->v[j] - p0->v[j]);
+		e2[j] = (f32)(p2->v[j] - p0->v[j]);
+	}
+
+	du1 = (f32)(p1->s - p0->s);
+	dv1 = (f32)(p1->t - p0->t);
+	du2 = (f32)(p2->s - p0->s);
+	dv2 = (f32)(p2->t - p0->t);
+
+	n[0] = e1[1] * e2[2] - e1[2] * e2[1];
+	n[1] = e1[2] * e2[0] - e1[0] * e2[2];
+	n[2] = e1[0] * e2[1] - e1[1] * e2[0];
+	nn = n[0] * n[0] + n[1] * n[1] + n[2] * n[2];
+
+	a = e1[0] * e1[0] + e1[1] * e1[1] + e1[2] * e1[2];
+	bb = e1[0] * e2[0] + e1[1] * e2[1] + e1[2] * e2[2];
+	c = e2[0] * e2[0] + e2[1] * e2[1] + e2[2] * e2[2];
+	det = a * c - bb * bb;
+
+	// A sliver or a point has no plane to speak of.
+	if (nn <= 0.0f || det <= 0.0f) {
+		return;
+	}
+
+	for (s32 axis = 0; axis < 2; axis++) {
+		// The axis as p e1 + q e2, as near as the plane allows.
+		const f32 r1 = e1[axis];
+		const f32 r2 = e2[axis];
+		const f32 p = (c * r1 - bb * r2) / det;
+		const f32 q = (a * r2 - bb * r1) / det;
+		const f32 ds = p * du1 + q * du2;
+		const f32 dt = p * dv1 + q * dv2;
+		const f32 score = 1.0f - n[axis] * n[axis] / nn;
+
+		for (s32 i = 0; i < 3; i++) {
+			f32 *g = &b->grad[idx[i] * 4 + axis * 2];
+			f32 *best = &b->gradscore[idx[i] * 2 + axis];
+
+			if (score > *best) {
+				*best = score;
+				g[0] = ds;
+				g[1] = dt;
+			}
+		}
+	}
+}
+
+static f32 xblaMeshTriWinding(const u8 *file, const struct xblameshhdr *h, u32 stride, const u32 mesh[3]);
+
+static s32 xblaMeshBuildGroup(struct xblameshbuilder *b, const u8 *file, u32 len,
+		const struct xblameshhdr *h, u32 stride, u32 firstdraw, u32 numdraws,
+		s32 wantspan)
+{
+	const u32 numtris = (len - h->indexoffset) / 6;
+
+	// The material the list is currently set up for. The top two bytes of a
+	// material word are not understood, so this compares the whole word rather
+	// than the part it reads - two draws whose materials differ only up there
+	// get a redundant setup, which is cheaper than being wrong about it.
+	u32 lastmaterial = 0;
+
+	// Whether anything has been written yet, which is what says the material
+	// has to be set - not the first draw of the group, since the first draws
+	// of it may all belong to the other span.
+	s32 emitted = 0;
+
+	b->span = wantspan;
+	b->decal = 0;
+
+	// How the mesh is lit, which no draw changes: its own vertex colours,
+	// both faces, no lighting and no generated coordinates.
+	//
+	// Perfect Dark's own lists only set what they change and rely on the rest
+	// persisting, so what this writes leaks into whatever draws next until
+	// that sets its own. Every node that draws its own geometry goes through a
+	// texture command that writes the combiner and the tile, so the window is
+	// between this mesh and the next node - but the end of the list puts the
+	// combiner, the render mode, the texture switch and the colour table back
+	// anyway, since a textured combiner left behind is a worse thing to leak
+	// than a shade-only one.
+	if (!xblaMeshRoomForGfx(b, 2)) {
+		return 0;
+	}
+
+	// A culled mesh drops the faces its build names (xblaMeshBuildCullBack).
+	gSPClearGeometryMode(&b->gdl[b->numgfx], G_LIGHTING | (G_CULL_BOTH & ~b->cullback) |
+			G_TEXTURE_GEN | G_TEXTURE_GEN_LINEAR);
+	b->numgfx++;
+	gSPSetGeometryMode(&b->gdl[b->numgfx], G_SHADE | G_SHADING_SMOOTH | b->cullback);
+	b->numgfx++;
+
+	for (u32 d = firstdraw; d < firstdraw + numdraws; d++) {
+		const u8 *draw = file + h->drawoffset + d * XBLAMESH_ENTRY;
+		const u32 firsttri = xblaMeshBE32(draw);
+		const u32 drawtris = xblaMeshBE32(draw + 4);
+		const u32 material = xblaMeshBE32(draw + 8);
+
+		const s32 drawspan = xblaMeshDrawSpan(b, file, len, h, stride, d);
+		s32 mapsize = 0;
+		const u8 *panes;
+
+		if (firsttri > numtris || drawtris > numtris - firsttri) {
+			return 0;
+		}
+
+		// A cutout draw can hand some of its triangles to the fading span:
+		// the ones that sample a pane (xblaMeshTriIsPane()).
+		panes = xblaMeshPaneMap(stride, material, drawspan, &mapsize);
+
+		if (drawspan != wantspan && !(panes && wantspan == XBLAMESH_SPAN_FADE)) {
+			continue;
+		}
+
+		for (u32 t = 0; t < drawtris; t++) {
+			const u8 *idx = file + h->indexoffset + (firsttri + t) * 6;
+			u32 mesh[3];
+			s32 slot[3];
+			s32 fresh = 0;
+
+			mesh[0] = xblaMeshBE16(idx);
+			mesh[1] = xblaMeshBE16(idx + 2);
+			mesh[2] = xblaMeshBE16(idx + 4);
+
+			if (mesh[0] >= h->numvertices || mesh[1] >= h->numvertices ||
+					mesh[2] >= h->numvertices) {
+				continue;
+			}
+
+			if (panes && (xblaMeshTriIsPane(file, h, stride, firsttri + t, panes, mapsize)
+						? XBLAMESH_SPAN_FADE : XBLAMESH_SPAN_ALPHA) != wantspan) {
+				continue;
+			}
+
+			// A draw is one material's worth of triangles, and consecutive
+			// draws share one more often than not - a character's head and
+			// hands are the same skin. The batch has to close first: a vertex
+			// load and the triangles that index it belong to the state they
+			// were written under. Written at the first triangle that is taken
+			// rather than at the draw, since a draw split between two spans
+			// may give this one none.
+			if (!emitted || material != lastmaterial) {
+				if (!xblaMeshCloseBatch(b) ||
+						!xblaMeshSetMaterial(b, material, wantspan) ||
+						!xblaMeshOpenBatch(b)) {
+					return 0;
+				}
+
+				lastmaterial = material;
+				emitted = 1;
+			}
+
+			for (s32 i = 0; i < 3; i++) {
+				if (xblaMeshFindSlot(b, mesh[i]) >= 0) {
+					continue;
+				}
+
+				if ((i > 0 && mesh[0] == mesh[i]) || (i > 1 && mesh[1] == mesh[i])) {
+					continue;
+				}
+
+				fresh++;
+			}
+
+			// Three vertices always fit in an empty batch, so this only ever
+			// has to happen once per triangle.
+			if (b->numslots + fresh > XBLAMESH_BATCH) {
+				if (!xblaMeshCloseBatch(b) || !xblaMeshOpenBatch(b)) {
+					return 0;
+				}
+			}
+
+			for (s32 i = 0; i < 3; i++) {
+				slot[i] = xblaMeshFindSlot(b, mesh[i]);
+
+				if (slot[i] < 0) {
+					slot[i] = xblaMeshAddVertex(b, file, h, stride, mesh[i]);
+				}
+
+				if (slot[i] < 0) {
+					return 0;
+				}
+			}
+
+			if (!xblaMeshRoomForGfx(b, 1)) {
+				return 0;
+			}
+
+			// Wound against the rest of a culled mesh: turned round
+			// (xblaMeshFindWinding())
+			if (b->turn && b->turn[firsttri + t]) {
+				if (b->turn[firsttri + t] == 2) {
+					// both ways: this one as it is, then turned round
+					if (!xblaMeshRoomForGfx(b, 2)) {
+						return 0;
+					}
+
+					gSP1Triangle(&b->gdl[b->numgfx], slot[0], slot[1], slot[2], 0);
+					b->numgfx++;
+					b->numtris++;
+				}
+
+				const s32 swap = slot[1];
+
+				slot[1] = slot[2];
+				slot[2] = swap;
+				b->numturned++;
+			}
+
+			gSP1Triangle(&b->gdl[b->numgfx], slot[0], slot[1], slot[2], 0);
+			b->numgfx++;
+			b->numtris++;
+
+			if (b->grad) {
+				xblaMeshNoteTriangle(b, b->batchvtx + slot[0],
+						b->batchvtx + slot[1], b->batchvtx + slot[2]);
+			}
+		}
+	}
+
+	if (!xblaMeshCloseBatch(b)) {
+		return 0;
+	}
+
+	if (!xblaMeshRoomForGfx(b, 7)) {
+		return 0;
+	}
+
+	// Put the texture switch back to what an untextured list would have left,
+	// so that what leaks past the end of this is the same whether the mesh
+	// drew with textures or without. The next node sets its own before it
+	// draws, so this only has to be harmless rather than right. The combiner
+	// and the render mode are not touched: they are the node's, written
+	// before this list by xblaMeshRenderNode(), and the cutout list drawn
+	// straight after this one has to find them still there.
+	gDPPipeSync(&b->gdl[b->numgfx]);
+	b->numgfx++;
+	gSPTexture(&b->gdl[b->numgfx], 0xffff, 0xffff, 0, G_TX_RENDERTILE, G_OFF);
+	b->numgfx++;
+
+	// Put the colour table back. There is no telling what it was - the
+	// renderer keeps one pointer and nothing saves it - so it goes back to a
+	// full table of white, which is the neutral value for a shade multiply and
+	// the one wrong answer that cannot darken anything. Every node that draws
+	// its own geometry sets its own table before using it, so the window this
+	// covers is between this mesh and the next node.
+	b->gdl[b->numgfx].words.w0 = ((u32)G_COL << 24) | (u32)(sizeof(xblaMeshWhite));
+	b->gdl[b->numgfx].words.w1 = (uintptr_t)xblaMeshWhite;
+	b->numgfx++;
+
+	// And the culling back to what a two-sided mesh leaves, which is none:
+	// a room list that sets G_CULL_BACK does not clear G_CULL_FRONT
+	if (b->cullback) {
+		gSPClearGeometryMode(&b->gdl[b->numgfx], G_CULL_BOTH);
+		b->numgfx++;
+	}
+
+	if (b->decal) {
+		gSPClearExtraGeometryModeEXT(&b->gdl[b->numgfx], G_DECAL_EXT);
+		b->numgfx++;
+		b->decal = 0;
+	}
+
+	gSPEndDisplayList(&b->gdl[b->numgfx]);
+	b->numgfx++;
+
+	return 1;
+}
+
+/**
+ * How a triangle of the file is wound against its vertices' normals: the
+ * cosine between the face's normal by its winding and the vertices' mean
+ * normal, or 0 where either is too short to say.
+ */
+static f32 xblaMeshTriWinding(const u8 *file, const struct xblameshhdr *h, u32 stride, const u32 mesh[3])
+{
+	f32 p[3][3];
+	f32 n[3] = { 0.0f, 0.0f, 0.0f };
+	f32 e1[3], e2[3], f[3];
+	f32 lf, ln;
+
+	for (s32 i = 0; i < 3; i++) {
+		const u8 *v = file + h->vertexoffset + mesh[i] * stride;
+
+		for (s32 k = 0; k < 3; k++) {
+			p[i][k] = xblaMeshBEF32(v + k * 4);
+			n[k] += xblaMeshBEF32(v + 20 + k * 4);
+		}
+	}
+
+	for (s32 k = 0; k < 3; k++) {
+		e1[k] = p[1][k] - p[0][k];
+		e2[k] = p[2][k] - p[0][k];
+	}
+
+	f[0] = e1[1] * e2[2] - e1[2] * e2[1];
+	f[1] = e1[2] * e2[0] - e1[0] * e2[2];
+	f[2] = e1[0] * e2[1] - e1[1] * e2[0];
+
+	lf = sqrtf(f[0] * f[0] + f[1] * f[1] + f[2] * f[2]);
+	ln = sqrtf(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+
+	if (!(lf > 1e-12f) || !(ln > 0.5f)) {
+		return 0.0f;
+	}
+
+	return (f[0] * n[0] + f[1] * n[1] + f[2] * n[2]) / (lf * ln);
+}
+
+/**
+ * How to draw each triangle of a culled mesh (b->turn): 0 as it is, 1 turned
+ * round, 2 both ways.
+ *
+ * A culled mesh shows nothing where a triangle is wound the other way round
+ * from the rest, and the release has a few: Natalya's jungle outfit has a
+ * patch of them at her left ear, which showed the room through her head once
+ * characters culled (F3 20260926-203535). Which way is out for a triangle is
+ * what its vertices' normals say, and which way the mesh winds its outsides
+ * is what most of its triangles say (Bean's and 4J's are opposite, so it is
+ * read, not assumed). A triangle clearly against both is turned round; one
+ * whose normals stand across its face - a fold, a crease, the rim of an ear -
+ * cannot be told, and is drawn from both sides, as every character was before
+ * they culled.
+ */
+static void xblaMeshFindWinding(struct xblameshbuilder *b, const u8 *file, u32 len,
+		const struct xblameshhdr *h, u32 stride)
+{
+	const u32 numtris = h->indexoffset < len ? (len - h->indexoffset) / 6 : 0;
+	s32 pos = 0;
+	s32 neg = 0;
+	f32 sign;
+
+	b->numturned = 0;
+	b->turn = NULL;
+
+	if (!b->cullback || stride < 32 || numtris == 0 || h->vertexoffset + (u64)h->numvertices * stride > len) {
+		return;
+	}
+
+	for (s32 pass = 0; pass < 2; pass++) {
+		for (u32 t = 0; t < numtris; t++) {
+			const u8 *idx = file + h->indexoffset + t * 6;
+			u32 mesh[3];
+			f32 c;
+
+			mesh[0] = xblaMeshBE16(idx);
+			mesh[1] = xblaMeshBE16(idx + 2);
+			mesh[2] = xblaMeshBE16(idx + 4);
+
+			if (mesh[0] >= h->numvertices || mesh[1] >= h->numvertices || mesh[2] >= h->numvertices) {
+				continue;
+			}
+
+			c = xblaMeshTriWinding(file, h, stride, mesh);
+
+			if (pass == 0) {
+				if (c > 0.5f) {
+					pos++;
+				} else if (c < -0.5f) {
+					neg++;
+				}
+			} else if (c * sign < -0.5f) {
+				b->turn[t] = 1;
+			} else if (c != 0.0f && c * sign < 0.3f) {
+				b->turn[t] = 2;
+			}
+		}
+
+		if (pass == 0) {
+			// A clear majority, or no telling
+			if (pos > neg * 9) {
+				sign = 1.0f;
+			} else if (neg > pos * 9) {
+				sign = -1.0f;
+			} else {
+				return;
+			}
+
+			b->turn = calloc(numtris, 1);
+
+			if (!b->turn) {
+				return;
+			}
+		}
+	}
+}
+
+/**
+ * Every group's list, and one that calls all of them.
+ *
+ * The whole-mesh list is what a model draws when its parts and the mesh's
+ * groups do not line up - which nothing in the release does, but a mod's model
+ * or a half matched one could - and what a mesh with no group table at all is
+ * built as. It is a call per group rather than a copy of them, so it costs a
+ * command each and cannot fall out of step with what it calls.
+ */
+static s32 xblaMeshBuildLists(struct xblameshbuilder *b, const u8 *file, u32 len,
+		const struct xblameshhdr *h, u32 stride)
+{
+	const u32 intable = (h->drawoffset - h->groupoffset) / XBLAMESH_ENTRY;
+
+	// A mesh with no group table, or with more groups than a model can have
+	// parts, is built as one group of everything - one file in the release has
+	// no group table at all. The count that comes out of here is what a part
+	// number is checked against, so it is always at least the one.
+	const s32 numgroups = (intable >= 1 && intable <= XBLAMESH_MAXPARTS) ? (s32)intable : 1;
+
+	s32 numxlu = 0;
+	s32 numfade = 0;
+
+	xblaMeshFindWinding(b, file, len, h, stride);
+
+	b->numgroups = numgroups;
+	b->allxlu = -1;
+	b->allfade = -1;
+	b->groupxlucut = 0;
+	b->allxlucut = 1;
+
+	for (s32 g = 0; g < numgroups; g++) {
+		u32 firstdraw = 0;
+		u32 numdraws = h->numdraws;
+		s32 anyalpha = 0;
+		s32 anyfade = 0;
+		s32 anyblend = 0;
+
+		b->cullback = g < 64 && (b->twosided & (1ull << g)) ? 0 : b->meshcull;
+
+		if ((u32)numgroups == intable) {
+			const u8 *group = file + h->groupoffset + (u32)g * XBLAMESH_ENTRY;
+
+			firstdraw = xblaMeshBE32(group);
+			numdraws = xblaMeshBE32(group + 4);
+
+			if (firstdraw > h->numdraws || numdraws > h->numdraws - firstdraw) {
+				return 0;
+			}
+		}
+
+		// Whether this group has anything for a second span at all. 124 of the
+		// release's 556 meshes have an alpha material anywhere in them, so for
+		// most groups this is the end of it and groupxlu stays -1.
+		for (u32 d = firstdraw; d < firstdraw + numdraws; d++) {
+			const s32 span = xblaMeshDrawSpan(b, file, len, h, stride, d);
+			const u8 *draw = file + h->drawoffset + d * XBLAMESH_ENTRY;
+			const u32 firsttri = xblaMeshBE32(draw);
+			const u32 drawtris = xblaMeshBE32(draw + 4);
+			const u32 numtris = (len - h->indexoffset) / 6;
+			s32 mapsize = 0;
+			const u8 *panes = xblaMeshPaneMap(stride, xblaMeshBE32(draw + 8), span, &mapsize);
+
+			if (panes && firsttri <= numtris && drawtris <= numtris - firsttri) {
+				// Split by triangle, and said once per mesh in the log.
+				s32 numpanes = 0;
+
+				for (u32 t = 0; t < drawtris; t++) {
+					if (xblaMeshTriIsPane(file, h, stride, firsttri + t, panes, mapsize)) {
+						numpanes++;
+					}
+				}
+
+				if (numpanes) {
+					anyfade = 1;
+				}
+
+				if ((u32)numpanes < drawtris) {
+					anyalpha = 1;
+				}
+
+				if (numpanes && xblaMeshVerbose) {
+					sysLogPrintf(LOG_NOTE, "xblamesh:   draw %u: %d of %u cutout triangles sample "
+							"a pane of record %u - blended", d, numpanes, drawtris,
+							xblaMeshBE32(draw + 8) & 0x1fff);
+				}
+			} else if (span == XBLAMESH_SPAN_ALPHA) {
+				anyalpha = 1;
+				anyblend = 1;
+			} else if (span == XBLAMESH_SPAN_FADE) {
+				anyfade = 1;
+			}
+		}
+
+		// An alpha span whose every draw was sorted against its picture is
+		// cutouts and nothing else: the panes went to the fading span, and
+		// what is left samples texels that are opaque or clear. Drawn in the
+		// translucent pass it wrote no depth, so the fading span laid over it
+		// covered it - the release's Villa bottles carry their labels on the
+		// glass's own surface, a tenth of a unit out, and the glass drawn
+		// after them (front and back) tinted every label to a dark green
+		// patch. A span like that, beside a fading one, is drawn as a cutout
+		// in the opaque pass instead, whatever the node's own translucent
+		// list says, and the glass is blended over what it has written - see
+		// xblaMeshRenderNode(). A draw with no map (a skinned mesh's, whose
+		// hair has to stay a cutout for other reasons, or a real translucent
+		// surface the pane test was never asked about) keeps the span where
+		// it was.
+		if (anyalpha && !anyblend) {
+			b->groupxlucut |= 1ull << g;
+		} else if (anyalpha) {
+			b->allxlucut = 0;
+		}
+
+		b->groupgfx[g] = b->numgfx;
+
+		if (!xblaMeshBuildGroup(b, file, len, h, stride, firstdraw, numdraws, XBLAMESH_SPAN_SOLID)) {
+			return 0;
+		}
+
+		b->groupxlu[g] = -1;
+		b->groupfade[g] = -1;
+
+		if (anyalpha) {
+			b->groupxlu[g] = b->numgfx;
+			numxlu++;
+
+			if (!xblaMeshBuildGroup(b, file, len, h, stride, firstdraw, numdraws, XBLAMESH_SPAN_ALPHA)) {
+				return 0;
+			}
+		}
+
+		if (anyfade) {
+			b->groupfade[g] = b->numgfx;
+			numfade++;
+
+			if (!xblaMeshBuildGroup(b, file, len, h, stride, firstdraw, numdraws, XBLAMESH_SPAN_FADE)) {
+				return 0;
+			}
+		}
+	}
+
+	b->cullback = b->meshcull;
+
+	// The lists that call them all. Their commands hold addresses inside the
+	// array they are in, which is still growing, so they go in after the
+	// batches do - by then nothing moves again.
+	b->allgfx = b->numgfx;
+
+	if (!xblaMeshRoomForGfx(b, numgroups + 1)) {
+		return 0;
+	}
+
+	b->numgfx += numgroups + 1;
+
+	if (numxlu) {
+		b->allxlu = b->numgfx;
+
+		if (!xblaMeshRoomForGfx(b, numxlu + 1)) {
+			return 0;
+		}
+
+		b->numgfx += numxlu + 1;
+	}
+
+	if (numfade) {
+		b->allfade = b->numgfx;
+
+		if (!xblaMeshRoomForGfx(b, numfade + 1)) {
+			return 0;
+		}
+
+		b->numgfx += numfade + 1;
+	}
+
+	xblaMeshWriteBatches(b);
+
+	for (s32 g = 0; g < numgroups; g++) {
+		gSPDisplayList(&b->gdl[b->allgfx + g], &b->gdl[b->groupgfx[g]]);
+	}
+
+	gSPEndDisplayList(&b->gdl[b->allgfx + numgroups]);
+
+	if (numxlu) {
+		s32 at = 0;
+
+		for (s32 g = 0; g < numgroups; g++) {
+			if (b->groupxlu[g] >= 0) {
+				gSPDisplayList(&b->gdl[b->allxlu + at], &b->gdl[b->groupxlu[g]]);
+				at++;
+			}
+		}
+
+		gSPEndDisplayList(&b->gdl[b->allxlu + at]);
+	}
+
+	if (numfade) {
+		s32 at = 0;
+
+		for (s32 g = 0; g < numgroups; g++) {
+			if (b->groupfade[g] >= 0) {
+				gSPDisplayList(&b->gdl[b->allfade + at], &b->gdl[b->groupfade[g]]);
+				at++;
+			}
+		}
+
+		gSPEndDisplayList(&b->gdl[b->allfade + at]);
+	}
+
+	return 1;
+}
+
+/**
+ * The palette, which is the inverse of every bind matrix, in the game's terms.
+ *
+ * A vertex has to come out of the bind pose before the game's pose for its
+ * bone can be put on it, and the inverse bind is what the file already holds -
+ * nothing here inverts anything. What it does do is change convention: the
+ * mesh stores three rows of four floats with the translation in the last
+ * column, to be applied on the left of a column vector, and an Mtxf is read by
+ * mtx4TransformVec the other way round - three basis vectors in rows with the
+ * translation in the fourth. So the 3x3 transposes and the column becomes the
+ * row.
+ */
+static s32 xblaMeshReadBind(struct xblameshbuilt *m, const u8 *file,
+		const struct xblameshhdr *h, f32 scale)
+{
+	if (h->nummatrices > XBLAMESH_MAXMTX) {
+		return 0;
+	}
+
+	m->invbind = calloc(h->nummatrices, sizeof(Mtxf));
+
+	if (!m->invbind) {
+		return 0;
+	}
+
+	m->nummatrices = (s32)h->nummatrices;
+
+	// A group's third word is a palette entry, and nothing reads it: what
+	// poses a vertex is the bone bytes the vertex itself carries, and the
+	// entry a group names is the one its part is weighted to most. It is worth
+	// knowing when a group is being matched to a part; it is not a step in
+	// drawing one.
+	for (u32 i = 0; i < h->nummatrices; i++) {
+		const u8 *src = file + XBLAMESH_HEADER + i * XBLAMESH_MATRIX;
+		Mtxf *dst = &m->invbind[i];
+		f32 row[3][4];
+
+		for (s32 r = 0; r < 3; r++) {
+			for (s32 c = 0; c < 4; c++) {
+				row[r][c] = xblaMeshBEF32(src + (r * 4 + c) * 4);
+			}
+		}
+
+		// Stored as three rows of four with the translation in the last
+		// column, which is a matrix meant to be applied on the left of a
+		// column vector. An Mtxf is read the other way round - three basis
+		// vectors in rows, translation in the fourth - so the 3x3 transposes
+		// and the column becomes the row.
+		//
+		// What is stored is the *inverse* bind, model space to bone space, and
+		// not the bind itself: palette entry 0 of the evening dress mesh
+		// translates by -146 in y where the mesh stands from 0 to 148, which
+		// is a bone at +146 written the other way about. Inverting it here as
+		// well - which is what "the matrices fold a character in half" was -
+		// puts every vertex through the bone twice.
+		for (s32 r = 0; r < 3; r++) {
+			for (s32 c = 0; c < 3; c++) {
+				dst->m[c][r] = row[r][c];
+			}
+
+			dst->m[r][3] = 0.0f;
+		}
+
+		// The last column is the translation of that same inverse bind and
+		// goes in as it stands - the bone's *position* is what it is not.
+		// Entry 0 of the evening dress mesh translates by -146 in y where the
+		// mesh stands from 0 to 149, and the head is at +146: a point at the
+		// head lands on the origin of the bone, which is what an inverse bind
+		// is for. Rotating and negating it here to make a position out of it -
+		// which is what this used to do - moves every bone with a rotation to
+		// somewhere else entirely and every bone without one to twice its own
+		// height away.
+		//
+		// In the game's units, since that is what the vertices were read in:
+		// the rotation does not care, the translation does.
+		for (s32 c = 0; c < 3; c++) {
+			dst->m[3][c] = row[c][3] * scale;
+		}
+
+		dst->m[3][3] = 1.0f;
+	}
+
+	return 1;
+}
+
+/**
+ * One of the release's meshes, or a synthesised one, read into the shape
+ * objmesh.h describes: what the asset dump writes out, and what a model
+ * pack's replacement for a skinned mesh takes its bone weights from.
+ *
+ * Positions come out in the game's units; a UV's v is turned over into the
+ * OBJ's bottom-up sense, which is the t direction the vertex loader wants
+ * (xblaMeshAddVertex()); the palette is copied as it stands.
+ */
+static struct objmesh *xblaMeshFileToObj(const u8 *file, u32 len, const char *name)
+{
+	struct xblameshhdr h;
+	struct objmesh *m;
+	u32 stride;
+	u32 numtris;
+	u32 intable;
+	f32 scale;
+
+	if (!xblaMeshReadHeader(&h, file, len, &stride)) {
+		return NULL;
+	}
+
+	m = objmeshAlloc(name);
+
+	if (!m) {
+		return NULL;
+	}
+
+	scale = xblaMeshScale(&h);
+	m->headerscale = h.unknown;
+	m->skinned = stride == XBLAMESH_STRIDE_SKIN && h.nummatrices > 0;
+	m->nummatrices = h.nummatrices;
+
+	if (h.nummatrices) {
+		m->matrices = malloc((size_t)h.nummatrices * 12 * sizeof(f32));
+
+		if (!m->matrices) {
+			objmeshFree(m);
+			return NULL;
+		}
+
+		for (u32 i = 0; i < h.nummatrices * 12; i++) {
+			m->matrices[i] = xblaMeshBEF32(file + XBLAMESH_HEADER + i * 4);
+		}
+	}
+
+	for (u32 i = 0; i < h.numvertices; i++) {
+		const u8 *v = file + h.vertexoffset + i * stride;
+		struct objvertex ov;
+		u32 colour;
+
+		memset(&ov, 0, sizeof(ov));
+		ov.pos[0] = xblaMeshBEF32(v) * scale;
+		ov.pos[1] = xblaMeshBEF32(v + 4) * scale;
+		ov.pos[2] = xblaMeshBEF32(v + 8) * scale;
+		ov.uv[0] = xblaMeshBEF32(v + 12);
+		ov.uv[1] = 1.0f - xblaMeshBEF32(v + 16);
+		ov.nrm[0] = xblaMeshBEF32(v + 20);
+		ov.nrm[1] = xblaMeshBEF32(v + 24);
+		ov.nrm[2] = xblaMeshBEF32(v + 28);
+		colour = xblaMeshBE32(v + 32);
+		ov.rgba[0] = (u8)(colour >> 16);
+		ov.rgba[1] = (u8)(colour >> 8);
+		ov.rgba[2] = (u8)colour;
+		ov.rgba[3] = (u8)(colour >> 24);
+		ov.weight[0] = 1.0f;
+
+		if (stride == XBLAMESH_STRIDE_SKIN) {
+			const u32 packed = xblaMeshBE32(v + 44);
+
+			xblaMeshSkinWeights(v, ov.weight);
+
+			ov.bone[0] = (u8)(packed >> 24);
+			ov.bone[1] = (u8)(packed >> 16);
+			ov.bone[2] = (u8)(packed >> 8);
+			ov.bone[3] = (u8)packed;
+		}
+
+		if (objmeshAddVertex(m, &ov) < 0) {
+			objmeshFree(m);
+			return NULL;
+		}
+	}
+
+	numtris = (len - h.indexoffset) / 6;
+
+	for (u32 t = 0; t < numtris; t++) {
+		const u8 *idx = file + h.indexoffset + t * 6;
+		u32 a = xblaMeshBE16(idx);
+		u32 b = xblaMeshBE16(idx + 2);
+		u32 c = xblaMeshBE16(idx + 4);
+
+		// A draw counts triangles by position, so a bad one is kept as a
+		// degenerate rather than dropped and shifting the ones after it.
+		if (a >= h.numvertices || b >= h.numvertices || c >= h.numvertices) {
+			a = b = c = 0;
+		}
+
+		if (objmeshAddTriangle(m, a, b, c) < 0) {
+			objmeshFree(m);
+			return NULL;
+		}
+	}
+
+	for (u32 d = 0; d < h.numdraws; d++) {
+		const u8 *draw = file + h.drawoffset + d * XBLAMESH_ENTRY;
+		const u32 firsttri = xblaMeshBE32(draw);
+		const u32 drawtris = xblaMeshBE32(draw + 4);
+		const u32 material = xblaMeshBE32(draw + 8);
+		char matname[OBJMESH_NAMELEN];
+		s32 mat;
+
+		snprintf(matname, sizeof(matname), "xbla_%04x", material & 0x1fff);
+		mat = objmeshAddMaterial(m, matname, OBJMAT_XBLA, material & 0x1fff, (material >> 15) & 1, NULL);
+
+		if (firsttri > numtris || drawtris > numtris - firsttri || objmeshAddDraw(m, firsttri, drawtris, mat) < 0) {
+			objmeshFree(m);
+			return NULL;
+		}
+	}
+
+	intable = (h.drawoffset - h.groupoffset) / XBLAMESH_ENTRY;
+
+	if (intable >= 1 && intable <= XBLAMESH_MAXPARTS) {
+		for (u32 g = 0; g < intable; g++) {
+			const u8 *group = file + h.groupoffset + g * XBLAMESH_ENTRY;
+			const u32 firstdraw = xblaMeshBE32(group);
+			const u32 numdraws = xblaMeshBE32(group + 4);
+			char gname[OBJMESH_NAMELEN];
+			s32 gi;
+
+			snprintf(gname, sizeof(gname), "part%u", g);
+			gi = objmeshAddGroup(m, gname, firstdraw, numdraws);
+
+			if (gi < 0 || firstdraw > h.numdraws || numdraws > h.numdraws - firstdraw) {
+				objmeshFree(m);
+				return NULL;
+			}
+
+			m->groups[gi].matrixindex = xblaMeshBE32(group + 8);
+		}
+	} else if (objmeshAddGroup(m, "part0", 0, h.numdraws) < 0) {
+		objmeshFree(m);
+		return NULL;
+	}
+
+	return m;
+}
+
+static void xblaMeshPutBE32(u8 *p, u32 v)
+{
+	p[0] = (u8)(v >> 24);
+	p[1] = (u8)(v >> 16);
+	p[2] = (u8)(v >> 8);
+	p[3] = (u8)v;
+}
+
+static void xblaMeshPutBEF32(u8 *p, f32 f)
+{
+	union { u32 u; f32 f; } bits;
+	bits.f = f;
+	xblaMeshPutBE32(p, bits.u);
+}
+
+/**
+ * The material word for one of an OBJ's materials: a record as the release
+ * writes it, or an entry in the build's own picture table.
+ */
+static u32 xblaMeshMaterialWord(const struct objmaterial *mat, struct xblameshmats *mats)
+{
+	const void *tile = NULL;
+	s32 alpha = 0;
+	s32 soft = 0;
+
+	if (mat && mat->kind == OBJMAT_XBLA && mat->id <= 0x1fff) {
+		return mat->id | (mat->alpha ? 0x8000u : 0u);
+	}
+
+	if (mat && (mat->kind == OBJMAT_N64 || mat->kind == OBJMAT_IMAGE)) {
+		tile = modelpackBindMaterial(mat, &alpha, &soft);
+	}
+
+	// The same picture once: a mesh names its skin on the head and the hands.
+	for (s32 i = 0; i < mats->num; i++) {
+		if (mats->tile[i] == tile) {
+			return XBLAMESH_MAT_TABLE | (u32)i | (mats->alpha[i] ? 0x8000u : 0u);
+		}
+	}
+
+	if (mats->num >= XBLAMESH_MAXMATS) {
+		return XBLAMESH_MAT_TABLE | 0xfff;
+	}
+
+	mats->tile[mats->num] = tile;
+	mats->alpha[mats->num] = (u8)(tile ? alpha : 0);
+	mats->soft[mats->num] = (u8)(tile ? soft : 0);
+	mats->num++;
+
+	return XBLAMESH_MAT_TABLE | (u32)(mats->num - 1) | (tile && alpha ? 0x8000u : 0u);
+}
+
+/**
+ * An OBJ written back out in 4J's own layout, so that it goes through the
+ * same builder as one of theirs. See xblamesh.py for the layout; every offset
+ * the header measures is laid out here in the file's own order.
+ *
+ * skin, when given, is the mesh being replaced: a skinned one lends its
+ * palette and its scale, and every vertex of the OBJ takes the weights of the
+ * nearest vertex of it - OBJ carries no skinning, and a character re-exported
+ * from a modeller has lost its bones. parts, when non-zero, lays the groups
+ * out by their number (a "node3" group is group 3) with an empty group where
+ * the file has none, and says which of those in *outAbsent - what a model
+ * pack's file for one of the game's own models wants. The triangles are
+ * written in draw order, group by group, so a draw is one contiguous run.
+ */
+static u8 *xblaMeshFromObj(const struct objmesh *m, const struct objmesh *skin,
+		struct xblameshmats *mats, s32 parts, u64 *outAbsent, u32 *outLen)
+{
+	const s32 skinned = skin && skin->skinned && skin->numvertices > 0 && skin->nummatrices > 0;
+	const u32 stride = skinned ? XBLAMESH_STRIDE_SKIN : XBLAMESH_STRIDE_RIGID;
+	const u32 nummatrices = skinned ? skin->nummatrices : 0;
+	const f32 headerscale = skinned ? skin->headerscale : 100.0f;
+	const f32 scale = (headerscale > 0.0f && headerscale <= 100000.0f) ? headerscale / 100.0f : 1.0f;
+	s32 numgroups;
+	s32 groupof[XBLAMESH_MAXPARTS]; // which OBJ group is laid out at each slot, or -1
+	u32 *matwords;
+	u32 numdraws = 0;
+	u32 numtris = 0;
+	u32 groupoffset, drawoffset, vertexoffset, indexoffset;
+	u32 len;
+	u8 *file;
+	u8 *p;
+	u32 drawat = 0;
+	u32 triat = 0;
+
+	if (m->numvertices == 0 || m->numtris == 0 || m->numvertices > XBLAMESH_MAXVERTS) {
+		return NULL;
+	}
+
+	for (s32 i = 0; i < XBLAMESH_MAXPARTS; i++) {
+		groupof[i] = -1;
+	}
+
+	if (parts > 0) {
+		s32 numbered = 1;
+
+		numgroups = parts > XBLAMESH_MAXPARTS ? XBLAMESH_MAXPARTS : parts;
+
+		for (u32 g = 0; g < m->numgroups; g++) {
+			if (m->groups[g].number < 0) {
+				numbered = 0;
+			}
+		}
+
+		for (u32 g = 0; g < m->numgroups; g++) {
+			const s32 at = numbered ? m->groups[g].number : (s32)g;
+
+			if (at >= 0 && at < numgroups && groupof[at] < 0) {
+				groupof[at] = (s32)g;
+			}
+		}
+
+		if (outAbsent) {
+			*outAbsent = 0;
+
+			for (s32 i = 0; i < numgroups; i++) {
+				if (groupof[i] < 0) {
+					*outAbsent |= 1ull << i;
+				}
+			}
+		}
+	} else if (m->numgroups >= 1 && m->numgroups <= XBLAMESH_MAXPARTS) {
+		numgroups = (s32)m->numgroups;
+
+		for (s32 g = 0; g < numgroups; g++) {
+			groupof[g] = g;
+		}
+	} else {
+		// Everything as one group: the layout below takes every draw.
+		numgroups = 1;
+		groupof[0] = -2;
+	}
+
+	for (s32 g = 0; g < numgroups; g++) {
+		if (groupof[g] == -2) {
+			numdraws = m->numdraws;
+			numtris = m->numtris;
+		} else if (groupof[g] >= 0) {
+			const struct objgroup *group = &m->groups[groupof[g]];
+
+			for (u32 d = group->firstdraw; d < group->firstdraw + group->numdraws && d < m->numdraws; d++) {
+				numdraws++;
+				numtris += m->draws[d].numtris;
+			}
+		}
+	}
+
+	if (numdraws == 0 || numtris == 0 || numdraws > XBLAMESH_MAXDRAWS) {
+		return NULL;
+	}
+
+	matwords = malloc((m->nummaterials + 1) * sizeof(u32));
+
+	if (!matwords) {
+		return NULL;
+	}
+
+	for (u32 i = 0; i < m->nummaterials; i++) {
+		matwords[i] = xblaMeshMaterialWord(&m->materials[i], mats);
+	}
+
+	matwords[m->nummaterials] = xblaMeshMaterialWord(NULL, mats); // for a draw with none
+
+	groupoffset = XBLAMESH_HEADER + XBLAMESH_MATRIX * nummatrices;
+	drawoffset = groupoffset + XBLAMESH_ENTRY * (u32)numgroups;
+	vertexoffset = drawoffset + XBLAMESH_ENTRY * numdraws;
+	indexoffset = vertexoffset + stride * m->numvertices;
+	len = indexoffset + 6 * numtris;
+
+	file = calloc(len, 1);
+
+	if (!file) {
+		free(matwords);
+		return NULL;
+	}
+
+	xblaMeshPutBE32(file, m->numvertices);
+	xblaMeshPutBE32(file + 4, vertexoffset);
+	xblaMeshPutBE32(file + 8, indexoffset);
+	xblaMeshPutBE32(file + 12, numdraws);
+	xblaMeshPutBE32(file + 16, drawoffset);
+	xblaMeshPutBE32(file + 20, nummatrices);
+	xblaMeshPutBEF32(file + 24, headerscale);
+	xblaMeshPutBE32(file + 28, groupoffset);
+
+	for (u32 i = 0; i < nummatrices * 12; i++) {
+		xblaMeshPutBEF32(file + XBLAMESH_HEADER + i * 4, skin->matrices[i]);
+	}
+
+	// Groups, draws and the index buffer, in the one order.
+	for (s32 g = 0; g < numgroups; g++) {
+		u8 *group = file + groupoffset + (u32)g * XBLAMESH_ENTRY;
+		const u32 firstdraw = drawat;
+		u32 dfrom = 0;
+		u32 dto = 0;
+
+		if (groupof[g] == -2) {
+			dto = m->numdraws;
+		} else if (groupof[g] >= 0) {
+			dfrom = m->groups[groupof[g]].firstdraw;
+			dto = dfrom + m->groups[groupof[g]].numdraws;
+
+			if (dto > m->numdraws) {
+				dto = m->numdraws;
+			}
+		}
+
+		for (u32 d = dfrom; d < dto; d++) {
+			const struct objdraw *draw = &m->draws[d];
+			u8 *out = file + drawoffset + drawat * XBLAMESH_ENTRY;
+			const u32 mat = (draw->material >= 0 && (u32)draw->material < m->nummaterials)
+					? (u32)draw->material : m->nummaterials;
+
+			xblaMeshPutBE32(out, triat);
+			xblaMeshPutBE32(out + 4, draw->numtris);
+			xblaMeshPutBE32(out + 8, matwords[mat]);
+
+			for (u32 t = draw->firsttri; t < draw->firsttri + draw->numtris && t < m->numtris; t++) {
+				u8 *idx = file + indexoffset + triat * 6;
+
+				for (s32 i = 0; i < 3; i++) {
+					const u32 v = m->indices[t * 3 + i] < m->numvertices ? m->indices[t * 3 + i] : 0;
+
+					idx[i * 2] = (u8)(v >> 8);
+					idx[i * 2 + 1] = (u8)v;
+				}
+
+				triat++;
+			}
+
+			drawat++;
+		}
+
+		xblaMeshPutBE32(group, firstdraw);
+		xblaMeshPutBE32(group + 4, drawat - firstdraw);
+		xblaMeshPutBE32(group + 8, 0);
+	}
+
+	free(matwords);
+
+	for (u32 i = 0; i < m->numvertices; i++) {
+		const struct objvertex *v = &m->vertices[i];
+		u8 *out = file + vertexoffset + i * stride;
+
+		xblaMeshPutBEF32(out, v->pos[0] / scale);
+		xblaMeshPutBEF32(out + 4, v->pos[1] / scale);
+		xblaMeshPutBEF32(out + 8, v->pos[2] / scale);
+		xblaMeshPutBEF32(out + 12, v->uv[0]);
+		xblaMeshPutBEF32(out + 16, 1.0f - v->uv[1]);
+		xblaMeshPutBEF32(out + 20, v->nrm[0]);
+		xblaMeshPutBEF32(out + 24, v->nrm[1]);
+		xblaMeshPutBEF32(out + 28, v->nrm[2]);
+		xblaMeshPutBE32(out + 32, ((u32)v->rgba[3] << 24) | ((u32)v->rgba[0] << 16) |
+				((u32)v->rgba[1] << 8) | v->rgba[2]);
+
+		if (skinned) {
+			// The nearest vertex of the mesh this replaces lends its bones.
+			// Brute force: a body is five thousand vertices a side, which is
+			// a few tens of milliseconds once per mesh.
+			const struct objvertex *best = &skin->vertices[0];
+			f32 bestd = 1e30f;
+
+			for (u32 j = 0; j < skin->numvertices; j++) {
+				const struct objvertex *sv = &skin->vertices[j];
+				const f32 dx = sv->pos[0] - v->pos[0];
+				const f32 dy = sv->pos[1] - v->pos[1];
+				const f32 dz = sv->pos[2] - v->pos[2];
+				const f32 d = dx * dx + dy * dy + dz * dz;
+
+				if (d < bestd) {
+					bestd = d;
+					best = sv;
+
+					if (d == 0.0f) {
+						break;
+					}
+				}
+			}
+
+			xblaMeshPutBEF32(out + 36, best->weight[0]);
+			xblaMeshPutBEF32(out + 40, best->weight[1]);
+			out[44] = best->bone[0];
+			out[45] = best->bone[1];
+			out[46] = best->bone[2];
+			out[47] = best->bone[3];
+		}
+	}
+
+	*outLen = len;
+
+	return file;
+}
+
+/**
+ * Trims each vertex's skinning down to the bones that actually move it.
+ *
+ * Three influences are stored per vertex and most vertices are not three. A
+ * vertex with fewer repeats a bone in the bytes it does not need, which is how
+ * 95% of them write a second bone they do not have, and the third weight is
+ * what is left of one and is zero outright on many. Applying all three anyway
+ * is three matrix transforms for an answer that one or two of them already
+ * gave: 44% of the release's skinned vertices come down to a single bone and
+ * 34% to two, so this takes 41% of the transforms out of every posed frame.
+ *
+ * Done once, here, rather than per vertex per frame: the palette index is
+ * clamped to the palette (which the pose did per vertex per frame), repeated
+ * bones have their weights added together, zero-weight terms are dropped, and
+ * what is left is counted into the fourth byte - which the file used for
+ * something that was never a count.
+ *
+ * **Only weights that are exactly zero.** A third weight written as the
+ * remainder of the other two lands a hair off zero rather than on it about
+ * 15% of the time, and dropping those as well would take another tenth of the
+ * transforms; it is not done, because a term that small still moves the
+ * rounded vertex by one step of the write wherever it falls either side of a
+ * half, and the pose is worth more as something that can be shown to be
+ * unchanged than as something a tenth faster. Merging a repeat is safe on the
+ * same measure: it adds the two weights before the transform instead of after
+ * it, which is the same sum in a different order, and the difference is a
+ * float's last place against a write that rounds to a sixteenth of a unit.
+ */
+static void xblaMeshCompactSkin(struct xblameshbuilt *m)
+{
+	// Runs for every skinned mesh, palette or no palette: the pose reads the
+	// count this leaves and the bones this clamps, so a mesh that has bones has
+	// been through here.
+	if (!m->bindpos || !m->weights || !m->bones) {
+		return;
+	}
+
+	for (s32 i = 0; i < m->numvertices; i++) {
+		f32 *wt = &m->weights[i * 3];
+		u8 *bn = &m->bones[i * 4];
+		s32 num = 0;
+
+		for (s32 j = 0; j < 3; j++) {
+			const u8 which = bn[j] < m->nummatrices ? bn[j] : 0;
+			const f32 w = wt[j];
+			s32 at = -1;
+
+			if (w == 0.0f) {
+				continue;
+			}
+
+			for (s32 k = 0; k < num; k++) {
+				if (bn[k] == which) {
+					at = k;
+					break;
+				}
+			}
+
+			// num is never past j, so the entry written here is either one that
+			// has already been read or the one being read now.
+			if (at >= 0) {
+				wt[at] += w;
+			} else {
+				bn[num] = which;
+				wt[num] = w;
+				num++;
+			}
+		}
+
+		if (num == 0) {
+			// Every weight was zero, so the vertex sits at the origin of the
+			// space the list is drawn in whichever bone is named. One entry, so
+			// that the pose never reads a bone byte this did not write.
+			bn[0] = 0;
+			wt[0] = 0.0f;
+			num = 1;
+		}
+
+		for (s32 j = num; j < 3; j++) {
+			wt[j] = 0.0f;
+			bn[j] = bn[0];
+		}
+
+		bn[3] = (u8)num;
+	}
+}
+
+/**
+ * The build proper: a file in 4J's layout, ours or theirs, into lists. Takes
+ * the file and frees it. what names the mesh in the log.
+ */
+/**
+ * Set round a build whose lists should cull the faces turned away, to the
+ * geometry mode bit that names them; 0 draws both. A prop draws both faces,
+ * since 4J built some as single planes. The title draws its cubes with no
+ * depth buffer, and 4J's red cube (file 222) is a closed box whose far walls
+ * then paint their insides over the near ones - the "open cup" it tipped back
+ * as. A character culls as its N64 model does, because the depth buffer is no
+ * help to a fading one: the fade is drawn without depth writes, so the far
+ * side painted over the near and the swirl into Bond's eyes showed his face
+ * through the back of his head - and a camera inside a body looked at the
+ * inside of it where the N64 model is seen through.
+ *
+ * The release winds its triangles the other way round from the game's, so the
+ * faces the game calls front are the ones facing away and its cube culls
+ * G_CULL_FRONT (tried the other way, 4J's cube lost the emblem on its face and
+ * showed the inside of its walls).
+ */
+static s32 xblaMeshBuildCullBack = 0;
+
+/**
+ * Groups of the mesh being built that are drawn both sides though the mesh
+ * culls (xblaMeshBuildCullBack): the parka's hood (gebeanmats.hood). Its
+ * lining does not cover the whole inside of the hood, and where it stops the
+ * hood's own inner face is a back face - culled, the sky showed through a
+ * sliver beside Bond's temple (F3 20260926-205739).
+ */
+static u64 xblaMeshBuildTwoSided = 0;
+
+/**
+ * Whether a file is a character's body or head: those cull their back faces,
+ * as the N64 models do, where a prop may be a single plane seen from both sides.
+ *
+ * A file read out of the release itself (Agent 4, xblaagent4.c) is asked for
+ * by the release's id - xblaMeshMatchModel() swaps the slot for it before
+ * the nodes are matched - while his rows hold the slot the file was registered
+ * in, so a row is his if either number is the one asked about. Matching the
+ * slot alone left Agent 4 the one character drawn two-sided.
+ */
+static s32 xblaMeshFileIsChr(s32 fileid)
+{
+	if (fileid <= 0) {
+		return 0;
+	}
+
+	for (s32 i = 0; i < NUM_HEADSANDBODIES; i++) {
+		const s32 filenum = g_HeadsAndBodies[i].filenum;
+
+		if (filenum == fileid || (filenum > 0 && romdataFileGetXblaId(filenum) == fileid)) {
+			return 1;
+		}
+	}
+
+	return 0;
+}
+
+/**
+ * The release's reflections. Every build reads its normals, and a mesh with
+ * no reflecting material lets them go again: 231 of the release's meshes have
+ * one (131 of them skinned - the guns a guard holds, most of all), and the rest
+ * do not pay for them past their own build. A material whose byte 16 is not zero is blended that percentage of
+ * the way towards environment cube map byte 24 - records 0e93 on - looked up by
+ * the eye's ray reflected in the surface, in view space (CLAUDE-notes/xbla.md,
+ * "The release's reflections"). The renderer has no cube maps, so each cube
+ * the mesh reflects becomes a sphere map for a viewer looking down -z, the
+ * cells side by side in one picture, and a copy of the mesh's lists binds that
+ * picture wherever the lists bind a material's. The lookup into it is worked
+ * out per pixel by the renderer - see xblaMeshEnvironmentVertices() - and
+ * the copy is added over the mesh, whose own colours have been scaled down by
+ * the same amount for the pass before it.
+ */
+#define XBLAMESH_ENV_FIRSTRECORD 0x0e93
+#define XBLAMESH_ENV_CELL        256
+#define XBLAMESH_ENV_MAXCELLS    4
+#define XBLAMESH_ENV_MAXATLASES  32
+
+// The atlases made so far, by the key they were bound under.
+static char envAtlasKey[XBLAMESH_ENV_MAXATLASES][64];
+static const void *envAtlasTile[XBLAMESH_ENV_MAXATLASES];
+static s32 envAtlasCount;
+
+// Mod.XblaReflections, and the title's word over it round its own draws: see
+// xblaMeshSetEnvironment().
+static s32 optReflect = 1;
+static s32 envforce = XBLAMESH_ENV_SETTING;
+
+// Mod.XblaReflectStyle: the release's cube maps, the N64 guns' sheen drawn
+// on the same materials, or that sheen as the levels' metal (2026-09-14). See
+// xblaMeshBuildSheen(). The sheen was the default from 2026-09-13 (the user
+// judged it much the better look than the cube maps), and Level Metal is since
+// 2026-09-14, at the user's request, so testers have it.
+static s32 optReflectStyle = XBLAMESH_REFLECT_METAL;
+
+// Mod.XblaLogoMaterial: the title's marble logo in the statue's blue and the
+// grey metal (2026-09-14, at the user's request, and the default), or in the
+// release's cube maps. See xblaMeshBuildLogo().
+static s32 optLogoMaterial = 1;
+
+// Mod.XblaReflectDistance: in metres, where the reflection is gone while the
+// Reflection Cutoff is on (the Xbox 360 (XBLA) page). See xblaMeshEnvironmentReach().
+static s32 optReflectDistance = 15;
+
+#define XBLAMESH_ENV_WANTED() (envforce > 0 || (envforce == 0 && optReflect))
+
+/**
+ * Direct3D's cube lookup: the major axis picks the face, the other two its
+ * coordinates, bilinear across the face's texels in the record's row order
+ * (the order the fit to the release's frames chose).
+ */
+static void xblaMeshCubeSample(const u8 *faces, s32 size, f32 x, f32 y, f32 z, f32 *out)
+{
+	const f32 ax = fabsf(x), ay = fabsf(y), az = fabsf(z);
+	const u8 *face;
+	f32 sc, tc, ma, fx, fy, wx, wy;
+	s32 f, x0, y0, x1, y1;
+
+	if (ax >= ay && ax >= az) {
+		f = x > 0.0f ? 0 : 1;
+		sc = x > 0.0f ? -z : z;
+		tc = -y;
+		ma = ax;
+	} else if (ay >= az) {
+		f = y > 0.0f ? 2 : 3;
+		sc = x;
+		tc = y > 0.0f ? z : -z;
+		ma = ay;
+	} else {
+		f = z > 0.0f ? 4 : 5;
+		sc = z > 0.0f ? x : -x;
+		tc = -y;
+		ma = az;
+	}
+
+	if (ma < 1e-6f) {
+		out[0] = out[1] = out[2] = 0.0f;
+		return;
+	}
+
+	face = faces + (size_t)f * size * size * 4;
+	fx = (sc / ma + 1.0f) * 0.5f * (size - 1);
+	fy = (tc / ma + 1.0f) * 0.5f * (size - 1);
+	fx = fx < 0.0f ? 0.0f : fx > size - 1 ? size - 1 : fx;
+	fy = fy < 0.0f ? 0.0f : fy > size - 1 ? size - 1 : fy;
+	x0 = (s32)fx;
+	y0 = (s32)fy;
+	x1 = x0 + 1 < size ? x0 + 1 : x0;
+	y1 = y0 + 1 < size ? y0 + 1 : y0;
+	wx = fx - x0;
+	wy = fy - y0;
+
+	for (s32 c = 0; c < 3; c++) {
+		const f32 top = face[(y0 * size + x0) * 4 + c] * (1.0f - wx) + face[(y0 * size + x1) * 4 + c] * wx;
+		const f32 bottom = face[(y1 * size + x0) * 4 + c] * (1.0f - wx) + face[(y1 * size + x1) * 4 + c] * wx;
+
+		out[c] = top * (1.0f - wy) + bottom * wy;
+	}
+}
+
+/**
+ * The N64 sheen's copy of the reflection list (Mod.XblaReflectStyle). It is
+ * what the stock guns draw on their metal: the K7 Avenger's lists switch on
+ * G_LIGHTING | G_TEXTURE_GEN round three spans, with G_TEXTURE at 0x0800 and
+ * ROM texture 0x3eb, so the RSP sphere-maps the streaks off each vertex's
+ * normal against the camera's LookAt and lights them with lightsSetDefault()'s
+ * white light (a fourth span reads 0xb54, within 17 levels of 0x3eb).
+ *
+ * The copy is envgdl - the same batches, the same skipped ones - with the
+ * atlas swapped for 0x3eb, the texture scale for the K7's, and the lists' own
+ * clear of the two modes taken out, so the pass's set survives each list's
+ * head. The stand-in tile is 32x32, which is 0x3eb's own size, so the scale
+ * means what it meant on the N64. Bound by number, so a texture pack repaints
+ * the streaks.
+ */
+#define XBLAMESH_SHEEN_TEXTURE 0x3eb
+#define XBLAMESH_SHEEN_SCALE   0x0800
+
+// The sheen's share of a material, from the release's amount (0-255). The
+// N64's streaks are highlights on its gun's own navy, so the sheen is added
+// over the lists' colours as they are, never blended towards the way the
+// release's cube is: 0x3eb is mostly navy itself, and taking the share out of
+// 4J's colours drew every reflecting material darker than either game, at
+// every share from the release's own to the whole (measured on the K7,
+// 2026-09-13). The K7 Avenger's metal is the release's 40% (the rest of the gun
+// 15%), and 40% is taken as the whole: two and a half times, capped, which
+// gives its rail the N64's white streak. A matte 10% material stays at a
+// quarter.
+#define XBLAMESH_SHEEN_SHARE(amount) ((amount) * 5 / 2 > 255 ? 255 : (amount) * 5 / 2)
+
+static const void *sheenTile;
+static s32 sheenTried;
+
+const void *xblaMeshSheenTile(void)
+{
+	if (!sheenTried) {
+		s32 w = 0;
+		s32 h = 0;
+		u8 *rgba = modelpackDecodeN64Texture(XBLAMESH_SHEEN_TEXTURE, &w, &h);
+
+		sheenTried = 1;
+
+		if (rgba) {
+			sheenTile = xblaTexBindTexture(XBLAMESH_SHEEN_TEXTURE, rgba, w, h);
+		}
+
+		if (!sheenTile) {
+			sysLogPrintf(LOG_WARNING, "xblamesh: the N64 sheen's texture %04x would not bind",
+					XBLAMESH_SHEEN_TEXTURE);
+		}
+	}
+
+	return sheenTile;
+}
+
+/**
+ * The Level Metal style (Mod.XblaReflectStyle): the sheen's pass drawn the way
+ * the levels draw their own metal and windows, whose room lists turn texgen on
+ * over a round environment map. Defection's walkway metal is 0x006d, the grey
+ * one. Its rooms draw it at G_TEXTURE 0x1000 on its 64x64 picture (all 74
+ * texgen triangles of bg_ame, lit, not linear), one whole sphere across the
+ * tile; on the 32x32 stand-in that is 0x0800.
+ */
+#define XBLAMESH_METAL_TEXTURE 0x006d
+#define XBLAMESH_METAL_SCALE   0x0800
+
+static const void *metalTile;
+static s32 metalTried;
+
+/**
+ * A ROM texture's stand-in, bound on first ask by number, so a texture pack
+ * repaints it and Enable Textures serves the release's own picture of it.
+ */
+static const void *xblaMeshNumberedTile(s32 texnum, const void **tile, s32 *tried, const char *what)
+{
+	if (!*tried) {
+		s32 w = 0;
+		s32 h = 0;
+		u8 *rgba = modelpackDecodeN64Texture(texnum, &w, &h);
+
+		*tried = 1;
+
+		if (rgba) {
+			*tile = xblaTexBindTexture(texnum, rgba, w, h);
+		}
+
+		if (!*tile) {
+			sysLogPrintf(LOG_WARNING, "xblamesh: %s texture %04x would not bind", what, texnum);
+		}
+	}
+
+	return *tile;
+}
+
+static const void *xblaMeshMetalTile(void)
+{
+	return xblaMeshNumberedTile(XBLAMESH_METAL_TEXTURE, &metalTile, &metalTried, "the level metal's");
+}
+
+/**
+ * The Level Metal's picture (Defection's grey 0x006d) on its 32x32 stand-in,
+ * for a pass of it outside the release's meshes - GE Plus's GoldenEye logo
+ * (geintro.c). Draw it at XBLAMESH_METAL_SCALE for the rooms' share.
+ */
+const void *xblaMeshLevelMetalTile(void)
+{
+	return xblaMeshMetalTile();
+}
+
+/**
+ * A copy of envgdl binding tile at scale, with the lists' own clear of the
+ * texgen modes taken out so the pass's set survives each list's head.
+ */
+static Gfx *xblaMeshCopySheen(struct xblameshbuilt *m, const void *tile, u32 scale)
+{
+	Gfx *copy = malloc((size_t)m->numgfx * sizeof(Gfx));
+
+	if (!copy) {
+		return NULL;
+	}
+
+	memcpy(copy, m->envgdl, (size_t)m->numgfx * sizeof(Gfx));
+
+	for (s32 i = 0; i < m->numgfx; i++) {
+		Gfx *g = &copy[i];
+		const u8 op = (u8)(g->words.w0 >> 24);
+
+		if (op == G_SETTIMG) {
+			g->words.w1 = (uintptr_t)tile;
+		} else if (op == (u8)G_TEXTURE) {
+			g->words.w1 = (uintptr_t)(scale << 16 | scale);
+		} else if (op == (u8)G_CLEARGEOMETRYMODE) {
+			g->words.w1 &= ~(uintptr_t)(G_LIGHTING | G_TEXTURE_GEN | G_TEXTURE_GEN_LINEAR);
+		} else if (op == G_DL && g->words.w1 >= (uintptr_t)m->envgdl &&
+				g->words.w1 < (uintptr_t)(m->envgdl + m->numgfx)) {
+			g->words.w1 = (uintptr_t)copy + (g->words.w1 - (uintptr_t)m->envgdl);
+		}
+	}
+
+	return copy;
+}
+
+static void xblaMeshBuildSheen(struct xblameshbuilt *m)
+{
+	if (!m->envgdl) {
+		return;
+	}
+
+	if (xblaMeshSheenTile()) {
+		m->sheengdl = xblaMeshCopySheen(m, sheenTile, XBLAMESH_SHEEN_SCALE);
+	}
+
+	if (xblaMeshMetalTile()) {
+		m->metalgdl = xblaMeshCopySheen(m, metalTile, XBLAMESH_METAL_SCALE);
+	}
+}
+
+/**
+ * The title's logos in the levels' own reflective materials
+ * (Mod.XblaLogoMaterial, XBLAMESH_ENV_LOGO). 4J baked the N64 marble logo's
+ * two sphere maps into fixed texture coordinates: record 1117 is a blue marble
+ * sphere on the faces, 1116 a grey one on the bevels. They are drawn live
+ * instead, the way the Carrington Institute's blue statue (ROM texture 0x0042,
+ * G_TEXTURE 0xb00 on its 48x44 picture, lit, in room 5) and Defection's metal
+ * (0x006d, 0x1000 on its 64x64) are: G_LIGHTING | G_TEXTURE_GEN, with the eye
+ * ray bending the lookup so a flat face is not one tint. Scales are for the
+ * 32x32 stand-in: the same share of each picture the rooms sample.
+ *
+ * The bevels are brightened (texel times one plus xblaLogoMetalGain), and they
+ * and the Rare logo's flat orange (1160) take a glint: an added pass of the
+ * metal's picture with all but its brightest streaks taken away
+ * (xblaMeshLogoGlint()), which sweeps across them as the logo turns.
+ */
+#define XBLAMESH_LOGO_ADD_GLINT 1 // the glint
+#define XBLAMESH_LOGO_ADD_METAL 2 // the levels' grey metal, as the guns' Level Metal adds it
+
+struct xblameshlogomat {
+	s32 record;
+	s32 texnum;   // the level's picture drawn in the record's place, or -1 to keep the release's
+	u16 scales;
+	u16 scalet;
+	s32 metal;    // brightened by xblaLogoMetalGain
+	s32 add;      // what is added over it: XBLAMESH_LOGO_ADD_*
+};
+
+static const struct xblameshlogomat xblaMeshLogoMats[XBLAMESH_LOGO_MATS] = {
+	{ 0x1117, 0x0042, 0x0755, 0x0800, 0, 0 }, // the marble logo's faces: the statue's blue
+	{ 0x1116, 0x006d, 0x0800, 0x0800, 1, XBLAMESH_LOGO_ADD_GLINT }, // its bevels: the grey metal, glinting
+	{ 0x1160, -1,     0x0800, 0x0800, 0, XBLAMESH_LOGO_ADD_METAL }, // the Rare logo's orange, under Level Metal
+};
+
+// Tuned on the card at the title. Plain statics so gdb can try others before
+// the first logo draw (the glint's picture is made once).
+static s32 xblaLogoMetalGain = 0x80;
+static s32 xblaLogoGlintShare = 0xc0;
+static f32 xblaLogoGlintPower = 4.0f;
+static s32 xblaLogoAddMetalShare = 0xff;
+
+// The title's fade for the logo passes: see xblaMeshSetLogoFade().
+static s32 logoFade = 255;
+
+static const void *logoTile[XBLAMESH_LOGO_MATS];
+static s32 logoTried[XBLAMESH_LOGO_MATS];
+static const void *logoGlint;
+static s32 logoGlintTried;
+
+#define XBLAMESH_LOGO_BASE  -1
+#define XBLAMESH_LOGO_GLINT -2
+#define XBLAMESH_LOGO_METAL -3
+
+static s32 xblaMeshLogoMaterialOf(const void *addr)
+{
+	const s32 record = xblaTexRecordOf(addr);
+
+	for (s32 k = 0; k < XBLAMESH_LOGO_MATS; k++) {
+		if (record >= 0 && xblaMeshLogoMats[k].record == record) {
+			return k;
+		}
+	}
+
+	return -1;
+}
+
+/** Whether any material of the mesh is one of the logos'. */
+static s32 xblaMeshHasLogoMaterial(const struct xblameshbuilt *m)
+{
+	for (s32 i = 0; i < m->numgfx; i++) {
+		if ((u8)(m->gdl[i].words.w0 >> 24) == G_SETTIMG &&
+				xblaMeshLogoMaterialOf((const void *)m->gdl[i].words.w1) >= 0) {
+			return 1;
+		}
+	}
+
+	return 0;
+}
+
+/** A normal per vertex as an RSP light reads one, for the logo passes' lighting. */
+static void xblaMeshLogoColours(const struct xblameshbuilt *m, const f32 *normals, Col *col)
+{
+	for (s32 i = 0; i < m->numvertices; i++) {
+		f32 nx = normals[i * 3], ny = normals[i * 3 + 1], nz = normals[i * 3 + 2];
+		const f32 len = sqrtf(nx * nx + ny * ny + nz * nz);
+
+		if (len > 1e-6f) {
+			nx /= len;
+			ny /= len;
+			nz /= len;
+		}
+
+		col[i].r = (u8)(s8)xblaMeshRound(nx * 127.0f);
+		col[i].g = (u8)(s8)xblaMeshRound(ny * 127.0f);
+		col[i].b = (u8)(s8)xblaMeshRound(nz * 127.0f);
+		col[i].a = 0xff;
+	}
+}
+
+#define XBLAMESH_MAXRGB(p) ((p)[0] > (p)[1] ? ((p)[0] > (p)[2] ? (p)[0] : (p)[2]) : ((p)[1] > (p)[2] ? (p)[1] : (p)[2]))
+
+/**
+ * The glint's picture: the grey metal's own (the release's, else the ROM's),
+ * its brightness measured against its brightest half percent and raised to
+ * xblaLogoGlintPower, so the dull body is gone and the bright streaks are
+ * white. Bound as an image, so nothing repaints it.
+ */
+static const void *xblaMeshLogoGlint(void)
+{
+	if (!logoGlintTried) {
+		s32 w = 0;
+		s32 h = 0;
+		s32 rom = 0;
+		u8 *src = xblaTexLoadNumbered(XBLAMESH_METAL_TEXTURE, &w, &h);
+		u8 *rgba = NULL;
+
+		logoGlintTried = 1;
+
+		if (!src) {
+			src = modelpackDecodeN64Texture(XBLAMESH_METAL_TEXTURE, &w, &h);
+			rom = 1;
+		}
+
+		if (src && w > 0 && h > 0) {
+			rgba = malloc((size_t)w * h * 4);
+		}
+
+		if (rgba) {
+			const u32 total = (u32)w * h;
+			u32 hist[256] = { 0 };
+			u32 seen = 0;
+			s32 top;
+
+			for (u32 i = 0; i < total; i++) {
+				hist[XBLAMESH_MAXRGB(&src[i * 4])]++;
+			}
+
+			for (top = 255; top > 1; top--) {
+				seen += hist[top];
+
+				if (seen * 200 >= total) {
+					break;
+				}
+			}
+
+			for (u32 i = 0; i < total; i++) {
+				f32 l = (f32)XBLAMESH_MAXRGB(&src[i * 4]) / top;
+				u8 v;
+
+				l = l > 1.0f ? 1.0f : l;
+				v = (u8)(powf(l, xblaLogoGlintPower) * 255.0f + 0.5f);
+
+				rgba[i * 4] = rgba[i * 4 + 1] = rgba[i * 4 + 2] = v;
+				rgba[i * 4 + 3] = 0xff;
+			}
+		}
+
+		if (src) {
+			if (rom) {
+				free(src);
+			} else {
+				xblaTexFreeReplacement(src);
+			}
+		}
+
+		if (rgba) {
+			logoGlint = xblaTexBindImage("xblalogoglint", rgba, w, h);
+		}
+
+		if (!logoGlint) {
+			sysLogPrintf(LOG_WARNING, "xblamesh: the title logo's glint would not bind");
+		}
+	}
+
+	return logoGlint;
+}
+
+static s32 xblaMeshLogoKeeps(s32 which, s32 mat)
+{
+	if (which == XBLAMESH_LOGO_BASE) {
+		return mat < 0 || xblaMeshLogoMats[mat].texnum < 0;
+	}
+
+	if (which == XBLAMESH_LOGO_GLINT) {
+		return mat >= 0 && xblaMeshLogoMats[mat].add == XBLAMESH_LOGO_ADD_GLINT;
+	}
+
+	if (which == XBLAMESH_LOGO_METAL) {
+		return mat >= 0 && xblaMeshLogoMats[mat].add == XBLAMESH_LOGO_ADD_METAL;
+	}
+
+	return mat == which;
+}
+
+/**
+ * A copy of the lists keeping only the batches `which` draws (a batch is one
+ * material; its head and triangles become no-ops elsewhere): the base keeps
+ * what no logo replaces, a material index keeps that material on its level's
+ * picture, and XBLAMESH_LOGO_GLINT and _METAL keep the materials that take
+ * that addition, on the picture handed in as `added`. A
+ * material writes its G_TEXTURE a few commands before its G_SETTIMG, so the
+ * scale looks ahead. Only the base is kept with nothing in it, since the draw
+ * branches into it in place of the lists.
+ */
+static Gfx *xblaMeshLogoCopy(const struct xblameshbuilt *m, s32 which,
+		const void *const *tiles, const void *added, s32 *outBatches)
+{
+	Gfx *copy = malloc((size_t)m->numgfx * sizeof(Gfx));
+	s32 mat = -1;
+
+	*outBatches = 0;
+
+	if (!copy) {
+		return NULL;
+	}
+
+	memcpy(copy, m->gdl, (size_t)m->numgfx * sizeof(Gfx));
+
+	for (s32 i = 0; i < m->numgfx; i++) {
+		const Gfx *g = &m->gdl[i];
+		const u8 op = (u8)(g->words.w0 >> 24);
+
+		if (op == G_SETTIMG) {
+			mat = xblaMeshLogoMaterialOf((const void *)g->words.w1);
+
+			if (which != XBLAMESH_LOGO_BASE && xblaMeshLogoKeeps(which, mat)) {
+				copy[i].words.w1 = (uintptr_t)(which < 0 ? added : tiles[mat]);
+			}
+		} else if (op == (u8)G_TEXTURE && which != XBLAMESH_LOGO_BASE) {
+			for (s32 j = i + 1; j < m->numgfx && j < i + 16; j++) {
+				if ((u8)(m->gdl[j].words.w0 >> 24) == G_SETTIMG) {
+					const s32 ahead = xblaMeshLogoMaterialOf((const void *)m->gdl[j].words.w1);
+
+					if (xblaMeshLogoKeeps(which, ahead) && ahead >= 0) {
+						copy[i].words.w1 = (uintptr_t)((u32)xblaMeshLogoMats[ahead].scales << 16 |
+								xblaMeshLogoMats[ahead].scalet);
+					}
+
+					break;
+				}
+			}
+		} else if (op == (u8)G_CLEARGEOMETRYMODE && which != XBLAMESH_LOGO_BASE) {
+			copy[i].words.w1 &= ~(uintptr_t)(G_LIGHTING | G_TEXTURE_GEN | G_TEXTURE_GEN_LINEAR);
+		} else if (op == G_DL && g->words.w1 >= (uintptr_t)m->gdl &&
+				g->words.w1 < (uintptr_t)(m->gdl + m->numgfx)) {
+			copy[i].words.w1 = (uintptr_t)copy + (g->words.w1 - (uintptr_t)m->gdl);
+		} else if (op == (u8)G_ENDDL) {
+			mat = -1;
+		}
+
+		if (op == G_COL || op == G_VTX || op == (u8)G_TRI1 || op == (u8)G_TRI4) {
+			if (!xblaMeshLogoKeeps(which, mat)) {
+				copy[i].words.w0 = (uintptr_t)G_NOOP << 24;
+				copy[i].words.w1 = 0;
+			} else if (op == G_COL) {
+				(*outBatches)++;
+			}
+		}
+	}
+
+	if (*outBatches == 0 && which != XBLAMESH_LOGO_BASE) {
+		free(copy);
+		return NULL;
+	}
+
+	return copy;
+}
+
+// The N64 look's tinted pane past opadist, as it reaches the screen: GoldenEye's
+// own glass picture, opaque, measured at Facility's report camera (20,18,17),
+// on Archives' upper panes (19..28 grey) and on Caverns' (22,21,21)
+#define XBLAMESH_TINT_R 22
+#define XBLAMESH_TINT_G 21
+#define XBLAMESH_TINT_B 20
+
+// The tinted pane xblaMeshRenderNode() has just drawn whose own GoldenEye pane
+// the game draws after it (xblaMeshKeptLists()), NULL for none
+static const struct modelnode *tintStockNode;
+
+/**
+ * A GoldenEye tinted pane's far colour, as a copy of gdl: the tinted panes
+ * (gebeanmats.tinted) under a combiner that is the primitive colour and alpha
+ * and nothing else, every other material's geometry left out.
+ *
+ * GoldenEye's pane goes opaque in its own glass picture past opadist, a flat
+ * dark grey on screen; Bean's pane is a light blue that went opaque as it is.
+ * Drawn over the pane in XBLAMESH_TINT_* at the pane's own opacity (mode 9's
+ * primitive alpha) it is nothing up close and the N64's grey past opadist,
+ * and Glass See-Through's cap on the opacity holds it back the same way.
+ * NULL for a mesh with no tinted pane.
+ */
+static Gfx *xblaMeshTintCopy(const struct xblameshbuilt *m, const void *const *panes, s32 num, s32 *only)
+{
+	Gfx *copy;
+	Gfx combine;
+	Gfx *cc = &combine;
+	s32 keep = 0;
+	s32 any = 0;
+	s32 other = 0;
+
+	*only = 0;
+
+	if (num == 0) {
+		return NULL;
+	}
+
+	copy = malloc((size_t)m->numgfx * sizeof(Gfx));
+
+	if (!copy) {
+		return NULL;
+	}
+
+	gDPSetCombineLERP(cc++, 0, 0, 0, PRIMITIVE, 0, 0, 0, PRIMITIVE,
+			0, 0, 0, PRIMITIVE, 0, 0, 0, PRIMITIVE);
+	memcpy(copy, m->gdl, (size_t)m->numgfx * sizeof(Gfx));
+
+	for (s32 i = 0; i < m->numgfx; i++) {
+		const Gfx *g = &m->gdl[i];
+		const u8 op = (u8)(g->words.w0 >> 24);
+
+		if (op == G_SETTIMG) {
+			keep = 0;
+
+			for (s32 k = 0; k < num; k++) {
+				if ((const void *)g->words.w1 == panes[k]) {
+					keep = 1;
+					break;
+				}
+			}
+		} else if (op == G_SETCOMBINE) {
+			copy[i] = combine;
+		} else if (op == G_DL && g->words.w1 >= (uintptr_t)m->gdl &&
+				g->words.w1 < (uintptr_t)(m->gdl + m->numgfx)) {
+			copy[i].words.w1 = (uintptr_t)copy + (g->words.w1 - (uintptr_t)m->gdl);
+		} else if (op == (u8)G_ENDDL) {
+			keep = 0;
+		}
+
+		if (op == G_COL || op == G_VTX || op == (u8)G_TRI1 || op == (u8)G_TRI4) {
+			if (!keep) {
+				copy[i].words.w0 = (uintptr_t)G_NOOP << 24;
+				copy[i].words.w1 = 0;
+				other |= op == (u8)G_TRI1 || op == (u8)G_TRI4;
+			} else {
+				any = 1;
+			}
+		}
+	}
+
+	if (!any) {
+		free(copy);
+		return NULL;
+	}
+
+	*only = !other;
+
+	return copy;
+}
+
+/**
+ * The logo copies, made on the first draw that asks. A mesh with none of the
+ * logos' materials keeps none of them.
+ */
+static void xblaMeshBuildLogo(struct xblameshbuilt *m)
+{
+	const void *tiles[XBLAMESH_LOGO_MATS] = { NULL };
+	const void *glint;
+	s32 numbase = 0;
+	s32 numlive = 0;
+	s32 numglint = 0;
+	s32 n;
+
+	m->logotried = 1;
+
+	if (!m->normals || !xblaMeshHasLogoMaterial(m)) {
+		return;
+	}
+
+	for (s32 k = 0; k < XBLAMESH_LOGO_MATS; k++) {
+		if (xblaMeshLogoMats[k].texnum >= 0) {
+			tiles[k] = xblaMeshNumberedTile(xblaMeshLogoMats[k].texnum, &logoTile[k], &logoTried[k],
+					"the title logo's");
+
+			if (!tiles[k]) {
+				return;
+			}
+		}
+	}
+
+	glint = xblaMeshLogoGlint();
+	m->logocol = malloc((size_t)m->numvertices * sizeof(Col));
+
+	if (!m->logocol) {
+		return;
+	}
+
+	xblaMeshLogoColours(m, m->normals, m->logocol);
+
+	for (s32 k = 0; k < XBLAMESH_LOGO_MATS; k++) {
+		if (tiles[k]) {
+			m->logogdl[k] = xblaMeshLogoCopy(m, k, tiles, glint, &n);
+			numlive += n;
+		}
+	}
+
+	if (glint) {
+		m->logoglint = xblaMeshLogoCopy(m, XBLAMESH_LOGO_GLINT, tiles, glint, &numglint);
+	}
+
+	if (xblaMeshMetalTile()) {
+		m->logometal = xblaMeshLogoCopy(m, XBLAMESH_LOGO_METAL, tiles, metalTile, &n);
+		numglint += n;
+	}
+
+	if (numlive + numglint > 0) {
+		m->logobase = xblaMeshLogoCopy(m, XBLAMESH_LOGO_BASE, tiles, glint, &numbase);
+	}
+
+	if (!m->logobase) {
+		for (s32 k = 0; k < XBLAMESH_LOGO_MATS; k++) {
+			free(m->logogdl[k]);
+			m->logogdl[k] = NULL;
+		}
+
+		free(m->logoglint);
+		free(m->logometal);
+		free(m->logocol);
+		m->logoglint = NULL;
+		m->logometal = NULL;
+		m->logocol = NULL;
+		return;
+	}
+
+	sysLogPrintf(LOG_NOTE, "xblamesh: a title logo draws %d batches in the levels' blue and metal, "
+			"%d with a glint or the metal added, %d as they were", numlive, numglint, numbase);
+}
+
+static void xblaMeshBuildEnvironment(struct xblameshbuilt *m, const struct xblameshmats *mats, const char *what)
+{
+	// A GoldenEye prop reflects maps of its own (gebeanmats.env): a vertex's
+	// first byte is its material, whose map is the cell
+	const s32 own = mats && mats->envkey && mats->envkey[0];
+
+	s32 cellof[256];
+	s32 cubes[XBLAMESH_ENV_MAXCELLS];
+	s32 numcells = 0;
+	s32 w, h;
+	u8 *atlas;
+	const void *tile;
+	char key[64];
+	s32 keylen;
+
+	for (s32 i = 0; i < 256; i++) {
+		cellof[i] = -1;
+	}
+
+	// The cubes the mesh reflects, a cell each in the order they turn up.
+	for (s32 i = 0; i < m->numvertices; i++) {
+		const u8 index = m->venv[i * 2];
+
+		if (m->venv[i * 2 + 1] == 0 || cellof[index] >= 0) {
+			continue;
+		}
+
+		if (numcells == XBLAMESH_ENV_MAXCELLS) {
+			continue;
+		}
+
+		cubes[numcells] = index;
+		cellof[index] = numcells++;
+	}
+
+	if (numcells == 0) {
+		free(m->venv);
+		m->venv = NULL;
+		free(m->vink);
+		m->vink = NULL;
+		free(m->vmatte);
+		m->vmatte = NULL;
+		m->mattemask = 0;
+
+		// A title logo that reflects nothing of the release's still needs its
+		// normals for the glint (xblaMeshBuildLogo()).
+		if (!xblaMeshHasLogoMaterial(m)) {
+			free(m->normals);
+			m->normals = NULL;
+		}
+
+		return;
+	}
+
+	w = numcells * XBLAMESH_ENV_CELL;
+	h = XBLAMESH_ENV_CELL;
+	keylen = snprintf(key, sizeof(key), "%s", own ? mats->envkey : "xblaenv");
+
+	for (s32 k = 0; k < numcells && keylen < (s32)sizeof(key) - 4; k++) {
+		keylen += snprintf(key + keylen, sizeof(key) - keylen, ":%x", cubes[k]);
+	}
+
+	m->envgdl = malloc((size_t)m->numgfx * sizeof(Gfx));
+
+	if (!m->envgdl) {
+		return;
+	}
+
+	// Most of the 231 meshes reflect the same grey studio alone, so an atlas is
+	// made once per set of cubes: the tile for a key already bound is kept here,
+	// rather than decoding the cubes again only for xblaTexBindImage() to free
+	// the result.
+	tile = NULL;
+
+	for (s32 i = 0; i < envAtlasCount; i++) {
+		if (!strcmp(envAtlasKey[i], key)) {
+			tile = envAtlasTile[i];
+			break;
+		}
+	}
+
+	atlas = tile ? NULL : calloc((size_t)w * h, 4);
+
+	if (!tile && !atlas) {
+		free(m->envgdl);
+		m->envgdl = NULL;
+		return;
+	}
+
+	// Each cell a sphere map: the texel at (su, sv) is what a mirror sphere
+	// seen from far down +z shows there, its normal being (a, b, sqrt(1 - a^2 -
+	// b^2)) for a = 2su - 1 and b = 2sv - 1, so the ray it reflects is
+	// (2nz a, 2nz b, 2nz^2 - 1). Texels past the rim take the rim's colour, for
+	// the filter to fall on. A row is sv, a column su.
+	for (s32 k = 0; k < numcells && atlas; k++) {
+		s32 size = 0;
+		u8 *faces;
+
+		// A map of the material's own is a cell already
+		if (own) {
+			const u8 *cell = cubes[k] < XBLAMESH_MAXMATS ? mats->env[cubes[k]] : NULL;
+
+			for (s32 y = 0; cell && y < h; y++) {
+				memcpy(&atlas[((size_t)y * w + k * XBLAMESH_ENV_CELL) * 4],
+						&cell[(size_t)y * XBLAMESH_ENV_CELL * 4], XBLAMESH_ENV_CELL * 4);
+			}
+
+			continue;
+		}
+
+		faces = xblaTexDecodeCube(XBLAMESH_ENV_FIRSTRECORD + cubes[k], &size);
+
+		for (s32 y = 0; y < h; y++) {
+			for (s32 x = 0; x < XBLAMESH_ENV_CELL; x++) {
+				u8 *px = &atlas[((size_t)y * w + k * XBLAMESH_ENV_CELL + x) * 4];
+				f32 a = ((x + 0.5f) / XBLAMESH_ENV_CELL) * 2.0f - 1.0f;
+				f32 bb = ((y + 0.5f) / h) * 2.0f - 1.0f;
+				f32 d = a * a + bb * bb;
+				f32 nz, rgb[3];
+
+				if (d > 0.999f) {
+					const f32 s = sqrtf(0.999f / d);
+
+					a *= s;
+					bb *= s;
+					d = 0.999f;
+				}
+
+				nz = sqrtf(1.0f - d);
+
+				if (faces) {
+					xblaMeshCubeSample(faces, size, 2.0f * nz * a, 2.0f * nz * bb, 2.0f * nz * nz - 1.0f, rgb);
+				} else {
+					rgb[0] = rgb[1] = rgb[2] = 0.0f;
+				}
+
+				px[0] = (u8)(rgb[0] + 0.5f);
+				px[1] = (u8)(rgb[1] + 0.5f);
+				px[2] = (u8)(rgb[2] + 0.5f);
+				px[3] = 0xff;
+			}
+		}
+
+		free(faces);
+	}
+
+	if (atlas) {
+		tile = xblaTexBindImage(key, atlas, w, h);
+
+		if (tile && envAtlasCount < XBLAMESH_ENV_MAXATLASES) {
+			snprintf(envAtlasKey[envAtlasCount], sizeof(envAtlasKey[0]), "%s", key);
+			envAtlasTile[envAtlasCount++] = tile;
+		}
+	}
+
+	if (!tile) {
+		free(m->envgdl);
+		m->envgdl = NULL;
+		return;
+	}
+
+	// The copy: every texture the lists bind becomes the atlas, and a list that
+	// calls another of the mesh's calls the copy's.
+	memcpy(m->envgdl, m->gdl, (size_t)m->numgfx * sizeof(Gfx));
+
+	for (s32 i = 0; i < m->numgfx; i++) {
+		Gfx *g = &m->envgdl[i];
+		const u8 op = (u8)(g->words.w0 >> 24);
+
+		if (op == G_SETTIMG) {
+			g->words.w1 = (uintptr_t)tile;
+		} else if (op == G_DL && g->words.w1 >= (uintptr_t)m->gdl &&
+				g->words.w1 < (uintptr_t)(m->gdl + m->numgfx)) {
+			g->words.w1 = (uintptr_t)m->envgdl + (g->words.w1 - (uintptr_t)m->gdl);
+		}
+	}
+
+	// From here a vertex's first byte is its cell.
+	for (s32 i = 0; i < m->numvertices; i++) {
+		const s32 cell = cellof[m->venv[i * 2]];
+
+		m->venv[i * 2] = (u8)(cell < 0 ? 0 : cell);
+
+		if (cell < 0) {
+			m->venv[i * 2 + 1] = 0;
+		}
+	}
+
+	m->numenvcells = numcells;
+	m->envown = own;
+
+	// The vertices that reflect, so that the per-frame work visits only them,
+	// and how far the mesh reaches from its origin, so that the distance
+	// cutoff measures to its nearest side rather than to its middle.
+	m->envidx = malloc((size_t)m->numvertices * sizeof(u32));
+
+	if (!m->envidx) {
+		free(m->envgdl);
+		m->envgdl = NULL;
+		return;
+	}
+
+	for (s32 i = 0; i < m->numvertices; i++) {
+		const Vtx *v = &m->vertices[i];
+		const f32 r = sqrtf((f32)v->x * v->x + (f32)v->y * v->y + (f32)v->z * v->z);
+
+		if (r > m->envradius) {
+			m->envradius = r;
+		}
+
+		if (m->venv[i * 2 + 1]) {
+			m->envidx[m->numenvidx++] = (u32)i;
+		}
+	}
+
+	// The colours a reflecting draw lists from, for a model with no bruise
+	// within the cutoff's full share - which is most of them, most frames -
+	// made once here rather than copied and scaled per model per frame. NULL
+	// leaves every draw to the per-frame copy. A GoldenEye prop's own
+	// reflection is added over its colours as they are - its shader screens
+	// the reflection over the picture rather than blending towards it (the
+	// gas tank's, gebean.c) - so it has none.
+	m->dimcol = own ? NULL : malloc((size_t)m->numvertices * sizeof(Col));
+
+	if (m->dimcol) {
+		memcpy(m->dimcol, m->colours, (size_t)m->numvertices * sizeof(Col));
+
+		for (s32 k = 0; k < m->numenvidx; k++) {
+			const u32 i = m->envidx[k];
+			const u32 left = 255 - m->venv[i * 2 + 1];
+
+			m->dimcol[i].r = (u8)((m->colours[i].r * left + 127) / 255);
+			m->dimcol[i].g = (u8)((m->colours[i].g * left + 127) / 255);
+			m->dimcol[i].b = (u8)((m->colours[i].b * left + 127) / 255);
+		}
+	}
+
+	// A batch whose vertices all reflect nothing adds nothing, so the copy does
+	// not draw it: its head (G_COL, G_VTX) and its triangles become no-ops. The
+	// pass is a second trip through the renderer for everything left in the
+	// copy, and most of a mesh is such batches - a gun's wooden stock beside
+	// its metal, the glass beside a console's frame. A batch opens with its
+	// G_COL (xblaMeshWriteBatches()), named through the colour segment with
+	// SEGADDR's marker bit in the offset.
+	{
+		s32 skipping = 0;
+		s32 kept = 0;
+		s32 batches = 0;
+
+		for (s32 i = 0; i < m->numgfx; i++) {
+			Gfx *g = &m->envgdl[i];
+			const u8 op = (u8)(g->words.w0 >> 24);
+
+			if (op == G_COL) {
+				const u32 first = (u32)(((u32)g->words.w1 & 0xfffffe) / sizeof(Col));
+				const u32 count = (u32)((g->words.w0 & 0xffffff) / 4);
+				s32 any = 0;
+
+				for (u32 j = first; j < first + count && j < (u32)m->numvertices; j++) {
+					if (m->venv[j * 2 + 1]) {
+						any = 1;
+						break;
+					}
+				}
+
+				skipping = !any;
+				batches++;
+				kept += any;
+			} else if (op == G_DL || op == (u8)G_ENDDL) {
+				skipping = 0;
+			}
+
+			if (skipping && (op == G_COL || op == G_VTX || op == (u8)G_TRI1 || op == (u8)G_TRI4)) {
+				g->words.w0 = (uintptr_t)G_NOOP << 24;
+				g->words.w1 = 0;
+			}
+		}
+
+		sysLogPrintf(LOG_NOTE, "xblamesh: %s reflects %d environment map%s%s, in %d of its %d batches",
+				what, numcells, numcells == 1 ? "" : "s", own ? " of its own" : "", kept, batches);
+	}
+
+	// The style (Mod.XblaReflectStyle) picks among stand-ins for 4J's cubes;
+	// a map of the prop's own is the release's picture, and stays
+	if (!own) {
+		xblaMeshBuildSheen(m);
+	}
+}
+
+/**
+ * A gun in a character's hands that reflects nothing of its own takes its
+ * reflection from the same gun in the player's.
+ *
+ * 4J marked the reflecting materials of the first-person guns (G*Z) and left
+ * many of the third-person ones (Pchr*Z, the model a character holds and the
+ * one lying on the floor) with none at all: PchrdevastatorZ, Pchrcmp150Z,
+ * PchrcycloneZ, PchrshotgunZ, Pchrrcp120Z, PchravengerZ and at least eight
+ * more have no byte 16 in any draw, while their first-person models do. So a
+ * gun that shone in the player's hands went matte the moment the camera went
+ * behind them (a tester's F3 traces, 2026-09-14). The two models' atlases are
+ * different pictures, so there is no material to pair one with the other by,
+ * and the whole mesh takes the first-person gun's lowest amount and its cube -
+ * the matte metal of it, which keeps a grip that cannot be told apart from the
+ * barrel from out-shining it. A third-person model with reflections of its
+ * own keeps them.
+ *
+ * The pairing is the game's own: the weapon whose third-person model
+ * (playermgrGetModelOfWeapon()) is this file, and that weapon's hi_model. The
+ * first-person file names its meshes the way every model does
+ * (xblaMeshFileMeshSlots()), and the amount is read off those meshes' draws.
+ * Set by xblaMeshBuild() round the build, never for a model pack's file, whose
+ * materials are pictures of its own and reflect nothing on purpose.
+ */
+static s32 xblaMeshBuildBorrowFile = 0;
+
+/**
+ * Whether fileid is one of the classic guns' models, first or third person,
+ * whose sheen (K7 or Level Metal) is weighted by the paint under each vertex.
+ *
+ * 4J gave each of these one reflecting material over the whole gun - the
+ * PP9i's black body and grips at 30%, the CC13 at 50% - where a Perfect Dark
+ * gun reflects only its bare metal (the Falcon 2's dark parts are 0%). The
+ * sheen is added over the paint at 2.5x that amount, so the black PP9i drew
+ * as chrome. A cube blended at the release's own amount keeps black black,
+ * so the Xbox 360 style is left alone.
+ */
+static s32 xblaMeshInkFile(s32 fileid)
+{
+	if (!fileid) {
+		return 0;
+	}
+
+	for (s32 weaponnum = WEAPON_PP9I; weaponnum <= WEAPON_RCP45; weaponnum++) {
+		const s32 modelnum = playermgrGetModelOfWeapon(weaponnum);
+		const struct weapon *weapon = weaponFindById(weaponnum);
+
+		if (weapon && (weapon->hi_model == fileid || weapon->lo_model == fileid)) {
+			return 1;
+		}
+
+		if (modelnum >= 0 && modelnum < NUM_MODELS && g_ModelStates[modelnum].fileid == fileid) {
+			return 1;
+		}
+	}
+
+	return 0;
+}
+
+static void xblaMeshFileMeshSlots(const u8 *file, u32 len, u16 fileid, u16 *table);
+
+/** The lowest reflection percentage any draw of the mesh in slot has, 0 for none. */
+static s32 xblaMeshLowestEnvironment(s32 slot, u32 *outmaterial)
+{
+	struct xblameshhdr h;
+	u32 stride;
+	u32 len;
+	u8 *file = xblaMeshReadSlot(slot, &len);
+	s32 lowest = 0;
+
+	if (!file) {
+		return 0;
+	}
+
+	if (xblaMeshReadHeader(&h, file, len, &stride)) {
+		for (u32 d = 0; d < h.numdraws; d++) {
+			const u32 material = xblaMeshBE32(file + h.drawoffset + d * XBLAMESH_ENTRY + 8);
+			const s32 percent = (material >> 16) & 0xff;
+
+			if (!(material & XBLAMESH_MAT_TABLE) && percent && (!lowest || percent < lowest)) {
+				lowest = percent;
+				*outmaterial = material;
+			}
+		}
+	}
+
+	free(file);
+
+	return lowest;
+}
+
+static void xblaMeshBorrowEnvironment(struct xblameshbuilt *m, s32 fileid, const char *what)
+{
+	u32 material = 0;
+	s32 percent = 0;
+	s32 gunfile = 0;
+	s32 amount;
+
+	for (s32 i = 0; i < m->numvertices; i++) {
+		if (m->venv[i * 2 + 1]) {
+			return;
+		}
+	}
+
+	// The weapons only - the guns, the knife, the grenades and mines, and the
+	// classic guns. Past them the items borrow a hand model: the briefcase's
+	// hi_model is Gfalcon2lodZ, which lit the whole case at the Falcon's 60%.
+	for (s32 weaponnum = WEAPON_FALCON2; weaponnum <= WEAPON_PSYCHOSISGUN && !gunfile; weaponnum++) {
+		const s32 modelnum = playermgrGetModelOfWeapon(weaponnum);
+		struct weapon *weapon;
+
+		if (weaponnum == WEAPON_COMBATBOOST) {
+			continue;
+		}
+
+		if (modelnum < 0 || modelnum >= NUM_MODELS || g_ModelStates[modelnum].fileid != fileid) {
+			continue;
+		}
+
+		weapon = weaponFindById(weaponnum);
+
+		if (weapon && weapon->hi_model && weapon->hi_model != fileid) {
+			gunfile = weapon->hi_model;
+		}
+	}
+
+	if (!gunfile) {
+		return;
+	}
+
+	{
+		u32 len = 0;
+		// Slot i is the game's file id i + 1: the release's copy of it.
+		u8 *file = xblaMeshReadSlot(gunfile - 1, &len);
+		u16 *table = file && len >= 4 ? calloc(numRecords, sizeof(u16)) : NULL;
+
+		if (table) {
+			xblaMeshFileMeshSlots(file, len, (u16)gunfile, table);
+
+			for (s32 slot = 0; slot < numRecords; slot++) {
+				u32 mat = 0;
+				s32 p;
+
+				if (table[slot] != gunfile) {
+					continue;
+				}
+
+				p = xblaMeshLowestEnvironment(slot, &mat);
+
+				if (p && (!percent || p < percent)) {
+					percent = p;
+					material = mat;
+				}
+			}
+		}
+
+		free(table);
+		free(file);
+	}
+
+	if (!percent) {
+		return;
+	}
+
+	amount = percent >= 100 ? 255 : percent * 255 / 100;
+
+	for (s32 i = 0; i < m->numvertices; i++) {
+		m->venv[i * 2] = (u8)((material >> 24) & 0xff);
+		m->venv[i * 2 + 1] = (u8)amount;
+	}
+
+	sysLogPrintf(LOG_NOTE, "xblamesh: %s reflects nothing of its own; it takes %d%% from "
+			"its first-person model, file %d", what, percent, gunfile);
+}
+
+/**
+ * What handtint.c needs of a skinned mesh, read off the file while it is still
+ * here: which textures its materials bind and how many triangles of each hang
+ * off each bone - a hand's sleeve is the texture on its forearm - and, for a
+ * character, the colour each bone is painted, the texel under each
+ * triangle's middle times its vertices' colour, weighted by the triangle's
+ * size. The bone of a triangle is the one most of its weight is on.
+ */
+static void xblaMeshAnalyse(struct xblameshbuilt *m, const struct xblameshbuilder *b, const u8 *file, u32 len,
+		const struct xblameshhdr *h, u32 stride, s32 mode)
+{
+	const u32 numtris = h->indexoffset < len ? (len - h->indexoffset) / 6 : 0;
+	u8 *rgba[XBLAMESH_ANATEX];
+	s32 tw[XBLAMESH_ANATEX];
+	s32 th[XBLAMESH_ANATEX];
+
+	free(m->anatexbone);
+	free(m->anabonecol);
+	m->anatexbone = NULL;
+	m->anabonecol = NULL;
+	m->numanatex = 0;
+
+	if (!b->skinned || stride < 48 || h->vertexoffset + (u64)h->numvertices * stride > len) {
+		return;
+	}
+
+	m->anatexbone = calloc(XBLAMESH_ANATEX * XBLAMESH_MAXMTX, sizeof(u16));
+	m->anabonecol = mode >= 2 ? calloc(XBLAMESH_MAXMTX * 4, sizeof(f32)) : NULL;
+
+	if (!m->anatexbone) {
+		free(m->anabonecol);
+		m->anabonecol = NULL;
+		return;
+	}
+
+	memset(rgba, 0, sizeof(rgba));
+
+	for (u32 d = 0; d < h->numdraws; d++) {
+		const u8 *draw = file + h->drawoffset + d * XBLAMESH_ENTRY;
+		const u32 firsttri = xblaMeshBE32(draw);
+		const u32 drawtris = xblaMeshBE32(draw + 4);
+		const u32 material = xblaMeshBE32(draw + 8);
+		const void *tile = (material & XBLAMESH_MAT_TABLE)
+				? ((b->mats && (s32)(material & 0xfff) < b->mats->num) ? b->mats->tile[material & 0xfff] : NULL)
+				: xblaMeshBuildKeepArt ? xblaTexBindKept(material & 0x1fff) : xblaTexBind(material & 0x1fff);
+		s32 ti;
+
+		if (firsttri > numtris || drawtris > numtris - firsttri || !tile) {
+			continue;
+		}
+
+		for (ti = 0; ti < m->numanatex && m->anatex[ti] != tile; ti++);
+
+		if (ti == m->numanatex) {
+			if (ti == XBLAMESH_ANATEX) {
+				continue;
+			}
+
+			m->anatex[ti] = tile;
+			m->numanatex++;
+
+			if (m->anabonecol) {
+				rgba[ti] = xblaTexLoadReplacement(tile, &tw[ti], &th[ti]);
+			}
+		}
+
+		for (u32 t = 0; t < drawtris; t++) {
+			const u8 *idx = file + h->indexoffset + (firsttri + t) * 6;
+			f32 vote[3];
+			u8 bone[3];
+			f32 p[3][3];
+			f32 uv[2] = { 0.0f, 0.0f };
+			f32 col[3] = { 0.0f, 0.0f, 0.0f };
+			s32 best = -1;
+			f32 bestw = 0.0f;
+			s32 k;
+
+			for (k = 0; k < 3; k++) {
+				const u32 vi = xblaMeshBE16(idx + k * 2);
+				const u8 *v;
+				u32 packed;
+				f32 w[3];
+
+				if (vi >= h->numvertices) {
+					break;
+				}
+
+				v = file + h->vertexoffset + vi * stride;
+				packed = xblaMeshBE32(v + 44);
+				xblaMeshSkinWeights(v, w);
+
+				// the vertex's own heaviest bone
+				bone[k] = (u8)(packed >> 24);
+				vote[k] = w[0];
+
+				if (w[1] > vote[k]) {
+					bone[k] = (u8)(packed >> 16);
+					vote[k] = w[1];
+				}
+
+				if (w[2] > vote[k]) {
+					bone[k] = (u8)(packed >> 8);
+					vote[k] = w[2];
+				}
+
+				p[k][0] = xblaMeshBEF32(v);
+				p[k][1] = xblaMeshBEF32(v + 4);
+				p[k][2] = xblaMeshBEF32(v + 8);
+				uv[0] += xblaMeshBEF32(v + 12) / 3.0f;
+				uv[1] += xblaMeshBEF32(v + 16) / 3.0f;
+
+				{
+					const u32 c = xblaMeshBE32(v + 32);
+
+					col[0] += (f32)((c >> 16) & 0xff) / (3.0f * 255.0f);
+					col[1] += (f32)((c >> 8) & 0xff) / (3.0f * 255.0f);
+					col[2] += (f32)(c & 0xff) / (3.0f * 255.0f);
+				}
+			}
+
+			if (k < 3) {
+				continue;
+			}
+
+			// the bone two or three of its corners share, else the first's
+			best = bone[0];
+			bestw = vote[0];
+
+			if (bone[1] == bone[2] && bone[1] != bone[0]) {
+				best = bone[1];
+			}
+
+			(void)bestw;
+
+			if (best < 0 || best >= XBLAMESH_MAXMTX) {
+				continue;
+			}
+
+			if (m->anatexbone[ti * XBLAMESH_MAXMTX + best] < 0xffff) {
+				m->anatexbone[ti * XBLAMESH_MAXMTX + best]++;
+			}
+
+			if (m->anabonecol && rgba[ti] && tw[ti] > 0 && th[ti] > 0) {
+				f32 e1[3], e2[3], cr[3];
+				f32 area;
+				f32 fu = uv[0] - floorf(uv[0]);
+				f32 fv = (1.0f - uv[1]) - floorf(1.0f - uv[1]);
+				s32 x = (s32)(fu * tw[ti]);
+				s32 y = (s32)(fv * th[ti]);
+				const u8 *px;
+
+				if (x >= tw[ti]) {
+					x = tw[ti] - 1;
+				}
+
+				if (y >= th[ti]) {
+					y = th[ti] - 1;
+				}
+
+				px = rgba[ti] + ((size_t)y * tw[ti] + x) * 4;
+
+				if (px[3] < 128) {
+					continue;
+				}
+
+				for (s32 j = 0; j < 3; j++) {
+					e1[j] = p[1][j] - p[0][j];
+					e2[j] = p[2][j] - p[0][j];
+				}
+
+				cr[0] = e1[1] * e2[2] - e1[2] * e2[1];
+				cr[1] = e1[2] * e2[0] - e1[0] * e2[2];
+				cr[2] = e1[0] * e2[1] - e1[1] * e2[0];
+				area = sqrtf(cr[0] * cr[0] + cr[1] * cr[1] + cr[2] * cr[2]);
+
+				m->anabonecol[best * 4 + 0] += area * px[0] * col[0];
+				m->anabonecol[best * 4 + 1] += area * px[1] * col[1];
+				m->anabonecol[best * 4 + 2] += area * px[2] * col[2];
+				m->anabonecol[best * 4 + 3] += area;
+			}
+		}
+	}
+
+	for (s32 i = 0; i < XBLAMESH_ANATEX; i++) {
+		xblaTexFreeReplacement(rgba[i]);
+	}
+}
+
+/**
+ * For handtint.c: a mesh's textures and how many of each one's triangles hang
+ * off each bone (rows of XBLAMESH_MAXMTX), and the colour it paints a bone.
+ */
+s32 xblaMeshAnalysedTextures(const struct xblameshbuilt *m, const void ***outtex, const u16 **outbones)
+{
+	if (!m || !m->anatexbone) {
+		return 0;
+	}
+
+	*outtex = (const void **)m->anatex;
+	*outbones = m->anatexbone;
+
+	return m->numanatex;
+}
+
+s32 xblaMeshAnalysedBoneColour(const struct xblameshbuilt *m, s32 bone, f32 *rgb, f32 *weight)
+{
+	if (!m || !m->anabonecol || bone < 0 || bone >= XBLAMESH_MAXMTX || m->anabonecol[bone * 4 + 3] <= 0.0f) {
+		return 0;
+	}
+
+	for (s32 j = 0; j < 3; j++) {
+		rgb[j] = m->anabonecol[bone * 4 + j] / m->anabonecol[bone * 4 + 3];
+	}
+
+	*weight = m->anabonecol[bone * 4 + 3];
+
+	return 1;
+}
+
+static s32 xblaMeshBuildFile(struct xblameshbuilt *m, u8 *file, u32 len,
+		const struct xblameshmats *mats, const char *what)
+{
+	struct xblameshbuilder b;
+	struct xblameshhdr h;
+	u32 stride;
+
+	if (!xblaMeshReadHeader(&h, file, len, &stride)) {
+		free(file);
+		return 0;
+	}
+
+	memset(&b, 0, sizeof(b));
+	b.skinned = stride == XBLAMESH_STRIDE_SKIN && h.nummatrices > 0;
+	b.scale = xblaMeshScale(&h);
+	b.mats = mats;
+	b.cullback = xblaMeshBuildCullBack;
+	b.meshcull = xblaMeshBuildCullBack;
+	b.twosided = xblaMeshBuildTwoSided;
+	b.keepnormals = 1;
+	b.ink = xblaMeshInkFile(xblaMeshBuildBorrowFile);
+	b.inkrecord = -1;
+	m->scale = b.scale;
+
+	if (!xblaMeshBuildLists(&b, file, len, &h, stride) || b.numtris == 0) {
+		free(b.gdl);
+		free(b.vertices);
+		free(b.colours);
+		free(b.grad);
+		free(b.gradscore);
+		free(b.batches);
+		free(b.turn);
+		free(b.normals);
+		free(b.venv);
+		free(b.vmatte);
+		free(b.vink);
+		free(b.inkrgba);
+		free(file);
+		sysLogPrintf(LOG_ERROR, "xblamesh: %s did not build", what);
+		return 0;
+	}
+
+	if (xblaMeshBuildAnalyse) {
+		xblaMeshAnalyse(m, &b, file, len, &h, stride, xblaMeshBuildAnalyse);
+	}
+
+	free(b.batches);
+	free(b.gradscore);
+	free(b.inkrgba);
+	free(b.turn);
+
+	if (b.numturned > 0) {
+		sysLogPrintf(LOG_NOTE, "xblamesh: %s: %d triangles drawn turned round or from both sides",
+				what, b.numturned);
+	}
+
+	if (b.skinned && !xblaMeshReadBind(m, file, &h, b.scale)) {
+		free(b.gdl);
+		free(b.vertices);
+		free(b.colours);
+		free(b.grad);
+		free(b.bindpos);
+		free(b.weights);
+		free(b.bones);
+		free(b.normals);
+		free(b.venv);
+		free(b.vmatte);
+		free(b.vink);
+		free(file);
+		return 0;
+	}
+
+	free(file);
+
+	m->gdl = b.gdl;
+	m->vertices = b.vertices;
+	m->colours = b.colours;
+	m->grad = b.grad;
+	m->numvertices = b.numvtx;
+	m->numtris = b.numtris;
+	m->bindpos = b.bindpos;
+	m->weights = b.weights;
+	m->bones = b.bones;
+	m->normals = b.normals;
+	m->venv = b.venv;
+	m->vink = b.vink;
+	m->vmatte = NULL;
+	m->mattemask = 0;
+
+	// Kept only for a mesh with a vertex on a material a pack can make matte
+	// (xblaMeshMattes): every other mesh's per-frame loops never look.
+	if (b.vmatte) {
+		for (s32 i = 0; i < b.numvtx; i++) {
+			if (b.vmatte[i]) {
+				m->mattemask |= 1u << (b.vmatte[i] - 1);
+			}
+		}
+
+		if (m->mattemask) {
+			m->vmatte = b.vmatte;
+			sysLogPrintf(LOG_NOTE, "xblamesh: %s has a material a pack can make matte", what);
+		} else {
+			free(b.vmatte);
+		}
+	}
+
+	if (m->vink) {
+		sysLogPrintf(LOG_NOTE, "xblamesh: %s is a classic gun, its sheen weighted by its paint", what);
+	}
+	m->numgfx = b.numgfx;
+	m->allgfx = b.allgfx;
+	m->allxlu = b.allxlu;
+	m->allfade = b.allfade;
+	m->groupxlucut = b.groupxlucut;
+	m->allxlucut = b.allxlu >= 0 && b.allxlucut;
+	m->numgroups = b.numgroups;
+
+	if (m->normals && m->venv && xblaMeshBuildBorrowFile) {
+		xblaMeshBorrowEnvironment(m, xblaMeshBuildBorrowFile, what);
+	}
+
+	if (m->normals && m->venv) {
+		xblaMeshBuildEnvironment(m, mats, what);
+	}
+
+	// The box the bind positions stand in. A posed vertex is a blend of the
+	// same point put through one palette matrix or another, so every one of
+	// them lands inside this box carried through those matrices - which is
+	// what bounds the pose, and so how finely it can be written down.
+	if (m->bindpos) {
+		for (s32 j = 0; j < 3; j++) {
+			m->bindlo[j] = m->bindhi[j] = m->bindpos[j];
+		}
+
+		for (s32 i = 1; i < b.numvtx; i++) {
+			for (s32 j = 0; j < 3; j++) {
+				const f32 v = m->bindpos[i * 3 + j];
+
+				if (v < m->bindlo[j]) {
+					m->bindlo[j] = v;
+				}
+
+				if (v > m->bindhi[j]) {
+					m->bindhi[j] = v;
+				}
+			}
+		}
+
+		// The palette's size is known now that the bind matrices are read, so
+		// the bones can be folded down to the ones that do something.
+		xblaMeshCompactSkin(m);
+	}
+
+	// Last, so that a mesh the renderer is allowed to draw is one whose bones
+	// have been through xblaMeshCompactSkin(): the pose reads the count and the
+	// clamped palette indices that leaves, and the file's own bytes are neither.
+	m->state = 1;
+
+	for (s32 g = 0; g < XBLAMESH_MAXPARTS; g++) {
+		m->groupgfx[g] = b.groupgfx[g];
+		// The builder is zeroed, and zero is a real index, so a group it never
+		// reached says -1 rather than "the list at the top of the array".
+		m->groupxlu[g] = g < b.numgroups ? b.groupxlu[g] : -1;
+		m->groupfade[g] = g < b.numgroups ? b.groupfade[g] : -1;
+	}
+
+	g_XblaMeshNumMeshes++;
+	g_XblaMeshNumTris += (u32)b.numtris;
+
+	// Everything this mesh is now holding, the skinning included - a skinned
+	// mesh keeps a bind position, two weights and its bones for every vertex
+	// it emitted, which is more than the vertices themselves come to.
+	g_XblaMeshBytes += (u32)((size_t)b.numgfx * sizeof(Gfx) +
+			(size_t)b.numvtx * (sizeof(Vtx) + sizeof(Col)) +
+			(size_t)m->nummatrices * sizeof(Mtxf) +
+			(m->bindpos ? (size_t)b.numvtx * (6 * sizeof(f32) + 3) : 0) +
+			(m->grad ? (size_t)b.numvtx * 4 * sizeof(f32) : 0));
+
+	if (xblaMeshVerbose) {
+		s16 lo[3];
+		s16 hi[3];
+
+		for (s32 i = 0; i < 3; i++) {
+			lo[i] = b.vertices[0].v[i];
+			hi[i] = b.vertices[0].v[i];
+		}
+
+		for (s32 i = 1; i < b.numvtx; i++) {
+			for (s32 j = 0; j < 3; j++) {
+				if (b.vertices[i].v[j] < lo[j]) {
+					lo[j] = b.vertices[i].v[j];
+				}
+
+				if (b.vertices[i].v[j] > hi[j]) {
+					hi[j] = b.vertices[i].v[j];
+				}
+			}
+		}
+
+		sysLogPrintf(LOG_NOTE, "xblamesh: %s mesh [%d %d %d]..[%d %d %d]",
+				what, lo[0], lo[1], lo[2], hi[0], hi[1], hi[2]);
+	}
+
+	sysLogPrintf(LOG_NOTE, "xblamesh: %s built, %d tris, %d verts, %d cmds%s",
+			what, b.numtris, b.numvtx, b.numgfx, m->frompack ? " (from the model pack)" : "");
+
+	return 1;
+}
+
+/**
+ * A built mesh whose file has changed under it - the model pack was switched
+ * - is started again. Its old lists are not freed: the render thread may be
+ * in the middle of one, and a pack swap is rare enough that leaking a mesh's
+ * worth per swap is the safer bargain.
+ */
+static void xblaMeshDropStale(struct xblameshbuilt *m, s32 fileid)
+{
+	if (m->state > 0 && m->packgen != modelpackGetGeneration() &&
+			(m->frompack || (fileid > 0 && modelpackFindXbla(fileid)))) {
+		sysLogPrintf(LOG_NOTE, "xblamesh: the model pack changed; a mesh is built again (the old one is kept, not freed)");
+		gfxMeshForget(&m->gpu);
+		gfxMeshForget(&m->envgpu);
+		memset(m, 0, sizeof(*m));
+	}
+}
+
+static struct xblameshbuilt *xblaMeshBuild(s32 slot)
+{
+	struct xblameshbuilt *m = &built[slot];
+	struct xblameshmats mats;
+	char what[32];
+	const char *path;
+	u8 *file;
+	u32 len;
+
+	const s32 fileid = slotFile ? slotFile[slot] : 0;
+
+	xblaMeshDropStale(m, fileid);
+
+	if (m->state) {
+		return m->state > 0 ? m : NULL;
+	}
+
+	m->state = -1;
+	m->packgen = modelpackGetGeneration();
+
+	file = xblaMeshReadSlot(slot, &len);
+
+	if (!file) {
+		return NULL;
+	}
+
+	memset(&mats, 0, sizeof(mats));
+
+	// The model pack's file for this mesh, if it has one: read, and written
+	// back out in the release's own layout with the release's own skinning
+	// laid over it. The file is named for the model whose nodes name the
+	// mesh, which is what the matching wrote down.
+	path = fileid ? modelpackFindXbla(fileid) : NULL;
+
+	if (path) {
+		struct objmesh *obj = objmeshRead(path);
+
+		if (obj) {
+			struct objmesh *orig = xblaMeshFileToObj(file, len, NULL);
+			u32 synthlen = 0;
+			u8 *synth = xblaMeshFromObj(obj, orig, &mats, 0, NULL, &synthlen);
+
+			if (synth) {
+				free(file);
+				file = synth;
+				len = synthlen;
+				m->frompack = 1;
+				sysLogPrintf(LOG_NOTE, "xblamesh: slot %d comes from %s: %u vertices, %u triangles%s",
+						slot, path, obj->numvertices, obj->numtris,
+						orig && orig->skinned ? ", skinned by nearest vertex" : "");
+			} else {
+				sysLogPrintf(LOG_ERROR, "xblamesh: %s could not stand in for slot %d", path, slot);
+			}
+
+			objmeshFree(orig);
+			objmeshFree(obj);
+		}
+	}
+
+	snprintf(what, sizeof(what), "slot %d", slot);
+
+	{
+		s32 ok;
+
+		xblaMeshBuildCullBack = fileid == FILE_PNLOGO2 || (!m->frompack && xblaMeshFileIsChr(fileid)) ? G_CULL_FRONT : 0;
+		xblaMeshBuildBorrowFile = m->frompack ? 0 : fileid;
+		xblaMeshBuildKeepArt = !m->frompack && fileid >= NUM_FILES;
+		xblaMeshBuildAnalyse = m->frompack ? 0 : handtintWantsMesh(fileid, xblaMeshFileIsChr(fileid));
+		ok = xblaMeshBuildFile(m, file, len, &mats, what);
+		xblaMeshBuildAnalyse = 0;
+		xblaMeshBuildCullBack = 0;
+		xblaMeshBuildBorrowFile = 0;
+		xblaMeshBuildKeepArt = 0;
+
+		return ok ? m : NULL;
+	}
+}
+
+/* -------------------------------------------------------------------------
+ * A model pack's file for one of the game's own models
+ * ------------------------------------------------------------------------- */
+
+// One per file id, made on the first ask. Freed at xblaMeshResetModels():
+// unlike the release's meshes these are node-local to a model the stage pool
+// is about to give back. A pack switched under one does not wait for that -
+// the generation on the build says the file has changed and it is made again
+// (xblaMeshBuildPack()), the way a pack's replacement for one of the
+// release's meshes is.
+static struct xblameshbuilt **packBuilt;
+
+s32 xblaMeshEnumListNodes(struct modeldef *modeldef, struct modelnode **out, s32 max)
+{
+	struct modelnode *node = modeldef ? modeldef->rootnode : NULL;
+	struct modelnode *headspot = NULL;
+	s32 n = 0;
+	s32 walked = 0;
+
+	// The same depth-first order the game's own iteration uses, and the
+	// matcher above: down to the child, along next, back up to the parent's
+	// next. Every DL or GUNDL node counts, in that order.
+	while (node) {
+		const u32 type = node->type & 0xff;
+
+		if (++walked > 4096) {
+			break;
+		}
+
+		if (type == MODELNODETYPE_DL || type == MODELNODETYPE_GUNDL) {
+			if (out && n < max) {
+				out[n] = node;
+			}
+
+			n++;
+		}
+
+		if (node->child) {
+			if (type == MODELNODETYPE_HEADSPOT) {
+				headspot = node;
+			}
+
+			node = node->child;
+			continue;
+		}
+
+		while (node) {
+			if (node->next) {
+				node = node->next;
+				break;
+			}
+
+			// Out of a grafted head by the headspot it was entered from. The
+			// head's modeldef is shared by every body wearing it on a solo
+			// mission, and its roots name the headspot of the body that
+			// attached it last - another model's, whose lists came next
+			// (gebeanNextNode())
+			if (headspot && node->parent && (node->parent->type & 0xff) == MODELNODETYPE_HEADSPOT) {
+				node = headspot;
+				headspot = NULL;
+			} else {
+				node = node->parent;
+			}
+		}
+	}
+
+	return n;
+}
+
+void xblaMeshNodeRestOffset(const struct modelnode *node, f32 out[3])
+{
+	out[0] = out[1] = out[2] = 0.0f;
+
+	// The bone a list node hangs under is placed by the position nodes above
+	// it, each relative to its parent - modelNodeGetModelRelativePosition()
+	// sums them the same way for a model instance. The chrinfo root's
+	// position lives in rwdata and is the instance's own, so it is not part
+	// of the model's rest.
+	while (node) {
+		const u32 type = node->type & 0xff;
+
+		if (type == MODELNODETYPE_POSITION) {
+			const struct modelrodata_position *pos = &node->rodata->position;
+			out[0] += pos->pos.x;
+			out[1] += pos->pos.y;
+			out[2] += pos->pos.z;
+		} else if (type == MODELNODETYPE_POSITIONHELD) {
+			const struct modelrodata_positionheld *pos = &node->rodata->positionheld;
+			out[0] += pos->pos.x;
+			out[1] += pos->pos.y;
+			out[2] += pos->pos.z;
+		}
+
+		node = node->parent;
+	}
+}
+
+/**
+ * Files every list node of a model as part k of the pack's file for it,
+ * whether or not the pack has one.
+ *
+ * It has to be every model, and not only the ones the pack can replace,
+ * because this is the only moment a model's tree may be walked: a modeldef is
+ * freed and its memory handed out again inside a stage, so a register of
+ * loaded models to go back over when the pack changes is a wild pointer away
+ * from a crash (xblaMeshRegisterModel() tells the same story about the
+ * release's meshes, which are matched up front for exactly this reason). With
+ * both halves filed at the load, choosing a pack, switching packs off, and
+ * changing which of the two wins are all decided at the draw and are on screen
+ * on the next frame.
+ *
+ * What it is not is free, so it is gated on there being a pack installed at
+ * all: a player with nothing in model-packs/ files nothing here, the node
+ * table stays as the matcher left it, and the draw path's first test costs
+ * what it always cost. A pack folder appearing mid-session is picked up by the
+ * next model load, so the level it appeared in keeps the models it has.
+ */
+static void xblaMeshRegisterPackModel(struct modeldef *modeldef, u16 fileid)
+{
+	struct modelnode *nodes[XBLAMESH_MAXPARTS];
+	s32 hasmesh = 0;
+	s32 n;
+	s32 useidx;
+	s32 beanrow;
+
+	if (!modeldef || !modeldef->rootnode || !fileid) {
+		return;
+	}
+
+	// A GoldenEye X model the GoldenEye XBLA release has a character for is
+	// filed whether or not Mod.XblaGoldenEye is on, for the reason above:
+	// switching it on is then live. A name compare for every other model.
+	beanrow = gebeanFindRow(fileid, modeldef);
+
+	if (!modelpackHavePacks() && beanrow < 0) {
+		return;
+	}
+
+	n = xblaMeshEnumListNodes(modeldef, nodes, XBLAMESH_MAXPARTS);
+
+	if (n <= 0) {
+		return;
+	}
+
+	if (n > XBLAMESH_MAXPARTS) {
+		sysLogPrintf(LOG_WARNING, "xblamesh: model file %d has %d list nodes and the pack can replace %d",
+				fileid, n, XBLAMESH_MAXPARTS);
+		n = XBLAMESH_MAXPARTS;
+	}
+
+	useidx = xblaMeshUseFor(modeldef, fileid, 1);
+
+	if (useidx < 0) {
+		return;
+	}
+
+	// Whether the matcher, which has just run, found this model a mesh -
+	// asked of the model and not of the node, because the preference between
+	// the two is about a model: half of one drawn from the pack's file and
+	// half from the release's mesh is neither of the two things being chosen
+	// between. A list the matcher left alone (a far LOD alternative) would
+	// otherwise keep taking the pack's file with the mesh drawn over it.
+	for (s32 k = 0; k < n; k++) {
+		const struct xblameshentry *e = xblaMeshSlotFor(nodes[k]);
+
+		if (e && e->node == nodes[k] && e->modeldef == modeldef && e->matched) {
+			hasmesh = 1;
+			break;
+		}
+	}
+
+	for (s32 k = 0; k < n; k++) {
+		struct xblameshentry *e = xblaMeshEntryFor(nodes[k], modeldef);
+
+		if (!e) {
+			// Half a model filed is worse than none: dropping the use is what
+			// stops the pack's mesh from building at all (xblaMeshBuildPack()
+			// asks for it), so every node keeps its own geometry rather than
+			// some of them drawing a file the rest are not part of.
+			sysLogPrintf(LOG_WARNING, "xblamesh: the node table is full; model file %d is left alone", fileid);
+			uses[useidx].modeldef = NULL;
+			return;
+		}
+
+		e->fileid = fileid;
+		e->packpart = (u16)k;
+
+		e->packuse = useidx;
+		e->packhasmesh = (u8)hasmesh;
+		e->beanrow = (s16)beanrow;
+
+		uses[useidx].parts[k] = nodes[k];
+
+		// The character is posed, and posing wants the matrix each list is
+		// drawn under; a pack's file is drawn under the node's own and never
+		// asks.
+		uses[useidx].partmtx[k] = beanrow >= 0 ? (s16)gebeanListNodeMatrix(nodes[k]) : -1;
+	}
+
+	uses[useidx].numparts = (u16)n;
+
+	if (beanrow >= 0) {
+		sysLogPrintf(LOG_NOTE, "xblamesh: model file %d is %s, which the GoldenEye "
+				"XBLA release has a model for%s", fileid, gebeanRowName(beanrow),
+				gebeanGetEnabled() ? "" : " (no copy of it is here)");
+
+		// Unpacked at the level load that first wants it rather than at a draw.
+		if (gebeanGetEnabled()) {
+			gebeanPrepare();
+		}
+	}
+
+	if (xblaMeshVerbose && modelpackFindN64(fileid)) {
+		sysLogPrintf(LOG_NOTE, "xblamesh: model file %d: %d list nodes can take %s",
+				fileid, n, modelpackFindN64(fileid));
+	}
+}
+
+/**
+ * A list node's rest offset within its own model file, which is the space a
+ * pack's OBJ is written in.
+ *
+ * xblaMeshNodeRestOffset() climbs every parent, and a head's top nodes are
+ * given the body's headspot as their parent when the head is grafted - which
+ * has happened by the time a pack's mesh is built, since that waits for the
+ * first draw. Climbing on took the body's neck position off every vertex of a
+ * head pack, so a head drew five hundred units down inside the torso and the
+ * body stood there headless. The head file has no position nodes of its own,
+ * so its offset is zero, whichever body it sits on.
+ */
+static void xblaMeshNodeOwnRestOffset(const struct modelnode *node, f32 out[3])
+{
+	out[0] = out[1] = out[2] = 0.0f;
+
+	while (node && (node->type & 0xff) != MODELNODETYPE_HEADSPOT) {
+		const u32 type = node->type & 0xff;
+
+		if (type == MODELNODETYPE_POSITION) {
+			const struct modelrodata_position *pos = &node->rodata->position;
+			out[0] += pos->pos.x;
+			out[1] += pos->pos.y;
+			out[2] += pos->pos.z;
+		} else if (type == MODELNODETYPE_POSITIONHELD) {
+			const struct modelrodata_positionheld *pos = &node->rodata->positionheld;
+			out[0] += pos->pos.x;
+			out[1] += pos->pos.y;
+			out[2] += pos->pos.z;
+		}
+
+		node = node->parent;
+	}
+}
+
+/**
+ * Builds the pack's mesh for one of the game's own models: a group per list
+ * node, each in the node's own space.
+ *
+ * The file's vertices are in the model's space, where the dump put them, so
+ * each group is moved back by the rest offset of the node it belongs to - the
+ * same sum the dump added. A vertex two groups share is given to each, since
+ * the two move by different amounts.
+ */
+static struct xblameshbuilt *xblaMeshBuildPack(const struct xblameshentry *e)
+{
+	const u16 fileid = e->fileid;
+	struct xblameshbuilt *m;
+	struct xblameshmats mats;
+	struct xblameshuse *use;
+	struct objmesh *obj;
+	const char *path;
+	char what[48];
+	u8 *synth;
+	u32 len = 0;
+	s32 *owner;
+	u32 ownercap;
+	s32 numbered = 1;
+
+	if (!packBuilt) {
+		packBuilt = calloc(NUM_FILE_SLOTS, sizeof(*packBuilt));
+
+		if (!packBuilt) {
+			return NULL;
+		}
+	}
+
+	m = packBuilt[fileid];
+
+	if (m && m->state && m->packgen != modelpackGetGeneration()) {
+		// Started again under a new pack. A built one is leaked rather than
+		// freed, for the reason xblaMeshDropStale() gives; one that would not
+		// build holds nothing, and is dropped so that the next pack's file for
+		// the same model is not refused for the last pack's file's sake.
+		if (m->state > 0) {
+			gfxMeshForget(&m->gpu);
+			gfxMeshForget(&m->envgpu);
+			packBuilt[fileid] = NULL;
+			m = NULL;
+		} else {
+			memset(m, 0, sizeof(*m));
+		}
+	}
+
+	if (!m) {
+		m = packBuilt[fileid] = calloc(1, sizeof(*m));
+
+		if (!m) {
+			return NULL;
+		}
+	}
+
+	if (m->state) {
+		return m->state > 0 ? m : NULL;
+	}
+
+	m->state = -1;
+	m->packgen = modelpackGetGeneration();
+	m->local = 1;
+	m->frompack = 1;
+
+	path = modelpackFindN64(fileid);
+	use = (e->packuse >= 0 && e->packuse < numUses && uses[e->packuse].modeldef == e->modeldef)
+			? &uses[e->packuse] : NULL;
+
+	if (!path || !use || use->numparts == 0) {
+		return NULL;
+	}
+
+	obj = objmeshRead(path);
+
+	if (!obj) {
+		return NULL;
+	}
+
+	for (u32 g = 0; g < obj->numgroups; g++) {
+		if (obj->groups[g].number < 0) {
+			numbered = 0;
+		}
+	}
+
+	ownercap = obj->numvertices + 64;
+	owner = malloc(ownercap * sizeof(s32));
+
+	if (!owner) {
+		objmeshFree(obj);
+		return NULL;
+	}
+
+	for (u32 i = 0; i < ownercap; i++) {
+		owner[i] = -1;
+	}
+
+	for (u32 g = 0; g < obj->numgroups; g++) {
+		const struct objgroup *group = &obj->groups[g];
+		const s32 k = numbered ? group->number : (s32)g;
+
+		for (u32 d = group->firstdraw; d < group->firstdraw + group->numdraws && d < obj->numdraws; d++) {
+			const struct objdraw *draw = &obj->draws[d];
+
+			for (u32 t = draw->firsttri; t < draw->firsttri + draw->numtris && t < obj->numtris; t++) {
+				for (s32 i = 0; i < 3; i++) {
+					u32 *idx = &obj->indices[t * 3 + i];
+
+					if (*idx >= obj->numvertices) {
+						continue;
+					}
+
+					if (owner[*idx] < 0) {
+						owner[*idx] = k;
+					} else if (owner[*idx] != k) {
+						// Shared with another group: a copy of its own. The
+						// vertex array may move, so nothing across the loop
+						// holds a pointer into it.
+						const struct objvertex copy = obj->vertices[*idx];
+						const s32 added = objmeshAddVertex(obj, &copy);
+
+						if (added < 0) {
+							continue;
+						}
+
+						if ((u32)added >= ownercap) {
+							const u32 grown = ownercap * 2 > (u32)added + 1 ? ownercap * 2 : (u32)added + 1;
+							s32 *grownowner = realloc(owner, grown * sizeof(s32));
+
+							if (!grownowner) {
+								continue;
+							}
+
+							for (u32 j = ownercap; j < grown; j++) {
+								grownowner[j] = -1;
+							}
+
+							owner = grownowner;
+							ownercap = grown;
+						}
+
+						owner[added] = k;
+						*idx = (u32)added;
+					}
+				}
+			}
+		}
+	}
+
+	for (u32 i = 0; i < obj->numvertices; i++) {
+		const s32 k = owner[i];
+		f32 off[3];
+
+		if (k < 0 || k >= use->numparts || !use->parts[k]) {
+			continue;
+		}
+
+		xblaMeshNodeOwnRestOffset(use->parts[k], off);
+		obj->vertices[i].pos[0] -= off[0];
+		obj->vertices[i].pos[1] -= off[1];
+		obj->vertices[i].pos[2] -= off[2];
+	}
+
+	free(owner);
+
+	memset(&mats, 0, sizeof(mats));
+	synth = xblaMeshFromObj(obj, NULL, &mats, use->numparts, &m->groupabsent, &len);
+
+	sysLogPrintf(LOG_NOTE, "xblamesh: model file %d comes from %s: %u vertices, %u triangles in %u groups for %d list nodes",
+			fileid, path, obj->numvertices, obj->numtris, obj->numgroups, use->numparts);
+
+	objmeshFree(obj);
+
+	if (!synth) {
+		return NULL;
+	}
+
+	snprintf(what, sizeof(what), "model file %d's pack mesh", fileid);
+
+	return xblaMeshBuildFile(m, synth, len, &mats, what) ? m : NULL;
+}
+
+static void xblaMeshFreePackMeshes(void)
+{
+	s32 n = 0;
+
+	if (!packBuilt) {
+		return;
+	}
+
+	for (s32 i = 0; i < NUM_FILE_SLOTS; i++) {
+		struct xblameshbuilt *m = packBuilt[i];
+
+		if (!m) {
+			continue;
+		}
+
+		if (m->state > 0) {
+			n++;
+		}
+
+		gfxMeshForget(&m->gpu);
+		gfxMeshForget(&m->envgpu);
+		free(m->envst);
+		free(m->gdl);
+		free(m->vertices);
+		free(m->colours);
+		free(m->grad);
+		free(m->invbind);
+		free(m->bindpos);
+		free(m->normals);
+		free(m->vink);
+		free(m->vmatte);
+		free(m->weights);
+		free(m->bones);
+		free(m->anatexbone);
+		free(m->anabonecol);
+		free(m);
+		packBuilt[i] = NULL;
+	}
+
+	if (n) {
+		sysLogPrintf(LOG_NOTE, "xblamesh: %d model pack meshes freed with the stage", n);
+	}
+}
+
+/* -------------------------------------------------------------------------
+ * A GoldenEye XBLA character for one of GoldenEye X's models
+ * ------------------------------------------------------------------------- */
+
+// One per look (0 Bean's HD character, 1 its N64-look original) and file id.
+// Kept across stages, unlike a pack's: the mesh is in the model's own space
+// and depends only on the file, which gebeanFindRow() has checked is the one
+// the table names every time it loads. One that would not build is tried
+// again at the next stage, in case the copy was missing then.
+static struct xblameshbuilt **beanBuilt[2];
+
+// How many of them keep some of their model's own triangles (xblaMeshKeptLists())
+static s32 beanNumKeeping;
+
+/**
+ * Builds the character for a GoldenEye X model: a mesh in 4J's layout from
+ * gebeanBuild(), skinned to the model's own matrices, a group per list node.
+ * It draws like one of the release's skinned meshes (posed under the first
+ * part's matrix), except that it chooses its group the way a pack's file does
+ * - by the node's place among the model's lists - and a node with no group
+ * keeps its own geometry.
+ */
+static struct xblameshbuilt *xblaMeshBuildBeanOnce(const struct xblameshentry *e, s32 original)
+{
+	const s32 look = original ? 1 : 0;
+	struct xblameshbuilt *m;
+	struct xblameshuse *use;
+	struct xblameshmats mats;
+	struct gebeanmats *bmats;
+	const void *tintpanes[8];
+	s32 numtint = 0;
+	u64 twosided = 0;
+	char what[80];
+	char envkey[sizeof(bmats->envkey)];
+	u8 *file;
+	u32 len = 0;
+	s32 ok;
+
+	if (!beanBuilt[look]) {
+		beanBuilt[look] = calloc(NUM_FILE_SLOTS, sizeof(*beanBuilt[look]));
+
+		if (!beanBuilt[look]) {
+			return NULL;
+		}
+	}
+
+	m = beanBuilt[look][e->fileid];
+
+	if (m && m->state) {
+		return m->state > 0 ? m : NULL;
+	}
+
+	if (!m) {
+		m = beanBuilt[look][e->fileid] = calloc(1, sizeof(*m));
+
+		if (!m) {
+			return NULL;
+		}
+	}
+
+	m->state = -1;
+
+	// A gun's first-person model is built in each list node's own space with
+	// no palette, and drawn the way a model pack's is; a character is posed
+	if (gebeanRowIsFirstPerson(e->beanrow)) {
+		m->local = 1;
+	} else {
+		m->frombean = 1;
+	}
+
+	use = (e->packuse >= 0 && e->packuse < numUses && uses[e->packuse].modeldef == e->modeldef)
+			? &uses[e->packuse] : NULL;
+
+	if (!use || use->numparts == 0) {
+		return NULL;
+	}
+
+	bmats = calloc(1, sizeof(*bmats));
+
+	if (!bmats) {
+		return NULL;
+	}
+
+	bmats->fileid = e->fileid;
+	file = gebeanBuild(e->beanrow, original, (struct modeldef *)e->modeldef, use->parts, use->numparts,
+			bmats, &m->groupabsent, &len);
+
+	if (!file) {
+		for (s32 i = 0; i < GEBEAN_MAXMATS; i++) {
+			free(bmats->env[i]);
+		}
+
+		free(bmats->keepvtx);
+		free(bmats);
+		return NULL;
+	}
+
+	memset(&mats, 0, sizeof(mats));
+	mats.num = bmats->num < XBLAMESH_MAXMATS ? bmats->num : XBLAMESH_MAXMATS;
+
+	for (s32 i = 0; i < mats.num; i++) {
+		mats.tile[i] = bmats->tile[i];
+		mats.alpha[i] = bmats->alpha[i];
+		mats.soft[i] = bmats->soft[i];
+		mats.env[i] = bmats->env[i];
+		mats.envamount[i] = bmats->envamount[i];
+	}
+
+	// The maps are copied into the reflection's atlas and freed below
+	for (s32 i = mats.num; i < GEBEAN_MAXMATS; i++) {
+		free(bmats->env[i]);
+	}
+
+	snprintf(envkey, sizeof(envkey), "%s", bmats->envkey);
+	mats.envkey = envkey;
+
+	m->beanneck = bmats->neckblank;
+	memcpy(m->beanneckfill, bmats->neckfill, sizeof(m->beanneckfill));
+	memcpy(m->beanhood, bmats->hood, sizeof(m->beanhood));
+	memcpy(m->beanneckof, bmats->neck, sizeof(m->beanneckof));
+	memcpy(m->beanownneck, bmats->ownneck, sizeof(m->beanownneck));
+	memcpy(m->beannoskin, bmats->noskin, sizeof(m->beannoskin));
+
+	for (s32 k = 0; k < 64; k++) {
+		if (bmats->hood[k] >= 0 && bmats->hood[k] < 64) {
+			twosided |= 1ull << bmats->hood[k];
+		}
+	}
+
+	twosided |= bmats->twosided;
+	memcpy(m->beanbare, bmats->bare, sizeof(m->beanbare));
+	memcpy(m->beanspentgroup, bmats->spent, sizeof(m->beanspentgroup));
+
+	for (s32 k = 0; k < 64; k++) {
+		if (bmats->spent[k] >= 0) {
+			m->beanspent |= 1ull << k;
+		}
+	}
+
+	m->beanhead = bmats->head;
+	m->beanneckback = bmats->neckback;
+	memcpy(m->beanseat, bmats->seat, sizeof(m->beanseat));
+	m->beanseathit = bmats->seathit;
+	memcpy(m->beanneckshift, bmats->neckshift, sizeof(m->beanneckshift));
+	m->beanhasneckshift = bmats->hasneckshift;
+	m->beancollarshift = bmats->collarshift;
+	m->beanhascollarshift = bmats->hascollarshift;
+	m->beanfromchar = bmats->fromchar;
+	m->beanopenrim = bmats->openrim;
+	m->beanrow = e->beanrow;
+	m->beangen = romdataFilesGeneration();
+	m->beanscreenfit = bmats->screenfit;
+	memcpy(m->beanscreenquad, bmats->screenquad, sizeof(m->beanscreenquad));
+	m->beanscreenrecess = bmats->screenrecess;
+	beanNumKeeping += bmats->keepvtx && !m->beankeepvtx;
+	beanNumKeeping -= !bmats->keepvtx && m->beankeepvtx;
+	free(m->beankeepvtx);
+	m->beankeepvtx = bmats->keepvtx;
+	m->beannumkeepvtx = bmats->keepvtx ? bmats->numkeepvtx : 0;
+	m->beankeeplist = bmats->keepvtx ? bmats->keeplist : -1;
+	m->beannumhubs = bmats->numhubs;
+	memcpy(m->beanhubmtx, bmats->hubmtx, sizeof(m->beanhubmtx));
+	memcpy(m->beanhubparent, bmats->hubparent, sizeof(m->beanhubparent));
+	memcpy(m->beanhubshift, bmats->hubshift, sizeof(m->beanhubshift));
+
+	// The tinted panes, by their picture
+	for (s32 i = 0; i < mats.num; i++) {
+		if (bmats->tinted[i] && mats.tile[i] && numtint < ARRAYCOUNT(tintpanes)) {
+			tintpanes[numtint++] = mats.tile[i];
+		}
+	}
+
+	free(bmats);
+
+	snprintf(what, sizeof(what), "model file %d's GoldenEye model%s", e->fileid,
+			original ? " (N64 look)" : "");
+
+	// A GoldenEye character culls its back faces, as the N64 models do (see
+	// xblaMeshBuildCullBack) - Bean winds its triangles the game's way round,
+	// not the release's. Its props and guns stay two-sided: Dam's truck cab
+	// and gates lost their far walls when they culled
+	xblaMeshBuildCullBack = m->frombean && gebeanRowIsChr(e->beanrow) ? G_CULL_BACK : 0;
+	xblaMeshBuildAnalyse = m->frombean && gebeanRowIsChr(e->beanrow) ? 2 : 0;
+	xblaMeshBuildTwoSided = twosided;
+	ok = xblaMeshBuildFile(m, file, len, &mats, what);
+	xblaMeshBuildCullBack = 0;
+	xblaMeshBuildAnalyse = 0;
+	xblaMeshBuildTwoSided = 0;
+
+	for (s32 i = 0; i < mats.num; i++) {
+		free((u8 *)mats.env[i]);
+	}
+
+	if (ok) {
+		m->tintgdl = xblaMeshTintCopy(m, tintpanes, numtint, &m->tintonly);
+	}
+
+	return ok ? m : NULL;
+}
+
+/**
+ * The build, and a failure told to gebean.c the once it happens (a failed
+ * build is remembered until the stage ends): a Combat Simulator pool row then
+ * takes GoldenEye's own N64 model from the ROM instead of standing on its
+ * Perfect Dark host with nothing over it (gebeanBuildFailed()).
+ */
+static struct xblameshbuilt *xblaMeshBuildBean(const struct xblameshentry *e, s32 original)
+{
+	const s32 look = original ? 1 : 0;
+	const struct xblameshbuilt *was = beanBuilt[look] ? beanBuilt[look][e->fileid] : NULL;
+	const s32 fresh = !was || !was->state;
+	struct xblameshbuilt *m = xblaMeshBuildBeanOnce(e, original);
+
+	if (!m && fresh && gebeanGetEnabled()) {
+		gebeanBuildFailed(e->beanrow, e->fileid);
+	}
+
+	return m;
+}
+
+s32 xblaMeshPrebuildBean(struct modeldef *modeldef)
+{
+	struct modelnode *nodes[XBLAMESH_MAXPARTS];
+	const struct xblameshentry *e;
+	s32 n;
+
+	if (!modeldef || !modeldef->rootnode || !gebeanGetEnabled()) {
+		return -1;
+	}
+
+	n = xblaMeshEnumListNodes(modeldef, nodes, XBLAMESH_MAXPARTS);
+
+	if (n <= 0) {
+		return -1;
+	}
+
+	e = xblaMeshSlotFor(nodes[0]);
+
+	// what the draw asks before it builds one (xblaMeshRenderNode()'s
+	// frombean): a pack's file for the model wins, and so does a release mesh
+	if (!e || e->node != nodes[0] || e->modeldef != modeldef || e->beanrow < 0
+			|| e->packpart == XBLAMESH_NOPART || !e->fileid
+			|| modelpackFindN64(e->fileid) != NULL
+			|| (e->matched && xblaMeshEntryLive(e) && opened > 0)
+			|| !(xblaMeshGetEnabled() || gebeanRowIsPool(e->beanrow) || gebeanRowIsFirstPerson(e->beanrow))) {
+		return -1;
+	}
+
+	return xblaMeshBuildBean(e, !xblaMeshGetEnabled()) ? 1 : 0;
+}
+
+/* -------------------------------------------------------------------------
+ * A GoldenEye stage's HD meshes, built while it loads
+ *
+ * A GoldenEye model's HD mesh was built on the game thread the first frame it
+ * was drawn: 20-100 ms for a first-person gun, 4-15 ms for a character, a
+ * freeze each time something new came into view or into the hand (F3
+ * 20261003-123556). While a GE Plus or converted stage loads in the HD look,
+ * every model it loads has its mesh built as it registers - its characters,
+ * heads, props and the guns its guards and pickups carry - and hdpreload.c
+ * loads the first-person models of the guns the stage hands out, here, into
+ * memory of their own, long enough to build them. The meshes are the cache
+ * the draw reads (beanBuilt), so the draw then finds them made.
+ * ------------------------------------------------------------------------- */
+
+static s32 preloadOn;
+static s32 preloadBuilt;
+static u64 preloadUs;
+
+void xblaMeshPreloadSet(s32 on)
+{
+	preloadOn = on;
+
+	if (on) {
+		preloadBuilt = 0;
+		preloadUs = 0;
+	}
+}
+
+s32 xblaMeshPreloading(void)
+{
+	return preloadOn;
+}
+
+void xblaMeshPreloadStats(s32 *built, u64 *us)
+{
+	*built = preloadBuilt;
+	*us = preloadUs;
+}
+
+static void xblaMeshPreloadModel(struct modeldef *modeldef)
+{
+	u32 before;
+	u64 t0;
+
+	if (!preloadOn || !modeldef) {
+		return;
+	}
+
+	before = g_XblaMeshNumMeshes;
+	t0 = sysGetMicroseconds();
+	xblaMeshPrebuildBean(modeldef);
+	preloadUs += sysGetMicroseconds() - t0;
+	preloadBuilt += g_XblaMeshNumMeshes != before;
+}
+
+s32 xblaMeshPreloadModelFile(u16 fileid)
+{
+	struct fileinfo saved;
+	struct modeldef *modeldef;
+	const u8 prevloadtype = g_LoadType;
+	const u32 before = g_XblaMeshNumMeshes;
+	u32 size;
+	u8 *mem;
+	u8 *at;
+
+	if (!preloadOn || !fileid || fileid >= NUM_FILE_SLOTS) {
+		return 0;
+	}
+
+	// built or tried already, this stage or one before it
+	if (beanBuilt[0] && beanBuilt[0][fileid] && beanBuilt[0][fileid]->state) {
+		return 0;
+	}
+
+	// Loaded the way bgunTickGunLoad() loads a gun, into memory of its own,
+	// and the file's record put back after: the gun's own load is untouched
+	size = ALIGN64(fileGetInflatedSize(fileid, LOADTYPE_MODEL)) + 0x8000;
+	mem = malloc(size + 64);
+
+	if (!mem) {
+		return 0;
+	}
+
+	at = (u8 *)ALIGN64((uintptr_t)mem);
+	saved = g_FileInfo[fileid];
+	g_FileInfo[fileid].loadedsize = 0;
+	g_LoadType = LOADTYPE_GUN;
+	modeldef = fileLoadToAddr(fileid, FILELOADMETHOD_EXTRAMEM, at, size);
+	g_LoadType = prevloadtype;
+
+	if (fileGetLoadedSize(fileid) != 0 && modeldef) {
+		modelPromoteTypeToPointer(modeldef);
+		modelPromoteOffsetsToPointers(modeldef, 0x05000000, (uintptr_t)modeldef);
+
+		// builds it (preloadOn), then everything filed against this memory
+		// goes before the memory does: the mesh is kept by file, not by model
+		xblaMeshRegisterModel(modeldef, fileid);
+		xblaMeshForgetModel(modeldef);
+	}
+
+	g_FileInfo[fileid] = saved;
+	free(mem);
+
+	return g_XblaMeshNumMeshes != before;
+}
+
+static void xblaMeshResetBeanMeshes(void)
+{
+	const s32 generation = romdataFilesGeneration();
+	s32 dropped = 0;
+
+	for (s32 look = 0; look < ARRAYCOUNT(beanBuilt); look++) {
+		if (!beanBuilt[look]) {
+			continue;
+		}
+
+		for (s32 i = 0; i < NUM_FILE_SLOTS; i++) {
+			struct xblameshbuilt *m = beanBuilt[look][i];
+
+			if (!m) {
+				continue;
+			}
+
+			// Built from whatever file had this slot before romdataResetFiles()
+			// (a mod swap): the slot can name another model now, and every
+			// draw path reads the mesh by slot. Let go of here, at the stage's
+			// end, where nothing of the next stage has looked it up yet. Leaked
+			// rather than freed, as xblaMeshDropStale() does for the same
+			// reason: the render thread may still be in its lists. The next
+			// load builds again (xblaMeshPreloadBegin()).
+			if (m->state > 0 && m->beangen != generation) {
+				beanNumKeeping -= m->beankeepvtx != NULL;
+				free(m->beankeepvtx);
+				free(m->beankeptgdl[0]);
+				free(m->beankeptgdl[1]);
+				m->beankeepvtx = NULL;
+				m->beankeptgdl[0] = m->beankeptgdl[1] = NULL;
+				gfxMeshForget(&m->gpu);
+				gfxMeshForget(&m->envgpu);
+				beanBuilt[look][i] = NULL;
+				dropped++;
+				continue;
+			}
+
+			if (m->state < 0) {
+				beanNumKeeping -= m->beankeepvtx != NULL;
+				free(m->beankeepvtx);
+				free(m->beankeptgdl[0]);
+				free(m->beankeptgdl[1]);
+				memset(m, 0, sizeof(*m));
+				continue;
+			}
+
+			m->posedmodel = NULL;
+			m->bruisemodel = NULL;
+			m->envmodel = NULL;
+			m->keptmodel = NULL;
+			m->neckbackdef = NULL;
+
+			// made from the stage's own copy of the model's lists
+			for (s32 k = 0; k < ARRAYCOUNT(m->beankeptgdl); k++) {
+				free(m->beankeptgdl[k]);
+				m->beankeptgdl[k] = NULL;
+				m->beankeptsrc[k] = NULL;
+			}
+		}
+	}
+
+	if (dropped) {
+		sysLogPrintf(LOG_NOTE, "xblamesh: %d GoldenEye meshes let go: their file slots were emptied (a mod swap)", dropped);
+	}
+}
+
+s32 xblaMeshGetNumPackageSlots(void)
+{
+	return xblaMeshOpen(1) ? numRecords : 0;
+}
+
+/**
+ * Every mesh id in the release's copy of one model file, filed against the
+ * model. The walk is the "their" half of xblaMeshMatchNodes().
+ */
+static void xblaMeshFileMeshSlots(const u8 *file, u32 len, u16 fileid, u16 *table)
+{
+	u32 off = xblaMeshBE32(file) & 0xffffff;
+	s32 walked = 0;
+
+	while (off && off + 24 <= len && ++walked < 4096) {
+		const u32 type = xblaMeshBE16(file + off) & 0xff;
+		const u16 id = xblaMeshBE16(file + off + 2);
+		u32 child;
+
+		if (id && id != 0xffff && (type == MODELNODETYPE_DL || type == MODELNODETYPE_GUNDL)) {
+			const s32 slot = (s32)(id & 0xfff) - 1;
+
+			if (slot >= 0 && slot < numRecords && !table[slot]) {
+				table[slot] = fileid;
+			}
+		}
+
+		child = xblaMeshFileChild(file, len, off, type);
+
+		if (child) {
+			off = child;
+			continue;
+		}
+
+		while (off) {
+			const u32 next = xblaMeshBE32(file + off + 12) & 0xffffff;
+
+			if (off + 24 > len) {
+				return;
+			}
+
+			if (next) {
+				off = next;
+				break;
+			}
+
+			off = xblaMeshBE32(file + off + 8) & 0xffffff;
+		}
+	}
+}
+
+s32 xblaMeshSlotModelFile(s32 slot)
+{
+	if (!xblaMeshOpen(1) || slot < 0 || slot >= numRecords) {
+		return 0;
+	}
+
+	if (!slotFileAll) {
+		slotFileAll = calloc(numRecords, sizeof(u16));
+
+		if (!slotFileAll) {
+			return 0;
+		}
+
+		for (s32 fileid = 1; fileid < NUM_FILES; fileid++) {
+			const char *name = romdataFileGetName(fileid);
+			u8 *file;
+			u32 len;
+
+			if (!name || !(name[0] == 'C' || name[0] == 'P' || name[0] == 'G')) {
+				continue;
+			}
+
+			// Slot i is the game's file id i + 1: the release's copy of it.
+			file = xblaMeshReadSlot(fileid - 1, &len);
+
+			if (file) {
+				if (len >= 4) {
+					xblaMeshFileMeshSlots(file, len, (u16)fileid, slotFileAll);
+				}
+
+				free(file);
+			}
+		}
+	}
+
+	return slotFileAll[slot];
+}
+
+struct objmesh *xblaMeshSlotToObj(s32 slot, const char *name)
+{
+	struct objmesh *m;
+	u8 *file;
+	u32 len;
+
+	if (!xblaMeshOpen(1)) {
+		return NULL;
+	}
+
+	file = xblaMeshReadSlot(slot, &len);
+
+	if (!file) {
+		return NULL;
+	}
+
+	m = xblaMeshFileToObj(file, len, name);
+	free(file);
+
+	return m;
+}
+
+/* -------------------------------------------------------------------------
+ * A frame's posed vertices
+ * ------------------------------------------------------------------------- */
+
+/**
+ * Where a skinned mesh's posed vertices go for one frame.
+ *
+ * Not the game's vtx pool: that is sized for what an N64 drew and a single
+ * character here is eleven thousand vertices, which would push a match's worth
+ * of chrs straight through the end of it. This is its own arena, doubled the
+ * way the game doubles its pools - the display list built this frame is run
+ * while the next one is being built, so last frame's vertices have to survive
+ * one more frame.
+ *
+ * **It grows by adding a chunk, never by growing one.** The obvious arena - one
+ * block per side, `realloc`ed to fit - cannot be grown inside a frame at all,
+ * because a `realloc` moves vertices that commands already written this frame
+ * point at. So it grew between frames instead, to whatever the frame before it
+ * asked for, and the frame that first wanted more than that drew the tail of
+ * its meshes in their **bind pose**: for a head, whose bind vertices are in the
+ * body's space around y 1400, a head hanging a body's height above the body for
+ * one frame. That is every frame a character first comes into view, 12 of them
+ * over 3000 frames of an eight-simulant match.
+ *
+ * A chunk list has neither problem. What has been handed out never moves, so a
+ * chunk can be added in the middle of a frame, and a frame that wants more than
+ * has ever been wanted gets it there and then rather than one frame late. Each
+ * side keeps its own chunks and hands them back at the top of its next frame;
+ * they are not freed, because the cap is what bounds this and what a match
+ * actually holds is small: one chunk a side for eight simulants, six for
+ * eighty.
+ */
+#define XBLAMESH_ARENA_MAX (48 * 1024 * 1024)
+#define XBLAMESH_CHUNK (1024 * 1024) // the smallest chunk asked for
+
+struct xblameshchunk {
+	u8 *data;
+	u32 size;
+	u32 pos;
+};
+
+// One list per side of the double buffer. The descriptors move when the list
+// grows; the chunks they name do not, which is the whole point.
+static struct xblameshchunk *frameChunks[2];
+static s32 frameNumChunks[2];
+static s32 frameCurChunk[2];
+static u32 frameBytes[2];  // held by that side's chunks, against the cap
+static u32 frameWanted;    // this frame's demand, for the log
+static s32 frameIndex;
+
+// Which frame this is, for the posed copy a mesh keeps. It only has to differ
+// from the frame before it, so wrapping is no more than one wasted pose.
+static u32 frameCount;
+
+// What this frame has done so far and what the last one did, for the F3
+// trace dump: opaque lists emitted, poses written, poses the arena refused.
+static u32 frameDraws, frameDrawsLast;
+static u32 framePoses, framePosesLast;
+static u32 frameGpuPoses, frameGpuPosesLast; // models posed on the GPU (xblaMeshGpuPalette())
+static u32 framePoseFails, framePoseFailsLast;
+
+static void xblaMeshReportOverlaps(void);
+
+void xblaMeshFrameReset(void)
+{
+	// Unconditional, including with the meshes switched off. The frame counter
+	// is what a mesh's posed copy is keyed on, and one that stops moving while
+	// the switch is off is still the current frame when it comes back on - so
+	// the first frame after would draw a pose left over from before, in an
+	// arena whose high water mark had not been given back either.
+	if (xblaMeshVerbose) {
+		xblaMeshReportOverlaps();
+	}
+
+	frameIndex ^= 1;
+	frameCount++;
+
+	// This side's chunks are two frames old now: the list they were written
+	// for has been run. Handed back where they are rather than freed.
+	for (s32 i = 0; i < frameNumChunks[frameIndex]; i++) {
+		frameChunks[frameIndex][i].pos = 0;
+	}
+
+	frameCurChunk[frameIndex] = 0;
+	frameWanted = 0;
+
+	frameDrawsLast = frameDraws;
+	framePosesLast = framePoses;
+	framePoseFailsLast = framePoseFails;
+	frameGpuPosesLast = frameGpuPoses;
+	frameDraws = framePoses = framePoseFails = frameGpuPoses = 0;
+}
+
+/**
+ * Each player's view is its own as far as a mesh's kept copies go: the pose
+ * and the GPU palette are in the first part's own space and would do for any
+ * view, but the matrix they are drawn under (posedmtx, gpumtx) is a copy of
+ * that part's, made under the camera of the view that posed it. A net host
+ * builds every player's view and keeps only its own player's (lv.c,
+ * netDiscardPass), in an order shuffled each frame, so whenever another
+ * player's view came first the host drew Dam's spawn gate and its truck under
+ * that player's camera - somewhere off the screen, a frame at a time
+ * (2026-10-07).
+ * Only the key moves: the arena is the frame's, as before.
+ */
+void xblaMeshPassBegin(void)
+{
+	frameCount++;
+}
+
+/**
+ * One more chunk on this side, big enough for what is being asked for.
+ *
+ * A single mesh's pose is one allocation, so a chunk has to be able to hold
+ * whatever the largest of them comes to rather than a fixed size; the minimum
+ * is what keeps a room of characters from taking a chunk each.
+ */
+static struct xblameshchunk *xblaMeshFrameAddChunk(u32 size)
+{
+	const u32 want = size > XBLAMESH_CHUNK ? size : XBLAMESH_CHUNK;
+	struct xblameshchunk *grown;
+	struct xblameshchunk *chunk;
+	u8 *data;
+
+	if (frameBytes[frameIndex] + want > XBLAMESH_ARENA_MAX) {
+		return NULL;
+	}
+
+	grown = realloc(frameChunks[frameIndex],
+			(size_t)(frameNumChunks[frameIndex] + 1) * sizeof(*grown));
+
+	if (!grown) {
+		return NULL;
+	}
+
+	frameChunks[frameIndex] = grown;
+	data = malloc(want);
+
+	if (!data) {
+		return NULL;
+	}
+
+	chunk = &grown[frameNumChunks[frameIndex]];
+	chunk->data = data;
+	chunk->size = want;
+	chunk->pos = 0;
+
+	frameCurChunk[frameIndex] = frameNumChunks[frameIndex];
+	frameNumChunks[frameIndex]++;
+	frameBytes[frameIndex] += want;
+
+	return chunk;
+}
+
+static void *xblaMeshFrameAlloc(u32 size)
+{
+	struct xblameshchunk *chunk = NULL;
+	void *ptr;
+
+	size = (size + 15) & ~15u;
+	frameWanted += size;
+
+	// The chunk being filled, or the next one along that this fits in. A chunk
+	// passed over keeps whatever was left in it until this side comes round
+	// again, which is what a bump allocator trades for never moving anything;
+	// a chunk is large enough that the loss is noise.
+	for (s32 cur = frameCurChunk[frameIndex]; cur < frameNumChunks[frameIndex]; cur++) {
+		struct xblameshchunk *c = &frameChunks[frameIndex][cur];
+
+		if (c->pos + size <= c->size) {
+			frameCurChunk[frameIndex] = cur;
+			chunk = c;
+			break;
+		}
+	}
+
+	if (!chunk) {
+		chunk = xblaMeshFrameAddChunk(size);
+	}
+
+	if (!chunk) {
+		return NULL;
+	}
+
+	ptr = chunk->data + chunk->pos;
+	chunk->pos += size;
+
+	return ptr;
+}
+
+static void xblaMeshArenaStats(u32 *kb, s32 *chunks)
+{
+	*kb = (frameBytes[0] + frameBytes[1] + 1023) / 1024;
+	*chunks = frameNumChunks[0] + frameNumChunks[1];
+}
+
+/**
+ * The inverse of one of the game's matrices.
+ *
+ * An Mtxf is read as three basis vectors in rows with the translation in the
+ * fourth, so a point is v * R + t and the inverse is v * R-1 - t * R-1.
+ */
+static void xblaMeshInvert(const Mtxf *src, Mtxf *dst)
+{
+	f32 inv[3][3];
+	f32 det;
+
+	inv[0][0] = src->m[1][1] * src->m[2][2] - src->m[1][2] * src->m[2][1];
+	inv[0][1] = src->m[0][2] * src->m[2][1] - src->m[0][1] * src->m[2][2];
+	inv[0][2] = src->m[0][1] * src->m[1][2] - src->m[0][2] * src->m[1][1];
+	inv[1][0] = src->m[1][2] * src->m[2][0] - src->m[1][0] * src->m[2][2];
+	inv[1][1] = src->m[0][0] * src->m[2][2] - src->m[0][2] * src->m[2][0];
+	inv[1][2] = src->m[0][2] * src->m[1][0] - src->m[0][0] * src->m[1][2];
+	inv[2][0] = src->m[1][0] * src->m[2][1] - src->m[1][1] * src->m[2][0];
+	inv[2][1] = src->m[0][1] * src->m[2][0] - src->m[0][0] * src->m[2][1];
+	inv[2][2] = src->m[0][0] * src->m[1][1] - src->m[0][1] * src->m[1][0];
+
+	det = src->m[0][0] * inv[0][0] + src->m[0][1] * inv[1][0] + src->m[0][2] * inv[2][0];
+
+	if (det > -1e-12f && det < 1e-12f) {
+		mtx4LoadIdentity(dst);
+		return;
+	}
+
+	det = 1.0f / det;
+
+	for (s32 row = 0; row < 3; row++) {
+		for (s32 col = 0; col < 3; col++) {
+			dst->m[row][col] = inv[row][col] * det;
+		}
+
+		dst->m[row][3] = 0.0f;
+	}
+
+	for (s32 col = 0; col < 3; col++) {
+		dst->m[3][col] = -(src->m[3][0] * dst->m[0][col] +
+				src->m[3][1] * dst->m[1][col] + src->m[3][2] * dst->m[2][col]);
+	}
+
+	dst->m[3][3] = 1.0f;
+}
+
+/** The matrix the game is posing one part of the model with, or NULL. */
+static Mtxf *xblaMeshPartMtx(struct model *model, struct xblameshuse *use, s32 part)
+{
+	s32 index;
+
+	if (!model || !model->matrices || !model->definition ||
+			part < 0 || part >= use->numparts) {
+		return NULL;
+	}
+
+	index = use->partmtx[part];
+
+	if (index < 0 || index >= model->definition->nummatrices) {
+		return NULL;
+	}
+
+	return &model->matrices[index];
+}
+
+/**
+ * The matrix a skinned mesh is posed under, where its first part names none.
+ *
+ * A part's matrix is read off the G_MTX its own list loads (xblaMeshNodeMtx()),
+ * and a prop's lists load none: the position node above them does. With no
+ * matrix the mesh was never posed and drew its bind pose, which is in the
+ * model's space - fine for a mesh that stands at the model's origin, but two of
+ * the release's are authored further out than an s16 reaches, and the bind
+ * pose's rounding pinned them there. PwirefenceZ, Chicago's chain-link gate, is
+ * one: its root position node stands at z 35069, so every vertex of its bind
+ * pose was rounded to 32767 and the whole gate drew flattened inside the alley
+ * wall - "the fence with XBLA textures is missing in Chicago". PcetroofgunZ, out
+ * to 74306, is the other.
+ *
+ * Only those take the game's own answer for the node, the nearest position
+ * node's matrix; posed out of it, they come out near its origin like any other
+ * pose. A mesh whose bind pose fits keeps drawing it exactly as before.
+ */
+static Mtxf *xblaMeshSkinRoot(const struct xblameshbuilt *m, struct model *model,
+		struct modelnode *node, Mtxf *root)
+{
+	if (root || !m->bindpos || !model || !model->matrices) {
+		return root;
+	}
+
+	for (s32 j = 0; j < 3; j++) {
+		if (m->bindlo[j] < -32768.0f || m->bindhi[j] > 32767.0f) {
+			return modelFindNodeMtx(model, node, 0);
+		}
+	}
+
+	return NULL;
+}
+
+/**
+ * How many steps of a posed copy make one of the game's units.
+ *
+ * A Perfect Dark vertex holds an s16, and the game's own models are drawn in
+ * whole units because that is what an N64 model file could say. **The
+ * release's skinned meshes are not**: the header's scale is a tenth for nearly
+ * every one of them, so a character's geometry is stated to a tenth of a unit
+ * and rounding the pose to whole ones throws nine tenths of what 4J drew away.
+ * A head is where that shows - the vertices across a nose are three or four
+ * units apart, so half a unit of rounding is a tenth of the spacing, scattered
+ * a different way on every vertex, and what should be a straight ridge comes
+ * out bent. It is a hundredth of the spacing on a wall or a crate, which is
+ * why nothing else looked wrong.
+ *
+ * A vertex cannot hold more than an s16, but the matrix it is drawn under can
+ * be divided: write the pose in sixteenths and hand back the bone's matrix
+ * with its three rows divided by sixteen, and the two cancel at the vertex
+ * that reaches the screen. The vertices stay inside the s16 as long as the
+ * mesh does, so how far the pose can be taken is what the pose *reaches*.
+ *
+ * The divided matrix has to reach the list as floats (G_MTX_FLOATS). The
+ * game's rows carry the model's scale, a tenth, and a tenth of a sixteenth is
+ * 0.006: in the N64's s15.16 that keeps two and a half decimal digits, and
+ * against vertices written sixteen times larger the error is sixteen times
+ * the game's own - a few pixels on a gun held at arm's length, snapping as
+ * the pose turns. See xblaMeshPose().
+ *
+ * Which is bounded without posing anything. A posed vertex is a blend of one
+ * bind position put through each of the palette's matrices, and a blend of
+ * points inside a box carried through an affine matrix is inside that box's
+ * image - so the eight corners of the bind box, through every palette entry,
+ * bound every vertex this is about to write. Cheap: 24 entries at most, eight
+ * corners each, once a frame per mesh.
+ *
+ * The cap is 16 because it is already far past what the mesh states - a
+ * sixteenth of a unit is a millimetre and a half of a person - and because a
+ * bound that is met exactly still has to leave the rounding somewhere to go.
+ */
+#define XBLAMESH_MAXFINE 16
+#define XBLAMESH_FINEROOM 30000.0f
+
+static s32 xblaMeshPoseFineness(const struct xblameshbuilt *m, const Mtxf *pal)
+{
+	f32 reach = 0.0f;
+	s32 fine = 1;
+
+	if (!m->bindpos) {
+		return 1;
+	}
+
+	for (s32 i = 0; i < m->nummatrices; i++) {
+		for (s32 corner = 0; corner < 8; corner++) {
+			struct coord in;
+			struct coord out;
+
+			in.x = (corner & 1) ? m->bindhi[0] : m->bindlo[0];
+			in.y = (corner & 2) ? m->bindhi[1] : m->bindlo[1];
+			in.z = (corner & 4) ? m->bindhi[2] : m->bindlo[2];
+
+			mtx4TransformVec((Mtxf *)&pal[i], &in, &out);
+
+			for (s32 j = 0; j < 3; j++) {
+				const f32 v = out.f[j] < 0.0f ? -out.f[j] : out.f[j];
+
+				if (v > reach) {
+					reach = v;
+				}
+			}
+		}
+	}
+
+	while (fine < XBLAMESH_MAXFINE && reach * (fine * 2) <= XBLAMESH_FINEROOM) {
+		fine *= 2;
+	}
+
+	return fine;
+}
+
+/**
+ * Palette entry 1 of a GoldenEye XBLA head that keeps its neck's back weights
+ * (gebean.c's neckback): the joint above the one the head is drawn on, which
+ * is the body's, not the head's. A head hangs under matrix 0 of GoldenEye's
+ * bodies, the neck, and the joint over the neck is the back. Hands back that
+ * joint's matrix and a bind taking a vertex from the head's space (the neck's
+ * joint at the origin) into the back's: a translation, GoldenEye's rest pose
+ * having no turns in it. 0 when the model has no such joint - a head drawn
+ * on its own - and the entry follows the neck.
+ */
+static s32 xblaMeshNeckBack(struct xblameshbuilt *m, const struct modeldef *def, s32 *outmtx, Mtxf *outbind)
+{
+	if (!m->beanneckback || !def || !def->rootnode) {
+		return 0;
+	}
+
+	if (m->neckbackdef != def) {
+		struct modelnode *node = def->rootnode;
+		struct modelnode *neck = NULL;
+		struct modelnode *back;
+		s32 walked = 0;
+
+		m->neckbackdef = def;
+		m->neckbackmtx = -1;
+
+		while (node && walked++ < 4096) {
+			const u32 type = node->type & 0xff;
+
+			if (type == MODELNODETYPE_POSITION && node->rodata->position.mtxindex0 == 0) {
+				neck = node;
+				break;
+			}
+
+			// Not down into a head grafted on it
+			if (node->child && type != MODELNODETYPE_HEADSPOT) {
+				node = node->child;
+				continue;
+			}
+
+			while (node) {
+				if (node->next) {
+					node = node->next;
+					break;
+				}
+
+				node = node->parent;
+			}
+		}
+
+		for (back = neck ? neck->parent : NULL; back; back = back->parent) {
+			if ((back->type & 0xff) == MODELNODETYPE_POSITION) {
+				break;
+			}
+		}
+
+		if (back && back->rodata->position.mtxindex0 > 0
+				&& back->rodata->position.mtxindex0 < def->nummatrices) {
+			m->neckbackmtx = back->rodata->position.mtxindex0;
+
+			for (s32 k = 0; k < 3; k++) {
+				m->neckbackofs[k] = 0.0f;
+			}
+
+			// The neck's rest less the back's: the offsets between the two
+			for (node = neck; node && node != back; node = node->parent) {
+				if ((node->type & 0xff) == MODELNODETYPE_POSITION) {
+					m->neckbackofs[0] += node->rodata->position.pos.x;
+					m->neckbackofs[1] += node->rodata->position.pos.y;
+					m->neckbackofs[2] += node->rodata->position.pos.z;
+				} else if ((node->type & 0xff) == MODELNODETYPE_POSITIONHELD) {
+					m->neckbackofs[0] += node->rodata->positionheld.pos.x;
+					m->neckbackofs[1] += node->rodata->positionheld.pos.y;
+					m->neckbackofs[2] += node->rodata->positionheld.pos.z;
+				}
+			}
+		}
+	}
+
+	if (m->neckbackmtx < 0) {
+		return 0;
+	}
+
+	*outmtx = m->neckbackmtx;
+	mtx4LoadIdentity(outbind);
+	outbind->m[3][0] = m->neckbackofs[0];
+	outbind->m[3][1] = m->neckbackofs[1];
+	outbind->m[3][2] = m->neckbackofs[2];
+
+	return 1;
+}
+
+static f32 *xblaMeshDeformOffsets(struct xblameshbuilt *m, struct model *model,
+		struct xblameshuse *use, s32 slot);
+
+/**
+ * The palette a pose is made with: for entry i, out of the bind pose
+ * (invbind), into the game's pose for the bone (its matrix, lifted by
+ * headshift), and back out of the matrix the list is drawn under (invroot) -
+ * see xblaMeshPose(). lin, when asked for, is the same without the bind, for
+ * objDeform()'s offsets. Hands back how many entries the model has matrices
+ * for; the rest follow the first.
+ */
+/**
+ * A part the mesh turns about a hub of its own (gebeanmats.hubmtx: the Cradle
+ * helicopter's rotors, which the release put elsewhere than GoldenEye's): its
+ * vertices are about that hub and its matrix turns them about GoldenEye's
+ * node, so the matrix is moved on by the hub's offset from the node, as the
+ * matrix over it turns that - which puts the hub back where the release has
+ * it and leaves the turn about it.
+ */
+static void xblaMeshHubShift(const struct xblameshbuilt *m, const struct model *model, s32 i, s32 posable, Mtxf *mtx)
+{
+	for (s32 h = 0; h < m->beannumhubs; h++) {
+		const s32 parent = m->beanhubparent[h];
+		const f32 *d = m->beanhubshift[h];
+
+		if (m->beanhubmtx[h] != i || parent < 0 || parent >= posable) {
+			continue;
+		}
+
+		for (s32 j = 0; j < 3; j++) {
+			mtx->m[3][j] += model->matrices[parent].m[0][j] * d[0]
+				+ model->matrices[parent].m[1][j] * d[1]
+				+ model->matrices[parent].m[2][j] * d[2];
+		}
+	}
+}
+
+/**
+ * The menu hudpiece's rotor (menu.c turns MODELPART_HUDPIECE_0002 about its X
+ * axis every frame). The release's rotor is a striped sleeve, radius 20.9,
+ * over a drum of radius 20.4 that is weighted to the root - and the sleeve's
+ * axis is 0.57 units off the node it is weighted to, so turned about the node
+ * it swung through the drum under it twice a turn (F3 20261004-170717, "the
+ * rotating portion clips into a duplicate of itself", XBLA look only).
+ *
+ * So the rotor's matrix is moved on by however far it carries the sleeve's
+ * centre away from where the root's matrix puts that point: the sleeve turns
+ * about its own axis, which is the drum's, and stays where it was at rest.
+ * The centre is the mean of the vertices weighted to the rotor alone, in the
+ * bind pose, worked out once.
+ */
+static void xblaMeshRotorShift(struct xblameshbuilt *m, const struct model *model, s32 i, s32 posable, Mtxf *mtx)
+{
+	if (m->rotorstate < 0 || !model->definition || model->definition->skel != &g_SkelHudPiece) {
+		return;
+	}
+
+	if (m->rotorstate == 0) {
+		struct modelnode *node = modelGetPart(model->definition, MODELPART_HUDPIECE_0002);
+		f64 sum[3] = { 0, 0, 0 };
+		s32 count = 0;
+
+		m->rotorstate = -1;
+
+		if (!node || !m->bindpos || !m->bones || (node->type & 0xff) != MODELNODETYPE_POSITION) {
+			return;
+		}
+
+		m->rotormtx = (s8)node->rodata->position.mtxindex0;
+
+		if (m->rotormtx <= 0 || m->rotormtx >= m->nummatrices) {
+			return;
+		}
+
+		for (s32 v = 0; v < m->numvertices; v++) {
+			const u8 *bone = &m->bones[v * 4];
+
+			if (bone[0] == (u8)m->rotormtx && bone[3] <= 1) {
+				sum[0] += m->bindpos[v * 3 + 0];
+				sum[1] += m->bindpos[v * 3 + 1];
+				sum[2] += m->bindpos[v * 3 + 2];
+				count++;
+			}
+		}
+
+		if (count == 0) {
+			return;
+		}
+
+		for (s32 j = 0; j < 3; j++) {
+			m->rotorcentre[j] = (f32)(sum[j] / count);
+		}
+
+		m->rotorstate = 1;
+		sysLogPrintf(LOG_NOTE, "xblamesh: the hudpiece's rotor (matrix %d, %d vertices) turns about "
+				"its own centre (%.2f %.2f %.2f)", m->rotormtx, count,
+				m->rotorcentre[0], m->rotorcentre[1], m->rotorcentre[2]);
+	}
+
+	if (i != m->rotormtx || posable <= 0 || m->rotormtx >= posable) {
+		return;
+	}
+
+	{
+		Mtxf root;
+		struct coord c = { m->rotorcentre[0], m->rotorcentre[1], m->rotorcentre[2] };
+		struct coord want;
+		struct coord got;
+
+		mtx4MultMtx4(&model->matrices[0], &m->invbind[0], &root);
+		mtx4TransformVec(&root, &c, &want);
+		mtx4TransformVec(mtx, &c, &got);
+
+		mtx->m[3][0] += want.x - got.x;
+		mtx->m[3][1] += want.y - got.y;
+		mtx->m[3][2] += want.z - got.z;
+	}
+}
+
+static s32 xblaMeshPoseMatrices(struct xblameshbuilt *m, struct model *model, Mtxf *invroot,
+		const f32 *headshift, Mtxf *pal, Mtxf *lin)
+{
+	s32 posable;
+	const s32 disp = lin != NULL;
+
+	posable = m->nummatrices;
+
+	if (posable > model->definition->nummatrices) {
+		posable = model->definition->nummatrices;
+	}
+
+	for (s32 i = 0; i < m->nummatrices; i++) {
+		Mtxf step;
+
+		// An entry the model has no matrix for follows the first entry, so the
+		// part of the mesh weighted to it stays rigidly attached to the bone
+		// that does have one rather than being left behind in the mesh's own
+		// space. Every head mesh has three entries against the one matrix a
+		// head model file carries, and its neck is weighted to the second: a
+		// head drawn on its own - not grafted onto a body, which is where the
+		// other eighteen matrices come from - would otherwise trail its neck
+		// back to where the body would have been.
+		if (i >= posable) {
+			if (posable > 0) {
+				mtx4Copy(&pal[0], &pal[i]);
+			} else {
+				mtx4LoadIdentity(&pal[i]);
+			}
+
+			if (lin && posable > 0) {
+				mtx4Copy(&lin[0], &lin[i]);
+			} else if (lin) {
+				mtx4LoadIdentity(&lin[i]);
+			}
+
+			continue;
+		}
+
+		// A head's second entry is the body's back, not a matrix of its own
+		s32 src = i;
+		Mtxf backbind;
+		Mtxf *bind = &m->invbind[i];
+
+		if (i == 1 && xblaMeshNeckBack(m, model->definition, &src, &backbind)) {
+			bind = &backbind;
+		}
+
+		// Out of the bind pose, into the game's, and then out of the matrix
+		// this list is drawn under - which is what keeps the result small
+		// enough to be the s16 a Perfect Dark vertex holds.
+		if (headshift && (headshift[0] != 0.0f || headshift[1] != 0.0f || headshift[2] != 0.0f)) {
+			// A head seated higher or lower on this body than on its own
+			// (bodyCalculateHeadOffset(), headfit.c) moved its N64 vertices
+			// along its own up; the mesh moves the same way, in the matrix's
+			// frame before it is turned. (And a pool head onto its body's own
+			// neck joint, xblaMeshPoolHeadSeat(), in all three.)
+			Mtxf lifted = model->matrices[src];
+
+			for (s32 j = 0; j < 3; j++) {
+				lifted.m[3][j] += model->matrices[src].m[0][j] * headshift[0]
+					+ model->matrices[src].m[1][j] * headshift[1]
+					+ model->matrices[src].m[2][j] * headshift[2];
+			}
+
+			mtx4MultMtx4(&lifted, bind, &step);
+		} else {
+			mtx4MultMtx4(&model->matrices[src], bind, &step);
+		}
+
+		if (m->beannumhubs) {
+			xblaMeshHubShift(m, model, i, posable, &step);
+		}
+
+		xblaMeshRotorShift(m, model, i, posable, &step);
+
+		mtx4MultMtx4(invroot, &step, &pal[i]);
+
+		// Without the bind, for objDeform()'s offsets, which are in the
+		// bone's own space as the game's lists are
+		if (disp) {
+			mtx4MultMtx4(invroot, &model->matrices[src], &lin[i]);
+		}
+	}
+
+	return posable;
+}
+
+/**
+ * The palette for the GPU to pose the mesh with (G_MESH_EXT): xblaMeshPose()'s
+ * matrices as the renderer takes them, GFXMESH_PALETTE_FLOATS an entry, and the
+ * matrix the lists go under - the bone's own as floats, stage scale and all,
+ * which is what xblaMeshPose() hands over when it divides by one. Not under
+ * the orthogonal projection, for the reason it gives. NULL when the frame
+ * arena has no room, and the mesh is posed on the CPU.
+ */
+static f32 *xblaMeshGpuPalette(struct xblameshbuilt *m, struct model *model, Mtxf *root,
+		const f32 *headshift, Mtxf **outmtx)
+{
+	Mtxf pal[XBLAMESH_MAXMTX];
+	Mtxf invroot;
+	Mtxf *fmtx = NULL;
+	f32 *out;
+
+	*outmtx = NULL;
+
+	if (m->nummatrices > XBLAMESH_MAXMTX || m->nummatrices > GFXMESH_PALETTE_MAX || !model->definition) {
+		return NULL;
+	}
+
+	out = xblaMeshFrameAlloc((u32)m->nummatrices * GFXMESH_PALETTE_FLOATS * sizeof(f32));
+
+	if (!orthogonal) {
+		fmtx = xblaMeshFrameAlloc(sizeof(Mtxf));
+	}
+
+	if (!out || (!orthogonal && !fmtx)) {
+		return NULL;
+	}
+
+	xblaMeshInvert(root, &invroot);
+	xblaMeshPoseMatrices(m, model, &invroot, headshift, pal, NULL);
+
+	for (s32 i = 0; i < m->nummatrices; i++) {
+		f32 *row = &out[i * GFXMESH_PALETTE_FLOATS];
+
+		for (s32 j = 0; j < 3; j++) {
+			row[j * 4 + 0] = pal[i].m[0][j];
+			row[j * 4 + 1] = pal[i].m[1][j];
+			row[j * 4 + 2] = pal[i].m[2][j];
+			row[j * 4 + 3] = pal[i].m[3][j];
+		}
+	}
+
+	if (fmtx) {
+		*fmtx = *root;
+		mtxApplyGfxScale(fmtx);
+	}
+
+	*outmtx = fmtx;
+
+	return out;
+}
+
+/**
+ * Poses one mesh into a copy of its vertices, and hands back the copy.
+ *
+ * Palette entry i is posed by whatever the game has done to the node carrying
+ * part i, so the transform for it is: out of the bind pose (invbind), into the
+ * game's pose for that bone (its matrix), and then back out of the matrix the
+ * list is going to be drawn under, which is the first part's. The last step is
+ * what keeps the vertices small enough to be the s16 a Perfect Dark vertex
+ * holds - they come out in the first part's own space rather than the view's.
+ *
+ * The copy is written **finer than the game's units**, and the matrix it is
+ * drawn under is handed back divided by the same number. See
+ * xblaMeshPoseFineness() for why, and for what picks the number.
+ *
+ * NULL when there is no room this frame, and the caller draws the bind pose.
+ */
+static Vtx *xblaMeshPose(struct xblameshbuilt *m, struct model *model, Mtxf *root,
+		Mtxf **outmtx, s32 *outfine, s32 normals, const f32 *headshift, const f32 *disp)
+{
+	Mtxf pal[XBLAMESH_MAXMTX];
+	Mtxf lin[XBLAMESH_MAXMTX];
+	Mtxf invroot;
+	Vtx *out;
+	Mtxf *fmtx = NULL;
+	f32 *nrm;
+	s32 posable;
+	s32 fine;
+
+	*outmtx = NULL;
+	*outfine = 1;
+
+	if (m->nummatrices > XBLAMESH_MAXMTX || !model->definition) {
+		return NULL;
+	}
+
+	out = xblaMeshFrameAlloc((u32)m->numvertices * sizeof(Vtx));
+
+	if (!out) {
+		return NULL;
+	}
+
+	xblaMeshInvert(root, &invroot);
+
+	// Entry i of the mesh's palette is matrix i of the model, and that is the
+	// whole of the mapping: not the part number, which only looked like it
+	// because a small model has few of both.
+	//
+	// It is checked the way the mesh id was. Take every model that names a
+	// mesh, and for each of its joints compare the offset the model file
+	// states from its parent joint against the offset the palette implies for
+	// the same two entries, turned into the parent's frame. Under this mapping
+	// they agree; under the palette read one, two or three entries along they
+	// do not, and the identity wins for 166 of the 170 models with a palette.
+	// It is the same argument as the mesh id's, on the same kind of evidence.
+	posable = xblaMeshPoseMatrices(m, model, &invroot, headshift, pal, disp ? lin : NULL);
+
+	if (xblaMeshVerbose && !m->posedlog) {
+		m->posedlog = 1;
+		sysLogPrintf(LOG_NOTE, "xblamesh:   %d palette entries, %d posed by the "
+				"model's %d matrices, scale %g", m->nummatrices, posable,
+				model->definition->nummatrices, m->scale);
+
+		// Whether the two rigs are the same rig, which is the thing to look at
+		// when a pose comes out wrong. A bone's distance from the first one is
+		// the same in both if they are, once the game's is taken out of the
+		// matrix's own scale - so every ratio here should be the same number,
+		// and it should be near 1. A bone whose ratio is on its own is one the
+		// release moved; all of them being off by a constant is the header's
+		// scale being read wrong.
+		for (s32 i = 0; i < posable && i < 12; i++) {
+			const Mtxf *g = &model->matrices[i];
+			const f32 *b = &m->invbind[i].m[3][0];
+			const f32 *b0 = &m->invbind[0].m[3][0];
+			f32 mesh = 0.0f;
+			f32 game = 0.0f;
+			f32 mscale;
+
+			// The bind's translation is the bone's position rotated into the
+			// bone's own frame, so a difference of two is only a distance
+			// after each has come back out of its rotation. Distances are
+			// what this needs, so it takes them one at a time.
+			for (s32 j = 0; j < 3; j++) {
+				const f32 mb = -(b[0] * m->invbind[i].m[j][0] +
+						b[1] * m->invbind[i].m[j][1] + b[2] * m->invbind[i].m[j][2]);
+				const f32 mb0 = -(b0[0] * m->invbind[0].m[j][0] +
+						b0[1] * m->invbind[0].m[j][1] + b0[2] * m->invbind[0].m[j][2]);
+				const f32 gd = g->m[3][j] - model->matrices[0].m[3][j];
+
+				mesh += (mb - mb0) * (mb - mb0);
+				game += gd * gd;
+			}
+
+			mesh = sqrtf(mesh);
+			game = sqrtf(game);
+			mscale = sqrtf(g->m[0][0] * g->m[0][0] + g->m[0][1] * g->m[0][1] +
+					g->m[0][2] * g->m[0][2]);
+
+			sysLogPrintf(LOG_NOTE, "xblamesh:     pal %2d  from pal 0: mesh "
+					"%8.2f  game %8.2f  ratio %6.3f", i, mesh,
+					mscale > 1e-6f ? game / mscale : game,
+					mesh > 1e-3f && mscale > 1e-6f ? game / mscale / mesh : 0.0f);
+		}
+	}
+
+	// How finely this pose can be written down, and the matrix that takes the
+	// fineness back out. A mesh whose posed vertices will not fit any finer
+	// than the game's own units gets no copy and no division, and is written
+	// exactly as it was before.
+	//
+	// Not under the orthogonal projection, whose matrices are rewritten into
+	// another space after this has copied one (xblaMeshSetOrthogonal()): a
+	// divided copy of the view-space matrix went under a projection that turns
+	// by the camera again, and every GoldenEye window - bit 0x200 is its glass's
+	// env mapping style, and Perfect Dark's OBJFLAG_ORTHOGONAL - stood as a big
+	// pane of glass well away from its frame (F3 20260922-232054, Dam's towers).
+	// Whole units under the game's own matrix, which the rewrite does carry.
+	fine = orthogonal ? 1 : xblaMeshPoseFineness(m, pal);
+
+	if (fine > 1) {
+		fmtx = xblaMeshFrameAlloc(sizeof(Mtxf));
+
+		if (fmtx) {
+			const f32 inv = 1.0f / fine;
+
+			for (s32 r = 0; r < 3; r++) {
+				for (s32 c = 0; c < 4; c++) {
+					fmtx->m[r][c] = root->m[r][c] * inv;
+				}
+			}
+
+			// The translation is not divided: it is where the whole thing
+			// stands, and the vertices multiplied by `fine` are what the
+			// divided rows are there to bring back to the game's units.
+			for (s32 c = 0; c < 4; c++) {
+				fmtx->m[3][c] = root->m[3][c];
+			}
+
+			// The scale the stage is drawn at, which mtxF2L() folds into
+			// every matrix that goes through it and this copy does not go
+			// through. Villa, Crash Site and Air Base are drawn at a half
+			// (stagetable.c), and without this a posed mesh is built at the
+			// stage's own units while everything round it is at half of
+			// them: the same picture, because the scale is about the eye and
+			// divides out of x and y, and twice as far away in the z buffer,
+			// where a body's legs lose to the floor they stand on and a
+			// ship's hull loses to the sea behind it. Read here rather than
+			// once, because the game puts it back to 1 for the passes it
+			// draws in its own units.
+			mtxApplyGfxScale(fmtx);
+
+			// Not converted to the N64's s15.16, which is what the list reads
+			// a matrix as unless told otherwise: this copy is handed over
+			// with G_MTX_FLOATS and read as the floats it is. It was
+			// converted once (mtxF2L, in place, the way the game converts a
+			// model's own matrices after listing them), and that is what
+			// shook every posed mesh. The game's rows carry the model's
+			// scale, a tenth, so divided by sixteen they are 0.006, and the
+			// s16 fraction's 1/65536 is a quarter of a percent of that -
+			// against vertices written sixteen times larger, up to a tenth
+			// of a unit of error on a gun eighteen units from the eye, three
+			// or four pixels, landing differently each time a row crossed a
+			// step of the fraction. Slow motion showed it as a shake and a
+			// fast one as a blur. A float's fraction is a thousand times
+			// finer, and the error goes with it.
+		} else {
+			// No room for the matrix. The vertices have not been written yet,
+			// so this simply goes back to what it did before rather than
+			// drawing a mesh sixteen times its size.
+			fine = 1;
+		}
+	}
+
+	*outmtx = fmtx;
+	*outfine = fine;
+
+	// A mesh that reflects has its normals posed with it, by the same blend of
+	// the same palette's rotations, and in the same first part's space. Not
+	// rescaled: the reflection normalises them.
+	nrm = normals && m->envgdl
+			? xblaMeshFrameAlloc((u32)m->numvertices * 3 * sizeof(f32)) : NULL;
+	m->posednrm = nrm;
+
+	for (s32 i = 0; i < m->numvertices; i++) {
+		const f32 *pos = &m->bindpos[i * 3];
+		const f32 *weight = &m->weights[i * 3];
+		const u8 *bone = &m->bones[i * 4];
+		const s32 num = bone[3] < 3 ? bone[3] : 3;
+		struct coord in;
+		struct coord moved;
+		f32 x;
+		f32 y;
+		f32 z;
+
+		in.x = pos[0];
+		in.y = pos[1];
+		in.z = pos[2];
+
+		// Only the bones that move this vertex: one of them for 44% of the
+		// release's skinned vertices and two for another 34%, where the file
+		// stores three for all of them and pads out what it does not use with a
+		// repeated bone at no weight. xblaMeshCompactSkin() folded those away
+		// at build time and left the number of real ones in the fourth byte,
+		// clamped to the palette - which is a compare this used to do per
+		// vertex per bone per frame.
+		mtx4TransformVec(&pal[bone[0]], &in, &moved);
+
+		x = moved.x * weight[0];
+		y = moved.y * weight[0];
+		z = moved.z * weight[0];
+
+		for (s32 j = 1; j < num; j++) {
+			mtx4TransformVec(&pal[bone[j]], &in, &moved);
+
+			x += moved.x * weight[j];
+			y += moved.y * weight[j];
+			z += moved.z * weight[j];
+		}
+
+		// A destroyed GoldenEye prop: objDeform()'s crumpling, mirrored
+		// (xblaMeshDeformOffsets()), turned with each bone but not moved
+		if (disp) {
+			const f32 *d = &disp[i * 3];
+
+			for (s32 j = 0; j < num; j++) {
+				const Mtxf *l = &lin[bone[j]];
+
+				x += (l->m[0][0] * d[0] + l->m[1][0] * d[1] + l->m[2][0] * d[2]) * weight[j];
+				y += (l->m[0][1] * d[0] + l->m[1][1] * d[1] + l->m[2][1] * d[2]) * weight[j];
+				z += (l->m[0][2] * d[0] + l->m[1][2] * d[1] + l->m[2][2] * d[2]) * weight[j];
+			}
+		}
+
+		out[i] = m->vertices[i];
+		out[i].x = xblaMeshRound(x * fine);
+		out[i].y = xblaMeshRound(y * fine);
+		out[i].z = xblaMeshRound(z * fine);
+	}
+
+	// The normals, only where the reflection will read them (m->envidx).
+	if (nrm) {
+		for (s32 k = 0; k < m->numenvidx; k++) {
+			const u32 i = m->envidx[k];
+			const f32 *n = &m->normals[i * 3];
+			const f32 *weight = &m->weights[i * 3];
+			const u8 *bone = &m->bones[i * 4];
+			const s32 num = bone[3] < 3 ? bone[3] : 3;
+			f32 ox = 0.0f, oy = 0.0f, oz = 0.0f;
+
+			for (s32 j = 0; j < num; j++) {
+				const Mtxf *p = &pal[bone[j]];
+				const f32 w = weight[j];
+
+				ox += (p->m[0][0] * n[0] + p->m[1][0] * n[1] + p->m[2][0] * n[2]) * w;
+				oy += (p->m[0][1] * n[0] + p->m[1][1] * n[1] + p->m[2][1] * n[2]) * w;
+				oz += (p->m[0][2] * n[0] + p->m[1][2] * n[1] + p->m[2][2] * n[2]) * w;
+			}
+
+			nrm[i * 3] = ox;
+			nrm[i * 3 + 1] = oy;
+			nrm[i * 3 + 2] = oz;
+		}
+	}
+
+	if (xblaMeshVerbose && m->posedlog == 1) {
+		s16 lo[3];
+		s16 hi[3];
+
+		m->posedlog = 2;
+
+		for (s32 j = 0; j < 3; j++) {
+			lo[j] = out[0].v[j];
+			hi[j] = out[0].v[j];
+		}
+
+		for (s32 i = 1; i < m->numvertices; i++) {
+			for (s32 j = 0; j < 3; j++) {
+				if (out[i].v[j] < lo[j]) lo[j] = out[i].v[j];
+				if (out[i].v[j] > hi[j]) hi[j] = out[i].v[j];
+			}
+		}
+
+		sysLogPrintf(LOG_NOTE, "xblamesh:   posed box [%d %d %d]..[%d %d %d], "
+				"written in %ds of a unit",
+				lo[0] / fine, lo[1] / fine, lo[2] / fine,
+				hi[0] / fine, hi[1] / fine, hi[2] / fine, fine);
+	}
+
+	return out;
+}
+
+/* -------------------------------------------------------------------------
+ * Drawing
+ * ------------------------------------------------------------------------- */
+
+/**
+ * What the node is drawing this frame, against what it was authored with.
+ *
+ * The game draws some nodes from a copy of their vertices that it has moved -
+ * a door stretched to fit its frame is the one that matters here - and a mesh
+ * put in the node's place has the authored geometry and none of that. This is
+ * how a mesh that is the right size but the wrong size on screen is told apart
+ * from one that was read wrong.
+ */
+static void xblaMeshLogDrawn(struct model *model, struct modelnode *node, s32 slot)
+{
+	union modelrodata *rodata = node->rodata;
+	union modelrwdata *rwdata;
+	const Vtx *ro;
+	const Vtx *rw;
+	s32 n;
+
+	if ((node->type & 0xff) != MODELNODETYPE_DL || !model) {
+		return;
+	}
+
+	rwdata = modelGetNodeRwData(model, node);
+	ro = rodata->dl.vertices;
+	rw = rwdata ? rwdata->dl.vertices : NULL;
+	n = rodata->dl.numvertices;
+
+	if (!ro || !rw || n <= 0) {
+		return;
+	}
+
+	{
+		s16 alo[3], ahi[3], blo[3], bhi[3];
+
+		for (s32 j = 0; j < 3; j++) {
+			alo[j] = ahi[j] = ro[0].v[j];
+			blo[j] = bhi[j] = rw[0].v[j];
+		}
+
+		for (s32 i = 1; i < n; i++) {
+			for (s32 j = 0; j < 3; j++) {
+				if (ro[i].v[j] < alo[j]) alo[j] = ro[i].v[j];
+				if (ro[i].v[j] > ahi[j]) ahi[j] = ro[i].v[j];
+				if (rw[i].v[j] < blo[j]) blo[j] = rw[i].v[j];
+				if (rw[i].v[j] > bhi[j]) bhi[j] = rw[i].v[j];
+			}
+		}
+
+		sysLogPrintf(LOG_NOTE, "xblamesh: slot %d drawn: authored "
+				"[%d %d %d]..[%d %d %d] drawn [%d %d %d]..[%d %d %d]%s",
+				slot, alo[0], alo[1], alo[2], ahi[0], ahi[1], ahi[2],
+				blo[0], blo[1], blo[2], bhi[0], bhi[1], bhi[2],
+				(alo[0] == blo[0] && ahi[0] == bhi[0] && alo[1] == blo[1] &&
+				 ahi[1] == bhi[1] && alo[2] == blo[2] && ahi[2] == bhi[2])
+						? "" : "  <- the game moved this node's vertices (a door's trim is mirrored on the mesh)");
+	}
+}
+
+/* ---------------------------------------------------------------------------
+ * The door trim
+ *
+ * A sliding door with DOORFLAG_0004 - nearly every one in dataDyne, the G5
+ * Building's, Chicago's shutters, the Cetan's - does not hide inside the
+ * wall as it opens. The game trims it: door0f08cb20() copies the door's
+ * vertices with everything past a plane moved on to the plane, and the plane
+ * walks across the door with its opening fraction (doorGetBbox()), so what is
+ * drawn is only the part still in the doorway. A vertical door is the same
+ * from the top down. The copy is what the node's rwdata points at, and a mesh
+ * drawn in the node's place from its own authored vertices is the whole door,
+ * standing in the wall it was meant to have slid into - which reads as the
+ * door showing through the wall and fighting it for the surface.
+ *
+ * The trim is read back off the game's copy rather than off the door, which
+ * this has no way to reach from a node: the copy's box against the authored
+ * box says which axis was trimmed and where, exactly, since the plane is at a
+ * whole unit and the vertices are s16. The same trim then goes on to a copy
+ * of the mesh for the frame, with the texture coordinates carried along the
+ * gradient xblaMeshNoteTriangle() kept, so the picture stays where it was.
+ * ------------------------------------------------------------------------- */
+
+/**
+ * Whether the game is drawing this node from trimmed vertices, and the trim:
+ * axis 0 is a sliding door, everything at or below ref in x moved to ref;
+ * axis 1 a vertical one, everything at or above ref in y moved to ref.
+ */
+static s32 xblaMeshNodeTrim(struct model *model, struct modelnode *node, s32 *axis, s16 *ref)
+{
+	union modelrodata *rodata = node->rodata;
+	union modelrwdata *rwdata;
+	const Vtx *ro;
+	const Vtx *rw;
+	s16 rominx, rwminx, romaxy, rwmaxy;
+	s32 n;
+
+	if ((node->type & 0xff) != MODELNODETYPE_DL || !model) {
+		return 0;
+	}
+
+	rwdata = modelGetNodeRwData(model, node);
+	ro = rodata->dl.vertices;
+	rw = rwdata ? rwdata->dl.vertices : NULL;
+	n = rodata->dl.numvertices;
+
+	if (!ro || !rw || rw == ro || n <= 0) {
+		return 0;
+	}
+
+	rominx = ro[0].x;
+	rwminx = rw[0].x;
+	romaxy = ro[0].y;
+	rwmaxy = rw[0].y;
+
+	for (s32 i = 1; i < n; i++) {
+		if (ro[i].x < rominx) rominx = ro[i].x;
+		if (rw[i].x < rwminx) rwminx = rw[i].x;
+		if (ro[i].y > romaxy) romaxy = ro[i].y;
+		if (rw[i].y > rwmaxy) rwmaxy = rw[i].y;
+	}
+
+	if (rwminx > rominx) {
+		*axis = 0;
+		*ref = rwminx;
+	} else if (rwmaxy < romaxy) {
+		*axis = 1;
+		*ref = rwmaxy;
+	} else {
+		return 0;
+	}
+
+	// A trim moves vertices along its one axis and onto the line, and nothing
+	// else. objDeform() also hands a node a copy of its vertices, jittered in
+	// all three axes, and read as a trim that pressed a destroyed object into a
+	// sliver at its own edge: a shot camera that "just disappears".
+	for (s32 i = 0; i < n; i++) {
+		if (*axis == 0) {
+			if (rw[i].y != ro[i].y || rw[i].z != ro[i].z || (rw[i].x != ro[i].x && rw[i].x != *ref)) {
+				return 0;
+			}
+		} else {
+			if (rw[i].x != ro[i].x || rw[i].z != ro[i].z || (rw[i].y != ro[i].y && rw[i].y != *ref)) {
+				return 0;
+			}
+		}
+	}
+
+	return 1;
+}
+
+/**
+ * The mesh's vertices with the trim applied, for this frame. The copy lives
+ * in the frame arena like a pose does, and is kept for the model and the
+ * frame so the translucent pass and the other parts find it made.
+ */
+static Vtx *xblaMeshTrimCopy(struct xblameshbuilt *m, const struct model *model,
+		s32 axis, s16 ref)
+{
+	Vtx *out;
+
+	if (m->trimvtx && m->trimmodel == model && m->trimframe == frameCount &&
+			m->trimaxis == axis && m->trimref == ref) {
+		return m->trimvtx;
+	}
+
+	out = xblaMeshFrameAlloc((u32)m->numvertices * sizeof(Vtx));
+
+	if (!out) {
+		return NULL;
+	}
+
+	memcpy(out, m->vertices, (size_t)m->numvertices * sizeof(Vtx));
+
+	for (s32 i = 0; i < m->numvertices; i++) {
+		Vtx *v = &out[i];
+		const f32 *g = &m->grad[i * 4 + axis * 2];
+		f32 d;
+
+		if (axis == 0) {
+			if (v->x > ref) {
+				continue;
+			}
+
+			d = (f32)(ref - v->x);
+			v->x = ref;
+		} else {
+			if (v->y < ref) {
+				continue;
+			}
+
+			d = (f32)(ref - v->y);
+			v->y = ref;
+		}
+
+		v->s = xblaMeshRound((f32)v->s + d * g[0]);
+		v->t = xblaMeshRound((f32)v->t + d * g[1]);
+	}
+
+	m->trimmodel = model;
+	m->trimframe = frameCount;
+	m->trimaxis = axis;
+	m->trimref = ref;
+	m->trimvtx = out;
+
+	return out;
+}
+
+/* ---------------------------------------------------------------------------
+ * Overlap diagnostic (--xbla-mesh-verbose only)
+ *
+ * "The release's model and the game's are both on the screen" is one question:
+ * did any node of this model draw from the mesh this frame while another node
+ * of the same model was left to draw its own geometry? Counted per (model,
+ * slot) and reported at the end of the frame, with the reason the stock draw
+ * was let through, so a report of two models on top of each other names the
+ * model and the branch rather than needing the level it was seen in.
+ * ------------------------------------------------------------------------- */
+#define XBLAMESH_OVERLAPS 64  // (model, slot) pairs watched in one frame
+#define XBLAMESH_OVERLAPSEEN 96 // (slot, reason) pairs reported before it goes quiet
+
+struct xblameshoverlap {
+	const struct model *model;
+	s32 slot;
+	s32 mesh;   // nodes drawn from the release's mesh this frame
+	s32 stock;  // nodes left to the game this frame
+	s32 reason; // why the last of those was left to it
+};
+
+static struct xblameshoverlap overlaps[XBLAMESH_OVERLAPS];
+static s32 numOverlaps;
+
+// One line per (slot, reason), not per frame: an overlap that is there is there
+// every frame the model is on the screen, and 60 copies a second of it says
+// nothing the first did not.
+static s32 seenSlot[XBLAMESH_OVERLAPSEEN];
+static s32 seenReason[XBLAMESH_OVERLAPSEEN];
+static s32 numSeen;
+
+static const char *const xblaMeshOverlapReasons[] = {
+	"?",
+	"the model is not the one the entry was filed under, and no headspot on the way up",
+	"Mod.XblaMeshOnly names another slot",
+	"a toggled piece the mesh has already, on a node that is not grafted",
+	"the mesh would not build",
+	"the translucent pass, where the mesh has no alpha span",
+	"Mod.XblaMeshBoth",
+};
+
+static void xblaMeshNoteDraw(const struct model *model, s32 slot, s32 mesh, s32 reason)
+{
+	struct xblameshoverlap *o = NULL;
+
+	for (s32 i = 0; i < numOverlaps; i++) {
+		if (overlaps[i].model == model && overlaps[i].slot == slot) {
+			o = &overlaps[i];
+			break;
+		}
+	}
+
+	if (!o) {
+		if (numOverlaps >= XBLAMESH_OVERLAPS) {
+			return;
+		}
+
+		o = &overlaps[numOverlaps++];
+		o->model = model;
+		o->slot = slot;
+		o->mesh = 0;
+		o->stock = 0;
+		o->reason = 0;
+	}
+
+	if (mesh) {
+		o->mesh++;
+	} else {
+		o->stock++;
+		o->reason = reason;
+	}
+}
+
+static void xblaMeshReportOverlaps(void)
+{
+	for (s32 i = 0; i < numOverlaps; i++) {
+		const struct xblameshoverlap *o = &overlaps[i];
+		s32 seen = 0;
+
+		if (!o->mesh || !o->stock) {
+			continue;
+		}
+
+		for (s32 j = 0; j < numSeen; j++) {
+			if (seenSlot[j] == o->slot && seenReason[j] == o->reason) {
+				seen = 1;
+				break;
+			}
+		}
+
+		if (seen || numSeen >= XBLAMESH_OVERLAPSEEN) {
+			continue;
+		}
+
+		seenSlot[numSeen] = o->slot;
+		seenReason[numSeen] = o->reason;
+		numSeen++;
+
+		sysLogPrintf(LOG_NOTE, "xblamesh: OVERLAP model %p slot %d: %d nodes drew the "
+				"mesh and %d drew the game's own - %s",
+				o->model, o->slot, o->mesh, o->stock,
+				xblaMeshOverlapReasons[(u32)o->reason < ARRAYCOUNT(xblaMeshOverlapReasons)
+						? o->reason : 0]);
+	}
+
+	numOverlaps = 0;
+}
+
+/**
+ * Whether a node from another model is one this model is drawing.
+ *
+ * Perfect Dark keeps a character's head in a model file of its own and hangs
+ * it off the body at a `HEADSPOT` node: `modelApplyHeadRelations()` makes the
+ * head's root a child of that node and gives the head's top level nodes the
+ * body node as their parent. So a head's display list reaches
+ * `modelRenderNodeDl()` with the *body's* model and the *head's* modeldef, and
+ * the definition check above would throw every head away - which is what used
+ * to leave a release body under an N64 head.
+ *
+ * Walking up to the model's own root through a `HEADSPOT` is what says the
+ * node has been grafted into this tree rather than being a stale address that
+ * happens to hash here, so this replaces the definition check rather than
+ * skipping it. A head is the only thing the game grafts - every `->parent`
+ * the renderer writes is a headspot's - so a walk that reaches the root
+ * without passing one is a node of this model's own tree and no business of
+ * an entry that was filed under another model. The walk is a head's depth
+ * plus the body's, both small; the bound is what stops a parent chain that is
+ * being rewritten from going round for ever.
+ */
+/** Whether the head on a body model was fitted to it rather than made for it (headfit.c). */
+static s32 xblaMeshHeadIsFitted(struct model *model)
+{
+	struct modelnode *spot = model && model->definition ? modelGetPart(model->definition, MODELPART_CHR_HEADSPOT) : NULL;
+	union modelrwdata *rw = spot ? modelGetNodeRwData(model, spot) : NULL;
+
+	return rw && rw->headspot.headmodeldef && headfitWasMeasured(rw->headspot.headmodeldef);
+}
+
+/**
+ * The GoldenEye XBLA row the head grafted on a GoldenEye body is drawn from,
+ * or -1 when it is not drawn as one of the release's meshes. Bean's head
+ * carries its own neck (a body leaves the neck out and a head takes only it),
+ * so the body's N64 neck stub under it is a second neck: flat tan flaps either
+ * side of Bond's HD one (F3 20260924-062727).
+ */
+static s32 xblaMeshHeadBeanRow(struct model *model)
+{
+	struct modelnode *spot = model && model->definition ? modelGetPart(model->definition, MODELPART_CHR_HEADSPOT) : NULL;
+	union modelrwdata *rw = spot ? modelGetNodeRwData(model, spot) : NULL;
+	struct modeldef *head = rw ? rw->headspot.headmodeldef : NULL;
+	struct modelnode *node = head ? head->rootnode : NULL;
+
+	for (s32 walked = 0; node && walked < 256; walked++) {
+		const struct xblameshentry *e = xblaMeshSlotFor(node);
+
+		if (e && e->node == node && e->modeldef == head && !e->suppress
+				&& e->beanrow >= 0 && e->packpart != XBLAMESH_NOPART
+				&& !(e->fileid && modelpackFindN64(e->fileid))
+				&& (xblaMeshGetEnabled() || gebeanRowIsPool(e->beanrow))) {
+			const struct xblameshbuilt *m = xblaMeshBuildBean(e, !xblaMeshGetEnabled());
+
+			return m && e->packpart < m->numgroups && !(m->groupabsent & (1ull << e->packpart))
+				? e->beanrow : -1;
+		}
+
+		if (node->child) {
+			node = node->child;
+		} else {
+			while (node && !node->next) {
+				node = node->parent;
+			}
+
+			node = node ? node->next : NULL;
+		}
+	}
+
+	return -1;
+}
+
+/**
+ * A model definition drawn as one of the release's GoldenEye meshes, measured
+ * round the neck (gebeanmats.seat): a head's rim or a body's collar, the
+ * middle of the directions found, in the model's own units about the neck
+ * joint; and for a head whether it ends at its jaw (GEBEAN_OPENRIM_JAW). For
+ * seating a head of one game on a body of the other (headfit.c), whose
+ * measure of the N64 geometry says nothing about a mesh drawn over it. 0 when
+ * the model is not drawn so in this look, or its mesh has no such ring.
+ */
+s32 xblaMeshBeanSeat(struct modeldef *def, s32 head, f32 *out, s32 *outneckless)
+{
+	return xblaMeshBeanSeatAt(def, head, out, outneckless, 0.5f);
+}
+
+/**
+ * The same, at another point of the directions sorted by height: 0.5 is the
+ * middle, 0.75 a head's rim a quarter of the way down from its highest (the
+ * nape of a neck whose throat reaches further, with one stray hit on the chin
+ * above it left out).
+ */
+s32 xblaMeshBeanSeatAt(struct modeldef *def, s32 head, f32 *out, s32 *outneckless, f32 frac)
+{
+	struct modelnode *node = def ? def->rootnode : NULL;
+
+	for (s32 walked = 0; node && walked < 512; walked++) {
+		const struct xblameshentry *e = xblaMeshSlotFor(node);
+
+		if (e && e->node == node && e->modeldef == def && !e->suppress
+				&& e->beanrow >= 0 && e->packpart != XBLAMESH_NOPART
+				&& (xblaMeshGetEnabled() || gebeanRowIsPool(e->beanrow))) {
+			const struct xblameshbuilt *m = xblaMeshBuildBean(e, !xblaMeshGetEnabled());
+			f32 found[GEBEAN_SEAT_SAMPLES];
+			s32 n = 0;
+
+			if (!m || (m->beanhead != 0) != (head != 0) || !m->beanseathit) {
+				return 0;
+			}
+
+			for (s32 i = 0; i < GEBEAN_SEAT_SAMPLES; i++) {
+				if (m->beanseathit & (1u << i)) {
+					s32 at = n++;
+
+					while (at > 0 && found[at - 1] > m->beanseat[i]) {
+						found[at] = found[at - 1];
+						at--;
+					}
+
+					found[at] = m->beanseat[i];
+				}
+			}
+
+			if (frac == 0.5f) {
+				*out = n & 1 ? found[n / 2] : (found[n / 2 - 1] + found[n / 2]) * 0.5f;
+			} else {
+				s32 at = (s32)(frac * (f32)n);
+
+				*out = found[at < 0 ? 0 : at >= n ? n - 1 : at];
+			}
+
+			if (outneckless) {
+				*outneckless = m->beanopenrim > GEBEAN_OPENRIM_JAW;
+			}
+
+			return 1;
+		}
+
+		if (node->child && (node->type & 0xff) != MODELNODETYPE_HEADSPOT) {
+			node = node->child;
+		} else {
+			while (node && !node->next) {
+				node = node->parent;
+			}
+
+			node = node ? node->next : NULL;
+		}
+	}
+
+	return 0;
+}
+
+/**
+ * Each vertex of the release's mesh for a model, drawn in this look, at rest:
+ * the matrix that moves it most, and where it is in that joint's own frame
+ * (in the first's, `rigid`, for a head's mesh on its own).
+ * For measuring one of Perfect Dark's bodies as the release has it
+ * (headfit.c), whose N64 geometry says nothing about the mesh: the Dinner
+ * Jacket's release mesh has no neck at all where the ROM's has GoldenEye's.
+ * 0 when the model is not drawn so in this look.
+ */
+s32 xblaMeshReleaseRestVertices(struct modeldef *def, s32 rigid, void (*fn)(s32 mtx, const f32 local[3], void *arg), void *arg)
+{
+	struct modelnode *node = def ? def->rootnode : NULL;
+
+	for (s32 walked = 0; node && walked < 512; walked++) {
+		const struct xblameshentry *e = xblaMeshSlotFor(node);
+
+		if (e && e->node == node && e->modeldef == def && e->matched && !e->suppress
+				&& e->beanrow < 0 && xblaMeshEntryLive(e)
+				&& !(e->fileid && modelpackFindN64(e->fileid))) {
+			const struct xblameshbuilt *m = xblaMeshBuild(e->slot);
+
+			if (!m || !m->invbind || !m->bindpos || !m->bones || !m->weights) {
+				return 0;
+			}
+
+			for (s32 i = 0; i < m->numvertices; i++) {
+				const u8 *bone = &m->bones[i * 4];
+				const f32 *weight = &m->weights[i * 3];
+				const s32 num = bone[3] < 3 ? bone[3] : 3;
+				s32 most = 0;
+				struct coord in;
+				struct coord local;
+				f32 p[3];
+
+				for (s32 j = 1; j < num; j++) {
+					if (weight[j] > weight[most]) {
+						most = j;
+					}
+				}
+
+				if (num <= 0 || bone[most] >= m->nummatrices) {
+					continue;
+				}
+
+				in.x = m->bindpos[i * 3];
+				in.y = m->bindpos[i * 3 + 1];
+				in.z = m->bindpos[i * 3 + 2];
+				// A head's mesh has entries past the one matrix its file has,
+				// which the pose puts under the first (xblaMeshPose())
+				mtx4TransformVec(&m->invbind[rigid ? 0 : bone[most]], &in, &local);
+				p[0] = local.x;
+				p[1] = local.y;
+				p[2] = local.z;
+				fn(bone[most], p, arg);
+			}
+
+			return 1;
+		}
+
+		if (node->child && (node->type & 0xff) != MODELNODETYPE_HEADSPOT) {
+			node = node->child;
+		} else {
+			while (node && !node->next) {
+				node = node->parent;
+			}
+
+			node = node ? node->next : NULL;
+		}
+	}
+
+	return 0;
+}
+
+static s32 xblaMeshHeadDrawsBean(struct model *model)
+{
+	return xblaMeshHeadBeanRow(model) >= 0;
+}
+
+/**
+ * The GoldenEye XBLA row a body model's own nodes were filed with, or -1. The
+ * walk stays out of the head grafted at its headspot.
+ */
+static s32 xblaMeshBodyBeanRow(struct model *model)
+{
+	struct modelnode *node = model && model->definition ? model->definition->rootnode : NULL;
+
+	for (s32 walked = 0; node && walked < 512; walked++) {
+		const struct xblameshentry *e = xblaMeshSlotFor(node);
+
+		if (e && e->node == node && e->modeldef == model->definition && !e->suppress && e->beanrow >= 0) {
+			return e->beanrow;
+		}
+
+		if (node->child && (node->type & 0xff) != MODELNODETYPE_HEADSPOT) {
+			node = node->child;
+		} else {
+			while (node && !node->next) {
+				node = node->parent;
+			}
+
+			node = node ? node->next : NULL;
+		}
+	}
+
+	return -1;
+}
+
+/**
+ * How far to move one of the pool's heads along the neck on one of its
+ * bodies. The pool's rows stand on a host's models, whose N64 geometry says
+ * nothing about the mesh, so headfit.c leaves them alone. The body is fitted
+ * onto the host's rig, and the fit carries Bean's neck joint on the back's
+ * fit rather than onto the host's neck joint (gebean.c's beanFitPalette()),
+ * some 13 to 33 units above it: the collar and the body's own neck go with
+ * Bean's joint, while the head is grafted at the host's. GoldenEye hangs any
+ * head on the body's own neck joint, so the head goes there
+ * (gebeanmats.neckshift, .collarshift), a neck of the body's under a head that
+ * ends at its jaw as in GoldenEye (xblaMeshPoolNeckOwn()). The Customize
+ * Character pick and the Combat Simulator's GoldenEye characters: a converted
+ * mission's guards stand on GoldenEye's own N64 bodies and never come here.
+ *
+ * Until 2026-09-28 this lowered the head as far as the widest gap round the
+ * neck between its rim and the collar - which, on a head ending at its jaw,
+ * is the nape, where GoldenEye's gap is the neck: every such head sat with
+ * its chin in the collar and no neck at all (F3 20260928-071022, "head
+ * sitting too low still"; 035938 "mr no neck").
+ */
+#define XBLAMESH_SEAT_MOST 80.0f
+// How far under the middle of a collar a head's open rim may stand and still
+// be a neck reaching into it
+#define XBLAMESH_RIM_CLEAR 5.0f
+
+/** The middle of a body's collar round the neck (gebeanmats.seat). */
+static f32 xblaMeshCollarMiddle(const struct xblameshbuilt *body)
+{
+	f32 found[GEBEAN_SEAT_SAMPLES];
+	s32 n = 0;
+
+	for (s32 i = 0; i < GEBEAN_SEAT_SAMPLES; i++) {
+		if (body->beanseathit & (1u << i)) {
+			s32 at = n++;
+
+			while (at > 0 && found[at - 1] > body->beanseat[i]) {
+				found[at] = found[at - 1];
+				at--;
+			}
+
+			found[at] = body->beanseat[i];
+		}
+	}
+
+	return n > 0 ? found[n / 2] : 0.0f;
+}
+
+static void xblaMeshPoolHeadSeat(const struct xblameshbuilt *head, const struct xblameshentry *he, struct model *model, f32 out[3])
+{
+	struct modelnode *node;
+
+	out[0] = out[1] = out[2] = 0.0f;
+
+	if (!head || !head->frombean || !head->beanhead
+			|| !gebeanRowIsPool(he->beanrow) || !model || !model->definition) {
+		return;
+	}
+
+	node = model->definition->rootnode;
+
+	for (s32 walked = 0; node && walked < 512; walked++) {
+		const struct xblameshentry *e = xblaMeshSlotFor(node);
+
+		if (e && e->node == node && e->modeldef == model->definition && !e->suppress && e->beanrow >= 0) {
+			const struct xblameshbuilt *body;
+
+			if (!gebeanRowIsPool(e->beanrow)) {
+				return;
+			}
+
+			// A head cut off this very body's own neck (a Bond outfit's)
+			// stands where its body pins it at the seam
+			if (head->beanfromchar && gebeanRowKeepsHood(e->beanrow, he->beanrow)) {
+				return;
+			}
+
+			// One of the women, fitted onto Joanna: her head already sits
+			// where GoldenEye's does at the host's joint (the ROM's Sally on
+			// the technician, the release's on the Civilian and the Moonraker
+			// woman); lifted by the fit's neck she stood on a ring of the room
+			if (gebeanRowIsFemale(e->beanrow)) {
+				return;
+			}
+
+			body = xblaMeshBuildBean(e, !xblaMeshGetEnabled());
+
+			if (!body || !body->beanhasneckshift) {
+				return;
+			}
+
+			// Across, onto Bean's own neck joint; up, by as much as the fit
+			// moved the collar against the host's joint (gebeanmats.collarshift,
+			// which is the joint's own lift give or take the fit's stretch)
+			for (s32 k = 0; k < 3; k++) {
+				const f32 v = k == 1 && body->beanhascollarshift ? body->beancollarshift : body->beanneckshift[k];
+
+				out[k] = v > XBLAMESH_SEAT_MOST ? XBLAMESH_SEAT_MOST : v < -XBLAMESH_SEAT_MOST ? -XBLAMESH_SEAT_MOST : v;
+			}
+
+			// A head with a neck of its own (the release's, GEBEAN_OPENRIM_JAW)
+			// goes no higher than keeps its neck's foot in the collar: only a
+			// head ending at the jaw has the body's neck to fill under it
+			// (xblaMeshPoolNeckOwn()), and the release's women, their necks
+			// short, stood on a band of the room (the Civilian, the Moonraker
+			// woman) where they had sat well
+			if (head->beanopenrim > -1e8f && head->beanopenrim <= GEBEAN_OPENRIM_JAW && body->beanseathit) {
+				const f32 most = xblaMeshCollarMiddle(body) - XBLAMESH_RIM_CLEAR - head->beanopenrim;
+
+				if (out[1] > most) {
+					out[1] = most > 0.0f ? most : 0.0f;
+				}
+			}
+
+			return;
+		}
+
+		if (node->child && (node->type & 0xff) != MODELNODETYPE_HEADSPOT) {
+			node = node->child;
+		} else {
+			while (node && !node->next) {
+				node = node->parent;
+			}
+
+			node = node ? node->next : NULL;
+		}
+	}
+
+	return;
+}
+
+static s32 xblaMeshPoolHeadIsSeated(struct model *model);
+
+/**
+ * Whether this pool body draws its own neck (gebeanmats.ownneck) under the
+ * pool head grafted on it, one ending at its jaw: GoldenEye's own
+ * arrangement, the neck the body's and the head only a face, in place of the
+ * collar's filler (which is clamped to the host's N64 neck, for the heads
+ * headfit.c fits). Not under the head cut off this very body's neck, which
+ * its body keeps the hood round.
+ */
+static s32 xblaMeshPoolNeckOwn(struct model *model)
+{
+	struct modelnode *node;
+
+	if (!xblaMeshPoolHeadIsSeated(model)) {
+		return 0;
+	}
+
+	{
+		const s32 bodyrow = xblaMeshBodyBeanRow(model);
+		const s32 headrow = xblaMeshHeadBeanRow(model);
+
+		if (bodyrow >= 0 && headrow >= 0 && gebeanRowKeepsHood(bodyrow, headrow)) {
+			return 0;
+		}
+	}
+
+	node = model->definition->rootnode;
+
+	for (s32 walked = 0; node && walked < 512; walked++) {
+		const struct xblameshentry *e = xblaMeshSlotFor(node);
+
+		if (e && e->node == node && e->modeldef == model->definition && !e->suppress && e->beanrow >= 0) {
+			const struct xblameshbuilt *m = xblaMeshBuildBean(e, !xblaMeshGetEnabled());
+
+			for (s32 k = 0; m && k < 64; k++) {
+				if (m->beanownneck[k] >= 0 && m->beanownneck[k] < m->numgroups
+						&& !(m->groupabsent & (1ull << m->beanownneck[k]))) {
+					return 1;
+				}
+			}
+
+			return 0;
+		}
+
+		if (node->child && (node->type & 0xff) != MODELNODETYPE_HEADSPOT) {
+			node = node->child;
+		} else {
+			while (node && !node->next) {
+				node = node->parent;
+			}
+
+			node = node ? node->next : NULL;
+		}
+	}
+
+	return 0;
+}
+
+/**
+ * Whether a head grafted on this body draws the neck made under it
+ * (gebeanmats.neck): on any body but its own character's, whose own neck is
+ * there, and not on one that takes no head.
+ */
+static s32 xblaMeshHeadNeckWanted(struct model *model)
+{
+	const s32 bodyrow = xblaMeshBodyBeanRow(model);
+	const s32 headrow = xblaMeshHeadBeanRow(model);
+
+	return !(bodyrow >= 0 && headrow >= 0 && gebeanRowKeepsHood(bodyrow, headrow));
+}
+
+/**
+ * Whether the head grafted on this body has a neck made for it, which then
+ * stands in for the body's own neck at the collar (gebeanmats.neckfill).
+ */
+/**
+ * Whether this body draws the bare collar round a head (gebeanmats.bare): the
+ * parka's, whose hood is left out round any head but its own face. Its collar
+ * opens wide and low, where the hood came up, and a foreign head's neck -
+ * one made to stand in a suit's collar - ends short of it: the room showed
+ * through between chin and collar (F3 20260929-051545).
+ */
+static s32 xblaMeshBodyDrawsBare(struct model *model)
+{
+	struct modelnode *node = model && model->definition ? model->definition->rootnode : NULL;
+
+	for (s32 walked = 0; node && walked < 512; walked++) {
+		const struct xblameshentry *e = xblaMeshSlotFor(node);
+
+		if (e && e->node == node && e->modeldef == model->definition && !e->suppress && e->beanrow >= 0) {
+			const struct xblameshbuilt *m = xblaMeshBuildBean(e, !xblaMeshGetEnabled());
+
+			for (s32 k = 0; m && !m->beanhead && k < 64; k++) {
+				if (m->beanbare[k] >= 0 && m->beanbare[k] < m->numgroups
+						&& !(m->groupabsent & (1ull << m->beanbare[k]))) {
+					return 1;
+				}
+			}
+
+			return 0;
+		}
+
+		if (node->child && (node->type & 0xff) != MODELNODETYPE_HEADSPOT) {
+			node = node->child;
+		} else {
+			while (node && !node->next) {
+				node = node->parent;
+			}
+
+			node = node ? node->next : NULL;
+		}
+	}
+
+	return 0;
+}
+
+// How far a body's collar must dip under a head's neck before the made neck
+// fills the gap (xblaMeshHeadTubeOn())
+#define XBLAMESH_COLLAR_GAP 2.0f
+
+/**
+ * Whether this body's collar dips under the foot of the head's own neck
+ * anywhere round it: a head cut off one character's collar, grafted on a
+ * body whose collar is cut lower - Bond's tuxedo head (char/djbond, its neck
+ * ending 62 under the joint in front) on the Russian guard (char/rusguard,
+ * the tunic's open front at 67) - left the throat open onto whatever was
+ * behind, the body's own neck skin being left out under a head file's neck
+ * (F3 20261002-061330, "bond has missing throat textures"). Both rings are
+ * gebeanmats.seat, measured from the neck joint round the same sixteen
+ * directions.
+ */
+static s32 xblaMeshCollarUnderHead(struct model *model, const struct xblameshbuilt *head)
+{
+	struct modelnode *node = model && model->definition ? model->definition->rootnode : NULL;
+
+	if (!head->beanseathit) {
+		return 0;
+	}
+
+	for (s32 walked = 0; node && walked < 512; walked++) {
+		const struct xblameshentry *e = xblaMeshSlotFor(node);
+
+		if (e && e->node == node && e->modeldef == model->definition && !e->suppress && e->beanrow >= 0) {
+			const struct xblameshbuilt *m = xblaMeshBuildBean(e, !xblaMeshGetEnabled());
+
+			for (s32 i = 0; m && !m->beanhead && i < GEBEAN_SEAT_SAMPLES; i++) {
+				if ((m->beanseathit & head->beanseathit & (1u << i))
+						&& m->beanseat[i] < head->beanseat[i] - XBLAMESH_COLLAR_GAP) {
+					return 1;
+				}
+			}
+
+			return 0;
+		}
+
+		if (node->child && (node->type & 0xff) != MODELNODETYPE_HEADSPOT) {
+			node = node->child;
+		} else {
+			while (node && !node->next) {
+				node = node->parent;
+			}
+
+			node = node ? node->next : NULL;
+		}
+	}
+
+	return 0;
+}
+
+/**
+ * Whether a head's made neck (gebeanmats.neck) is drawn on this body: always
+ * under a head ending at its jaw; under a head with a neck of its own only
+ * inside the parka's open collar, which that neck does not reach (on a suit's
+ * collar the tube stood out round it) - and wherever the body's collar is cut
+ * lower than the head's neck (xblaMeshCollarUnderHead()).
+ */
+static s32 xblaMeshHeadTubeOn(struct model *model, const struct xblameshbuilt *head)
+{
+	return head->beanopenrim > GEBEAN_OPENRIM_JAW || xblaMeshBodyDrawsBare(model)
+		|| xblaMeshCollarUnderHead(model, head);
+}
+
+/**
+ * Whether the head grafted on this body is one of the release's head files
+ * whose neck reaches down into the collar on the back (gebean.c's neckback),
+ * which the body's own neck skin below the cut stands out through
+ * (gebeanmats.noskin).
+ */
+static s32 xblaMeshHeadIsNeckBack(struct model *model)
+{
+	struct modelnode *spot = model && model->definition ? modelGetPart(model->definition, MODELPART_CHR_HEADSPOT) : NULL;
+	union modelrwdata *rw = spot ? modelGetNodeRwData(model, spot) : NULL;
+	struct modeldef *head = rw ? rw->headspot.headmodeldef : NULL;
+	struct modelnode *node = head ? head->rootnode : NULL;
+
+	for (s32 walked = 0; node && walked < 256; walked++) {
+		const struct xblameshentry *e = xblaMeshSlotFor(node);
+
+		if (e && e->node == node && e->modeldef == head && !e->suppress && e->beanrow >= 0) {
+			const struct xblameshbuilt *m = xblaMeshBuildBean(e, !xblaMeshGetEnabled());
+
+			return m && m->beanhead && m->beanneckback;
+		}
+
+		if (node->child) {
+			node = node->child;
+		} else {
+			while (node && !node->next) {
+				node = node->parent;
+			}
+
+			node = node ? node->next : NULL;
+		}
+	}
+
+	return 0;
+}
+
+static s32 xblaMeshHeadBringsNeck(struct model *model)
+{
+	struct modelnode *spot = model && model->definition ? modelGetPart(model->definition, MODELPART_CHR_HEADSPOT) : NULL;
+	union modelrwdata *rw = spot ? modelGetNodeRwData(model, spot) : NULL;
+	struct modeldef *head = rw ? rw->headspot.headmodeldef : NULL;
+	struct modelnode *node = head ? head->rootnode : NULL;
+
+	if (!xblaMeshHeadNeckWanted(model)) {
+		return 0;
+	}
+
+	for (s32 walked = 0; node && walked < 256; walked++) {
+		const struct xblameshentry *e = xblaMeshSlotFor(node);
+
+		if (e && e->node == node && e->modeldef == head && !e->suppress && e->beanrow >= 0) {
+			const struct xblameshbuilt *m = xblaMeshBuildBean(e, !xblaMeshGetEnabled());
+
+			if (m && m->beanhead && e->packpart < 64 && m->beanneckof[e->packpart] >= 0
+					&& xblaMeshHeadTubeOn(model, m)) {
+				return 1;
+			}
+		}
+
+		if (node->child) {
+			node = node->child;
+		} else {
+			while (node && !node->next) {
+				node = node->parent;
+			}
+
+			node = node ? node->next : NULL;
+		}
+	}
+
+	return 0;
+}
+
+
+/** The pool body's own mesh, built, or NULL (a body of any other kind). */
+static const struct xblameshbuilt *xblaMeshBodyBuilt(struct model *model)
+{
+	struct modelnode *node = model && model->definition ? model->definition->rootnode : NULL;
+
+	for (s32 walked = 0; node && walked < 512; walked++) {
+		const struct xblameshentry *e = xblaMeshSlotFor(node);
+
+		if (e && e->node == node && e->modeldef == model->definition && !e->suppress && e->beanrow >= 0) {
+			return gebeanRowIsPool(e->beanrow) ? xblaMeshBuildBean(e, !xblaMeshGetEnabled()) : NULL;
+		}
+
+		if (node->child && (node->type & 0xff) != MODELNODETYPE_HEADSPOT) {
+			node = node->child;
+		} else {
+			while (node && !node->next) {
+				node = node->parent;
+			}
+
+			node = node ? node->next : NULL;
+		}
+	}
+
+	return NULL;
+}
+
+/**
+ * Whether the pool head on a pool body has no neck reaching into its collar:
+ * its open rim (gebeanmats.openrim), where xblaMeshPoolHeadSeat() seats it,
+ * stands over the middle of the collar. Every N64-look head ends at its jaw,
+ * and some of the release's women's; the body's own neck fills the collar
+ * under such a head (gebeanmats.ownneck, else .neckfill), as it does under a
+ * head headfit.c fitted. With nothing there, looking down into the collar
+ * past the chin showed the room behind it (F3 20260928-040029, a dark ring
+ * round the scientist's neck).
+ */
+static s32 xblaMeshPoolHeadIsSeated(struct model *model)
+{
+	// Only one of the pool's bodies: the walk below is for a head grafted on one
+	struct modelnode *spot = xblaMeshBodyBuilt(model) ? modelGetPart(model->definition, MODELPART_CHR_HEADSPOT) : NULL;
+	union modelrwdata *rw = spot ? modelGetNodeRwData(model, spot) : NULL;
+	struct modeldef *head = rw ? rw->headspot.headmodeldef : NULL;
+	struct modelnode *node = head ? head->rootnode : NULL;
+
+	for (s32 walked = 0; node && walked < 256; walked++) {
+		const struct xblameshentry *e = xblaMeshSlotFor(node);
+
+		if (e && e->node == node && e->modeldef == head && !e->suppress && e->beanrow >= 0) {
+			const struct xblameshbuilt *m = gebeanRowIsPool(e->beanrow) ? xblaMeshBuildBean(e, !xblaMeshGetEnabled()) : NULL;
+
+			const struct xblameshbuilt *body = xblaMeshBodyBuilt(model);
+			f32 shift[3];
+
+			if (!m || !m->beanhead || !body || !body->beanseathit || m->beanopenrim < -1e8f) {
+				return 0;
+			}
+
+			// Whether its open rim, where the fit seats it (xblaMeshPoolHeadSeat()),
+			// stands clear of the middle of the collar: a head ending at its jaw
+			// (every N64-look head, and some of the release's women's), whose
+			// neck is the body's
+			xblaMeshPoolHeadSeat(m, e, model, shift);
+
+			// A head with a neck of its own (GEBEAN_OPENRIM_JAW) against the
+			// collar's front, where a coat opens lowest round a throat: the
+			// technician's HD Sally, whose neck is short of her V
+			if (m->beanopenrim <= GEBEAN_OPENRIM_JAW) {
+				return (body->beanseathit & 1) && m->beanopenrim + shift[1] > body->beanseat[0] - XBLAMESH_RIM_CLEAR;
+			}
+
+			return m->beanopenrim + shift[1] > xblaMeshCollarMiddle(body) - XBLAMESH_RIM_CLEAR;
+		}
+
+		if (node->child) {
+			node = node->child;
+		} else {
+			while (node && !node->next) {
+				node = node->parent;
+			}
+
+			node = node ? node->next : NULL;
+		}
+	}
+
+	return 0;
+}
+
+static s32 xblaMeshNodeIsGrafted(const struct model *model, const struct modelnode *node)
+{
+	const struct modelnode *root = model->definition->rootnode;
+	s32 crossed = 0;
+
+	for (s32 i = 0; node && i < XBLAMESH_PARENTSCAN; i++) {
+		if (node == root) {
+			return crossed;
+		}
+
+		if ((node->type & 0xff) == MODELNODETYPE_HEADSPOT) {
+			crossed = 1;
+		}
+
+		node = node->parent;
+	}
+
+	return 0;
+}
+
+/**
+ * Whether node is a head grafted into model's tree, and the one this entry was
+ * made for: the headspot crossed on the way up names the head attached there
+ * (modelAttachHead()). An entry outlives its model file - it is dropped when a
+ * file next loads at that definition's address (xblaMeshForgetModel()), not
+ * when the file is freed - so once Customize Character has swapped heads a few
+ * times, a new head's node can land on a freed one's address and find that
+ * head's entry. Grafted was enough to draw it, and the bruise map of the
+ * freed head walked parent pointers through what the new file had written
+ * over its nodes (crash report 20260930-024826, modelGetNodeRwData() from
+ * xblaMeshBruiseColours() under menuRenderModel()).
+ */
+static s32 xblaMeshNodeIsGraftedFrom(struct model *model, const struct modelnode *node,
+		const struct modeldef *modeldef)
+{
+	const struct modelnode *root = model->definition->rootnode;
+	struct modelnode *headspot = NULL;
+
+	for (s32 i = 0; node && i < XBLAMESH_PARENTSCAN; i++) {
+		if (node == root) {
+			break;
+		}
+
+		if ((node->type & 0xff) == MODELNODETYPE_HEADSPOT && !headspot) {
+			headspot = (struct modelnode *)node;
+		}
+
+		node = node->parent;
+	}
+
+	if (node != root || !headspot || !model->rwdatas) {
+		return 0;
+	}
+
+	{
+		const struct modelrwdata_headspot *rw = modelGetNodeRwData(model, headspot);
+
+		return rw && rw->headmodeldef == modeldef;
+	}
+}
+
+/* -------------------------------------------------------------------------
+ * Bruises: the game's, carried over to the release's mesh
+ * ------------------------------------------------------------------------- */
+
+/** The colour table a stock list node starts with - what a bruise copies away from. */
+static const Col *xblaMeshStockColours(const struct modelnode *node)
+{
+	const struct modelrodata_dl *ro = &node->rodata->dl;
+
+	return (const Col *)ALIGN8((uintptr_t)ro->vertices + ro->numvertices * sizeof(Vtx));
+}
+
+/**
+ * The next node of one model's own tree, depth first, never crossing a
+ * headspot: a body's walk does not go down into the head grafted on it, and a
+ * head's walk does not climb out into the body it is grafted on - its top
+ * nodes' parent is that body's headspot, which the renderer sets.
+ */
+static struct modelnode *xblaMeshOwnNext(struct modelnode *node)
+{
+	if (node->child && (node->type & 0xff) != MODELNODETYPE_HEADSPOT) {
+		return node->child;
+	}
+
+	while (node) {
+		if (node->next) {
+			return node->next;
+		}
+
+		if (!node->parent || (node->parent->type & 0xff) == MODELNODETYPE_HEADSPOT) {
+			return NULL;
+		}
+
+		node = node->parent;
+	}
+
+	return NULL;
+}
+
+/** modelFindNodeByMtxIndex(), asked of one modeldef rather than of a model's root. */
+static struct modelnode *xblaMeshFindMtxNode(const struct modeldef *modeldef, s32 index)
+{
+	struct modelnode *node = modeldef->rootnode;
+
+	for (s32 walked = 0; node && walked < 4096; walked++, node = xblaMeshOwnNext(node)) {
+		const union modelrodata *ro = node->rodata;
+
+		if (!ro) {
+			continue;
+		}
+
+		switch (node->type & 0xff) {
+		case MODELNODETYPE_CHRINFO:
+			if (ro->chrinfo.mtxindex == index) {
+				return node;
+			}
+			break;
+		case MODELNODETYPE_POSITION:
+			if (ro->position.mtxindexes[0] == index || ro->position.mtxindexes[1] == index
+					|| ro->position.mtxindexes[2] == index) {
+				return node;
+			}
+			break;
+		case MODELNODETYPE_POSITIONHELD:
+			if (ro->positionheld.mtxindex == index) {
+				return node;
+			}
+			break;
+		}
+	}
+
+	return NULL;
+}
+
+/**
+ * The stock lists whose colours the mesh takes: the ones it covers, which are
+ * the ones drawn where it is. A far LOD alternative and the hair the mesh has
+ * painted on are not among them.
+ */
+static void xblaMeshBruiseNodes(struct xblameshbruise *br, const struct xblameshbuilt *m,
+		const struct xblameshuse *use)
+{
+	struct modelnode *node = use->modeldef->rootnode;
+	const s32 useidx = (s32)(use - uses);
+
+	br->numnodes = 0;
+
+	for (s32 walked = 0; node && walked < 4096; walked++, node = xblaMeshOwnNext(node)) {
+		const struct xblameshentry *e;
+
+		if ((node->type & 0xff) != MODELNODETYPE_DL || !node->rodata ||
+				!node->rodata->dl.vertices || !node->rodata->dl.numcolours) {
+			continue;
+		}
+
+		e = xblaMeshSlotFor(node);
+
+		if (!e || e->node != node || e->modeldef != use->modeldef) {
+			continue;
+		}
+
+		if (m->frombean) {
+			// A GoldenEye character (xblaMeshBuildBean()): list node p draws
+			// group p, filed on the pack's side (packpart, packuse) rather than
+			// against a release slot. A node with no group keeps its own
+			// geometry, and so its own bruises. A GoldenEye prop's lists give
+			// it objDeform()'s crumpling and blackening the same way: see
+			// scorched in xblaMeshRenderNode().
+			if (e->beanrow < 0 || e->packuse != useidx || e->packpart == XBLAMESH_NOPART ||
+					e->packpart >= m->numgroups || e->packpart >= 64 ||
+					(m->groupabsent & (1ull << e->packpart))) {
+				continue;
+			}
+		} else if (e->slot != use->slot || e->suppress == XBLAMESH_SUPPRESS_HAIR ||
+				!(e->matched || e->suppress == XBLAMESH_SUPPRESS_COVERED)) {
+			continue;
+		}
+
+		if (br->numnodes < XBLAMESH_BRUISENODES) {
+			br->nodes[br->numnodes++] = node;
+		}
+	}
+}
+
+struct xblameshstockvtx {
+	f32 pos[3];
+	s32 index;
+	s32 mtx;
+	u16 node;
+	u16 colour;
+	u16 vtx;
+	u16 base;
+};
+
+static const f32 *xblaMeshRestShift(const struct xblameshbuilt *m, struct xblameshuse *use, s32 slot);
+
+/**
+ * Makes the map: each of the release's vertices to the stock vertices nearest
+ * it, in the rest pose both are authored in.
+ *
+ * The stock side is read the way chrBruise() reads it - a node's lists, a
+ * G_MTX naming the bone its vertices hang off, a G_COL the offset their colour
+ * bytes count from - with the bone's rest position added, so the vertices are
+ * in the model's space as the release's bind positions are. Only the release's
+ * **solid** vertices take a bruise: the cutout span's alpha is its edge, and a
+ * bruise's low shade alpha would push a strand of hair's clear texels opaque.
+ *
+ * Nearest by position alone would let a hand take the bruise of the hip it
+ * hangs beside, so a body's vertex looks only among the stock vertices on its
+ * own bone first - palette entry i is matrix i of the model, the same index a
+ * G_MTX names. A grafted head's palette is the body's while its lists name
+ * the head's matrices, so a head matches by position.
+ *
+ * Three references each, weighted by inverse squared distance: close to what
+ * the game's Gouraud does across the stock triangle a release vertex sits in,
+ * without having to find the triangle.
+ */
+static s32 xblaMeshBruiseMap(struct xblameshbruise *br, const struct xblameshbuilt *m,
+		struct model *model, const struct modeldef *modeldef, s32 samebone, s32 slot,
+		const f32 *rigidshift)
+{
+	struct xblameshstockvtx *sv = NULL;
+	struct xblameshstockvtx *sorted = NULL;
+	struct xblameshbruiseref *refs = NULL;
+	s32 *start = NULL;
+	u8 *solid = NULL;
+	s32 numsv = 0;
+	s32 capsv = 0;
+	s32 mapped = 0;
+	const s32 nummtx = modeldef->nummatrices > 0 ? modeldef->nummatrices : 1;
+
+	for (s32 ni = 0; ni < br->numnodes; ni++) {
+		struct modelnode *node = br->nodes[ni];
+		const struct modelrodata_dl *ro = &node->rodata->dl;
+		union modelrwdata *rw = modelGetNodeRwData(model, node);
+		Gfx *lists[2] = { NULL, NULL };
+
+		if (!rw || !rw->dl.gdl) {
+			continue;
+		}
+
+		lists[0] = rw->dl.gdl == ro->opagdl
+			? (Gfx *)((uintptr_t)ro->colours + ((uintptr_t)UNSEGADDR(ro->opagdl) & 0xffffff))
+			: rw->dl.gdl;
+
+		if (ro->xlugdl) {
+			lists[1] = (Gfx *)((uintptr_t)ro->colours + ((uintptr_t)UNSEGADDR(ro->xlugdl) & 0xffffff));
+		}
+
+		for (s32 li = 0; li < 2; li++) {
+			Gfx *gdl = lists[li];
+			// Which bone the vertices hang off, or -1 where that is not known
+			// - they still count, by position alone. Until a G_MTX says
+			// otherwise they sit where the list node does.
+			s32 mtx = -1;
+			f32 rest[3];
+			u32 spac = 0;
+
+			xblaMeshNodeRestOffset(node, rest);
+
+			for (s32 c = 0; gdl && c < 0x10000; c++, gdl++) {
+				const s32 op = (s8)gdl->bytes[GFX_W0_BYTE(0)];
+
+				if (op == G_ENDDL) {
+					break;
+				}
+
+				if (op == G_MTX) {
+					// Asked of this modeldef first, then of the whole model the
+					// way chrBruise() asks it: a grafted head's lists name
+					// matrices no position node of the head's own file carries.
+					const s32 index = (s32)((UNSEGADDR(gdl->words.w1) & 0xffffff) / sizeof(Mtxf));
+					struct modelnode *posnode = xblaMeshFindMtxNode(modeldef, index);
+
+					if (!posnode) {
+						posnode = modelFindNodeByMtxIndex(model, index);
+					}
+
+					if (posnode) {
+						mtx = index;
+						xblaMeshNodeRestOffset(posnode, rest);
+					} else {
+						mtx = -1;
+						xblaMeshNodeRestOffset(node, rest);
+					}
+				} else if (op == G_COL) {
+					spac = (u32)(UNSEGADDR(gdl->words.w1) & 0xffffff);
+				} else if (op == G_VTX) {
+					const u8 *ptr = (u8 *)&gdl->words.w0;
+					const u32 word = (u32)(UNSEGADDR(gdl->words.w1) & 0xffffff);
+					const s32 numverts = (u32)ptr[GFX_W0_BYTE(1)] / 16 + 1;
+
+					for (s32 i = 0; i < numverts; i++) {
+						const u32 vi = word / sizeof(Vtx) + (u32)i;
+						const Vtx *v;
+						u32 ci;
+
+						if (vi >= (u32)ro->numvertices) {
+							break;
+						}
+
+						v = &ro->vertices[vi];
+						ci = spac / sizeof(Col) + ((u32)v->colour >> 2);
+
+						if (ci >= ro->numcolours) {
+							continue;
+						}
+
+						if (numsv >= capsv) {
+							const s32 cap = capsv ? capsv * 2 : 1024;
+							struct xblameshstockvtx *grown = realloc(sv, (size_t)cap * sizeof(*sv));
+
+							if (!grown) {
+								free(sv);
+								return 0;
+							}
+
+							sv = grown;
+							capsv = cap;
+						}
+
+						sv[numsv].pos[0] = v->x + rest[0];
+						sv[numsv].pos[1] = v->y + rest[1];
+						sv[numsv].pos[2] = v->z + rest[2];
+						sv[numsv].index = numsv;
+						sv[numsv].mtx = mtx;
+						sv[numsv].node = (u16)ni;
+						sv[numsv].colour = (u16)ci;
+						sv[numsv].vtx = (u16)vi;
+						sv[numsv].base = (u16)(spac / sizeof(Col));
+						numsv++;
+					}
+				}
+			}
+		}
+	}
+
+	solid = calloc((size_t)m->numvertices, 1);
+	refs = malloc((size_t)m->numvertices * XBLAMESH_BRUISEREFS * sizeof(*refs));
+	start = calloc((size_t)nummtx + 1, sizeof(*start));
+	sorted = numsv ? malloc((size_t)numsv * sizeof(*sorted)) : NULL;
+
+	if (!numsv || !solid || !refs || !start || !sorted) {
+		free(sv);
+		free(sorted);
+		free(start);
+		free(solid);
+		free(refs);
+		return 0;
+	}
+
+	// Which emitted vertices the solid lists load: the G_COLs of each group's
+	// opaque list name them, in this build's own segment.
+	for (s32 g = 0; g < m->numgroups; g++) {
+		const Gfx *gdl = &m->gdl[m->groupgfx[g]];
+
+		for (s32 c = 0; c < 0x100000; c++, gdl++) {
+			const u8 cmd = (u8)(gdl->words.w0 >> 24);
+			const uintptr_t w1 = gdl->words.w1;
+
+			if (cmd == (u8)G_ENDDL) {
+				break;
+			}
+
+			if (cmd == (u8)G_COL && (w1 & 1) && w1 < 0x10000000 &&
+					((w1 >> 24) & 0xff) == SPSEGMENT_MODEL_COL1) {
+				const u32 first = (u32)((UNSEGADDR(w1) & 0xffffff) / sizeof(Col));
+				const u32 count = (u32)((gdl->words.w0 & 0xffff) / 4);
+
+				for (u32 i = first; i < first + count && i < (u32)m->numvertices; i++) {
+					solid[i] = 1;
+				}
+			}
+		}
+	}
+
+	// The stock vertices by bone, so a vertex searches its own bone's run.
+	for (s32 i = 0; i < numsv; i++) {
+		if (sv[i].mtx >= 0 && sv[i].mtx < nummtx) {
+			start[sv[i].mtx + 1]++;
+		}
+	}
+
+	for (s32 i = 0; i < nummtx; i++) {
+		start[i + 1] += start[i];
+	}
+
+	{
+		s32 *at = malloc((size_t)nummtx * sizeof(*at));
+
+		if (!at) {
+			free(sv);
+			free(sorted);
+			free(start);
+			free(solid);
+			free(refs);
+			return 0;
+		}
+
+		memcpy(at, start, (size_t)nummtx * sizeof(*at));
+
+		for (s32 i = 0; i < numsv; i++) {
+			if (sv[i].mtx >= 0 && sv[i].mtx < nummtx) {
+				sorted[at[sv[i].mtx]++] = sv[i];
+			}
+		}
+
+		free(at);
+	}
+
+	// Nearest only means something with both sets in one pose, and a skinned
+	// mesh's bind pose is not the stock rest pose: the release's bodies stand
+	// on the floor with their arms down where the game's rest has its feet
+	// below the origin and its arms out, and a grafted head is authored at neck
+	// height where the stock head sits at its own origin. Matched as they were,
+	// 60 of a Villa guard's 1371 stock body vertices and 8 of its head's 405
+	// were anybody's nearest, 724 and 888 units off, so the vertex a bruise
+	// darkened was nearly never one the mesh read.
+	//
+	// So a body's vertex is skinned into the rest pose - out of the bind pose
+	// through each of its bones' inverse bind, and out to that bone's rest
+	// offset - and a head, whose palette is not the head file's matrices, is
+	// moved by the translation that sits its solid vertices on the stock
+	// head's: centre on centre, then a few steps of each vertex towards its
+	// nearest, leaving out the ones far past the average so that hair or a hat
+	// only one of the two has does not hold it off.
+	f32 *restmtx = NULL;
+	u8 *restok = NULL;
+	f32 headshift[3] = { 0.0f, 0.0f, 0.0f };
+	s32 shifthead = 0;
+	u8 *referenced = calloc((size_t)numsv, 1);
+	f32 *mappos = m->bindpos ? calloc((size_t)m->numvertices * 3, sizeof(f32)) : NULL;
+	f64 nearsum = 0.0;
+	s32 nearcount = 0;
+
+	if (samebone && m->bindpos && m->invbind && m->bones && m->weights) {
+		restmtx = calloc((size_t)nummtx * 3, sizeof(f32));
+		restok = calloc((size_t)nummtx, 1);
+
+		for (s32 b = 0; restmtx && restok && b < nummtx; b++) {
+			struct modelnode *posnode = xblaMeshFindMtxNode(modeldef, b);
+
+			if (posnode) {
+				xblaMeshNodeRestOffset(posnode, &restmtx[b * 3]);
+				restok[b] = 1;
+			}
+		}
+	} else if (!samebone && m->bindpos) {
+		f64 stockcentre[3] = { 0.0, 0.0, 0.0 };
+		f64 meshcentre[3] = { 0.0, 0.0, 0.0 };
+		f32 cutoff = 1e30f;
+		s32 numsolid = 0;
+
+		for (s32 j = 0; j < numsv; j++) {
+			for (s32 a = 0; a < 3; a++) {
+				stockcentre[a] += sv[j].pos[a];
+			}
+		}
+
+		for (s32 i = 0; i < m->numvertices; i++) {
+			if (solid[i]) {
+				for (s32 a = 0; a < 3; a++) {
+					meshcentre[a] += m->bindpos[i * 3 + a];
+				}
+
+				numsolid++;
+			}
+		}
+
+		if (numsolid) {
+			for (s32 a = 0; a < 3; a++) {
+				headshift[a] = (f32)(stockcentre[a] / numsv - meshcentre[a] / numsolid);
+			}
+
+			shifthead = 1;
+		}
+
+		for (s32 step = 0; shifthead && step < 4; step++) {
+			f64 move[3] = { 0.0, 0.0, 0.0 };
+			f64 dist = 0.0;
+			s32 moved = 0;
+			s32 counted = 0;
+
+			for (s32 i = 0; i < m->numvertices; i++) {
+				const f32 q[3] = { m->bindpos[i * 3] + headshift[0], m->bindpos[i * 3 + 1] + headshift[1],
+					m->bindpos[i * 3 + 2] + headshift[2] };
+				f32 best = 1e30f;
+				s32 bestj = 0;
+
+				if (!solid[i]) {
+					continue;
+				}
+
+				for (s32 j = 0; j < numsv; j++) {
+					const f32 dx = sv[j].pos[0] - q[0];
+					const f32 dy = sv[j].pos[1] - q[1];
+					const f32 dz = sv[j].pos[2] - q[2];
+					const f32 d = dx * dx + dy * dy + dz * dz;
+
+					if (d < best) {
+						best = d;
+						bestj = j;
+					}
+				}
+
+				best = sqrtf(best);
+				dist += best;
+				counted++;
+
+				if (best <= cutoff) {
+					for (s32 a = 0; a < 3; a++) {
+						move[a] += sv[bestj].pos[a] - q[a];
+					}
+
+					moved++;
+				}
+			}
+
+			for (s32 a = 0; a < 3 && moved; a++) {
+				headshift[a] += (f32)(move[a] / moved);
+			}
+
+			cutoff = counted ? (f32)(dist / counted) * 2.0f : cutoff;
+		}
+	}
+
+	for (s32 i = 0; i < m->numvertices; i++) {
+		struct xblameshbruiseref *r = &refs[i * XBLAMESH_BRUISEREFS];
+		f32 rigidpos[3];
+		f32 restpos[3];
+		const f32 *p = m->bindpos ? &m->bindpos[i * 3] : rigidpos;
+		const struct xblameshstockvtx *pool = sv;
+		s32 from = 0;
+		s32 to = numsv;
+		f32 bestd[XBLAMESH_BRUISEREFS];
+		s32 besti[XBLAMESH_BRUISEREFS];
+		f32 wsum = 0.0f;
+
+		for (s32 k = 0; k < XBLAMESH_BRUISEREFS; k++) {
+			r[k].node = XBLAMESH_NOPART;
+			bestd[k] = 1e30f;
+			besti[k] = -1;
+		}
+
+		// A skinned mesh maps only what takes a bruise. A rigid one maps every
+		// vertex, since objDeform() moves the whole object, and remembers which
+		// are solid for the colours - and so does a GoldenEye prop, which is
+		// made the way a character is, on one bone.
+		if (!solid[i] && m->bindpos && !(m->frombean && !gebeanRowIsChr(m->beanrow))) {
+			continue;
+		}
+
+		if (!m->bindpos) {
+			rigidpos[0] = m->vertices[i].x + (rigidshift ? rigidshift[0] : 0.0f);
+			rigidpos[1] = m->vertices[i].y + (rigidshift ? rigidshift[1] : 0.0f);
+			rigidpos[2] = m->vertices[i].z + (rigidshift ? rigidshift[2] : 0.0f);
+		}
+
+		if (restmtx && restok) {
+			const u8 *bn = &m->bones[i * 4];
+			const f32 *wt = &m->weights[i * 3];
+			const s32 num = bn[3] < 3 ? bn[3] : 3;
+			f32 acc[3] = { 0.0f, 0.0f, 0.0f };
+			f32 wb = 0.0f;
+
+			for (s32 j = 0; j < num; j++) {
+				const s32 b = bn[j];
+				struct coord in = { p[0], p[1], p[2] };
+				struct coord out;
+
+				if (b >= m->nummatrices || b >= nummtx || !restok[b] || wt[j] <= 0.0f) {
+					continue;
+				}
+
+				mtx4TransformVec(&m->invbind[b], &in, &out);
+				acc[0] += wt[j] * (out.x + restmtx[b * 3]);
+				acc[1] += wt[j] * (out.y + restmtx[b * 3 + 1]);
+				acc[2] += wt[j] * (out.z + restmtx[b * 3 + 2]);
+				wb += wt[j];
+			}
+
+			if (wb > 0.0f) {
+				restpos[0] = acc[0] / wb;
+				restpos[1] = acc[1] / wb;
+				restpos[2] = acc[2] / wb;
+				p = restpos;
+			}
+		} else if (shifthead) {
+			restpos[0] = p[0] + headshift[0];
+			restpos[1] = p[1] + headshift[1];
+			restpos[2] = p[2] + headshift[2];
+			p = restpos;
+		}
+
+		// Where a wound is measured from: see xblaMeshWoundStrength().
+		if (mappos) {
+			mappos[i * 3] = p[0];
+			mappos[i * 3 + 1] = p[1];
+			mappos[i * 3 + 2] = p[2];
+		}
+
+		if (samebone && m->bones && m->weights) {
+			const u8 *bn = &m->bones[i * 4];
+			const f32 *wt = &m->weights[i * 3];
+			s32 pal = bn[0];
+
+			for (s32 j = 1; j < bn[3] && j < 3; j++) {
+				if (wt[j] > wt[0] && wt[j] >= wt[1] && wt[j] >= wt[2]) {
+					pal = bn[j];
+				}
+			}
+
+			if (pal < nummtx && start[pal + 1] > start[pal]) {
+				pool = sorted;
+				from = start[pal];
+				to = start[pal + 1];
+			}
+		}
+
+		for (s32 j = from; j < to; j++) {
+			const f32 dx = pool[j].pos[0] - p[0];
+			const f32 dy = pool[j].pos[1] - p[1];
+			const f32 dz = pool[j].pos[2] - p[2];
+			f32 d = dx * dx + dy * dy + dz * dz;
+			s32 at = j;
+
+			for (s32 k = 0; k < XBLAMESH_BRUISEREFS; k++) {
+				if (d < bestd[k]) {
+					const f32 td = bestd[k];
+					const s32 ti = besti[k];
+
+					bestd[k] = d;
+					besti[k] = at;
+					d = td;
+					at = ti;
+
+					if (at < 0) {
+						break;
+					}
+				}
+			}
+		}
+
+		for (s32 k = 0; k < XBLAMESH_BRUISEREFS; k++) {
+			if (besti[k] >= 0) {
+				wsum += 1.0f / (bestd[k] + 1.0f);
+
+				if (referenced) {
+					referenced[pool[besti[k]].index] = 1;
+				}
+			}
+		}
+
+		if (besti[0] >= 0) {
+			nearsum += sqrtf(bestd[0]);
+			nearcount++;
+		}
+
+		for (s32 k = 0; k < XBLAMESH_BRUISEREFS && wsum > 0.0f; k++) {
+			if (besti[k] >= 0) {
+				r[k].node = pool[besti[k]].node;
+				r[k].colour = pool[besti[k]].colour;
+				r[k].vtx = pool[besti[k]].vtx;
+				r[k].base = pool[besti[k]].base;
+				r[k].weight = (1.0f / (bestd[k] + 1.0f)) / wsum;
+			}
+		}
+
+		if (wsum > 0.0f) {
+			mapped++;
+		}
+	}
+
+	{
+		s32 numreferenced = 0;
+
+		for (s32 j = 0; j < numsv && referenced; j++) {
+			numreferenced += referenced[j];
+		}
+
+		// How much of the stock model a bruise can land on and still be seen,
+		// and how far the pairs are apart: the numbers that say a map is wrong.
+		sysLogPrintf(LOG_NOTE, "xblamesh: slot %d takes the game's bruises: %d of %d vertices "
+				"from %d stock vertices in %d lists, matched %s; %d of the stock vertices are read, "
+				"the nearest %.0f units away on average", slot, mapped, m->numvertices, numsv, br->numnodes,
+				restmtx ? "on each bone in the rest pose" : shifthead ? "by position, moved onto the stock head"
+				: samebone ? "on each bone" : "by position",
+				numreferenced, nearcount ? nearsum / nearcount : 0.0);
+	}
+
+	free(restmtx);
+	free(restok);
+	free(referenced);
+	free(sv);
+	free(sorted);
+	free(start);
+	br->solid = solid;
+	br->mappos = mappos;
+	br->refs = refs;
+
+	return 1;
+}
+
+/** The model's map of stock vertices, made (or remade for a rebuilt mesh) but not yet filled. */
+static struct xblameshbruise *xblaMeshBruiseReady(const struct xblameshbuilt *m, struct xblameshuse *use)
+{
+	struct xblameshbruise *br = use->bruise;
+
+	if (br && (br->gdl != m->gdl || br->numvertices != m->numvertices)) {
+		xblaMeshBruiseFree(use);
+		br = NULL;
+	}
+
+	if (!br) {
+		br = calloc(1, sizeof(*br));
+
+		if (!br) {
+			return NULL;
+		}
+
+		br->gdl = m->gdl;
+		br->numvertices = m->numvertices;
+		xblaMeshBruiseNodes(br, m, use);
+		use->bruise = br;
+	}
+
+	return br;
+}
+
+/**
+ * What takes a rigid mesh's vertices into the model's space, where the stock
+ * side of the map is: nothing for a mesh authored there, its first part's rest
+ * offset for one authored in that part's space. See xblaMeshRestShift().
+ */
+static const f32 *xblaMeshMapShift(const struct xblameshbuilt *m, struct xblameshuse *use, s32 slot)
+{
+	if (m->bindpos) {
+		return NULL;
+	}
+
+	return xblaMeshRestShift(m, use, slot) ? NULL : use->restshift;
+}
+
+/**
+ * The vertices a rigid mesh draws with for one model this frame: its own
+ * (NULL) until the game deforms the model, then a frame-arena copy that
+ * follows.
+ *
+ * A destroyed object is objDeform()'s: every list of the model gets a copy of
+ * its vertices, each pushed up to ten units in every axis and held inside the
+ * list's bounding box, with some of them pointed at a colour entry whose alpha
+ * survives while every other entry's is cleared - the scorched, crumpled prop
+ * the game draws from then on, deformed again at each destroyed level. The
+ * matrix squash along the object's upright axis reaches the mesh by itself;
+ * the rest did not, so the release's prop stayed pristine (or, before the trim
+ * test was made exact, was pressed into a sliver as if it were a door).
+ *
+ * Each vertex takes the displacement of the stock vertices nearest it in the
+ * rest pose, weighted as its colours are (xblaMeshBruiseMap()), and the colours
+ * follow through xblaMeshBruiseColours() from the same map.
+ */
+static f32 *xblaMeshDeformOffsets(struct xblameshbuilt *m, struct model *model,
+		struct xblameshuse *use, s32 slot)
+{
+	const Vtx *nowv[XBLAMESH_BRUISENODES];
+	const Vtx *wasv[XBLAMESH_BRUISENODES];
+	struct xblameshbruise *map;
+	s32 moved = 0;
+	f32 *out;
+
+	if (!model || !model->rwdatas || !m->vertices) {
+		return NULL;
+	}
+
+	if (m->deformoffmodel == model && m->deformoffframe == frameCount) {
+		return m->deformoff;
+	}
+
+	map = xblaMeshBruiseReady(m, use);
+
+	if (!map) {
+		return NULL;
+	}
+
+	m->deformoffmodel = model;
+	m->deformoffframe = frameCount;
+	m->deformoff = NULL;
+
+	for (s32 ni = 0; ni < map->numnodes; ni++) {
+		const union modelrwdata *rw = modelGetNodeRwData(model, map->nodes[ni]);
+
+		wasv[ni] = map->nodes[ni]->rodata->dl.vertices;
+		nowv[ni] = rw && rw->dl.vertices ? rw->dl.vertices : wasv[ni];
+
+		if (nowv[ni] != wasv[ni]) {
+			moved = 1;
+		}
+	}
+
+	if (!moved) {
+		return NULL;
+	}
+
+	// A mesh on bones (a GoldenEye prop) is mapped in the rest pose on its
+	// bones, as its colours are (xblaMeshBruiseColours() with samebone)
+	if (map->state == 0) {
+		map->state = xblaMeshBruiseMap(map, m, model, use->modeldef, m->bindpos != NULL, slot,
+				xblaMeshMapShift(m, use, slot)) ? 1 : -1;
+	}
+
+	if (map->state < 0) {
+		return NULL;
+	}
+
+	out = xblaMeshFrameAlloc((u32)m->numvertices * 3 * sizeof(f32));
+
+	if (!out) {
+		return NULL;
+	}
+
+	for (s32 i = 0; i < m->numvertices; i++) {
+		const struct xblameshbruiseref *r = &map->refs[i * XBLAMESH_BRUISEREFS];
+		f32 *d = &out[i * 3];
+
+		d[0] = d[1] = d[2] = 0.0f;
+
+		for (s32 k = 0; k < XBLAMESH_BRUISEREFS && r[k].node != XBLAMESH_NOPART; k++) {
+			const Vtx *now = &nowv[r[k].node][r[k].vtx];
+			const Vtx *was = &wasv[r[k].node][r[k].vtx];
+
+			d[0] += r[k].weight * (now->x - was->x);
+			d[1] += r[k].weight * (now->y - was->y);
+			d[2] += r[k].weight * (now->z - was->z);
+		}
+	}
+
+	m->deformoff = out;
+
+	return out;
+}
+
+static Vtx *xblaMeshDeformVertices(struct xblameshbuilt *m, struct model *model,
+		struct xblameshuse *use, s32 slot)
+{
+	const f32 *off;
+	Vtx *out;
+
+	if (!model || m->bindpos || !m->vertices) {
+		return NULL;
+	}
+
+	if (m->deformmodel == model && m->deformframe == frameCount) {
+		return m->deformvtx;
+	}
+
+	m->deformmodel = model;
+	m->deformframe = frameCount;
+	m->deformvtx = NULL;
+
+	off = xblaMeshDeformOffsets(m, model, use, slot);
+
+	if (!off) {
+		return NULL;
+	}
+
+	out = xblaMeshFrameAlloc((u32)m->numvertices * sizeof(Vtx));
+
+	if (!out) {
+		return NULL;
+	}
+
+	memcpy(out, m->vertices, (size_t)m->numvertices * sizeof(Vtx));
+
+	for (s32 i = 0; i < m->numvertices; i++) {
+		out[i].x = xblaMeshRound(out[i].x + off[i * 3]);
+		out[i].y = xblaMeshRound(out[i].y + off[i * 3 + 1]);
+		out[i].z = xblaMeshRound(out[i].z + off[i * 3 + 2]);
+	}
+
+	m->deformvtx = out;
+
+	return out;
+}
+
+/**
+ * Wounds: a bullet's bruise drawn where it landed, on the release's vertices.
+ *
+ * The mirror puts a bruise where the game puts it, on the stock vertex nearest
+ * the shot - often 50 to 100 units from the hit on a body of a few hundred
+ * vertices - and spreads it over the release's vertices that read that one,
+ * each blended with two that are clean, so it came out a third as strong and
+ * beside the hole ("too dull ... not very accurate"). So chrBruise() also
+ * notes the hit (xblaMeshNoteBruise()) in the model's rest space, the space
+ * the map already holds every release vertex in (mappos), and the release's
+ * vertices within XBLAMESH_WOUND_RADIUS of it take the bruise's alpha, falling
+ * off to nothing at the edge. The mirror still carries every other change the
+ * game makes to the tables - a burn's darkening - but not their alpha on a
+ * skinned mesh, which is the bullets'.
+ *
+ * The chr combiner multiplies the blood tint by the vertex colour
+ * (G_CC_CUSTOM_18), and the release bakes dark vertex colours where the N64's
+ * are near white, so a wound on a dark shirt came out the colour of the shirt.
+ * A wounded vertex is lifted towards white by how wounded it is, and the
+ * reflection passes are scaled down by the same: blood does not shine, and the
+ * sheen added over a wound washed it back to the cloth.
+ *
+ * The wounds are kept per model and forgotten when the model's stock tables
+ * are clean again - a chr freed and its model handed to another, or the
+ * vertex store taking a corpse's copies back - so they last exactly as long as
+ * the game's own bruises do.
+ */
+// 100 spread one hit over most of a back, and it read as landing somewhere
+// other than the shot (F3 report 20260927-010513); 60 still reads as a wound
+// rather than a dot after three hits (2026-09-27)
+#define XBLAMESH_WOUND_RADIUS 60.0f
+// A grafted head's: a head is about a third the size of a torso, and at the
+// body's radius one hit reddened most of the face (2026-09-26)
+#define XBLAMESH_WOUND_RADIUS_HEAD 40.0f
+#define XBLAMESH_WOUND_TINT_PEAK 96   // 160 read too bright; 40% darker (2026-09-15)
+#define XBLAMESH_WOUNDMODELS  128
+#define XBLAMESH_WOUNDRING    16
+
+struct xblameshwound {
+	f32 pos[3];
+	u8 alpha;   // the bruise's shade alpha, 20 to 70
+	u8 kinds;   // which meshes it lands on: bit 0 the body's, bit 1 a grafted head's
+};
+
+struct xblameshwounds {
+	const struct model *model;
+	u32 frame;                                   // last noted or drawn, so the oldest can go
+	u32 serial;                                  // wounds noted, ever; ring[serial % ring] is next
+	struct xblameshwound ring[XBLAMESH_WOUNDRING];
+	const struct xblameshbuilt *mesh[2];         // the body's mesh, the grafted head's
+	s32 numvertices[2];
+	u32 applied[2];                              // the serial each strength is made up to
+	u8 *strength[2];                             // per vertex, 0 clean to 255 fully wounded
+};
+
+static struct xblameshwounds woundTable[XBLAMESH_WOUNDMODELS];
+static s32 woundsInUse;
+
+static struct xblameshwounds *xblaMeshWoundsFor(const struct model *model, s32 create)
+{
+	struct xblameshwounds *pick = NULL;
+
+	if (!woundsInUse && !create) {
+		return NULL;
+	}
+
+	for (s32 i = 0; i < XBLAMESH_WOUNDMODELS; i++) {
+		if (woundTable[i].model == model) {
+			return &woundTable[i];
+		}
+	}
+
+	if (!create) {
+		return NULL;
+	}
+
+	for (s32 i = 0; i < XBLAMESH_WOUNDMODELS; i++) {
+		if (!woundTable[i].model) {
+			pick = &woundTable[i];
+			break;
+		}
+
+		if (!pick || woundTable[i].frame < pick->frame) {
+			pick = &woundTable[i];
+		}
+	}
+
+	if (pick->model) {
+		free(pick->strength[0]);
+		free(pick->strength[1]);
+		woundsInUse--;
+	}
+
+	memset(pick, 0, sizeof(*pick));
+	pick->model = model;
+	woundsInUse++;
+
+	return pick;
+}
+
+/** The model's stock tables for this mesh are clean: whatever was wounded is gone. */
+static void xblaMeshWoundsForget(const struct model *model, s32 kind)
+{
+	struct xblameshwounds *w = xblaMeshWoundsFor(model, 0);
+
+	if (w && w->strength[kind]) {
+		free(w->strength[kind]);
+		w->strength[kind] = NULL;
+		w->mesh[kind] = NULL;
+		w->applied[kind] = w->serial;
+	}
+}
+
+void xblaMeshNoteBruise(struct model *model, struct modelnode *bboxnode, const struct coord *pos, s32 alpha)
+{
+	struct xblameshwounds *w;
+	struct xblameshwound *wd;
+	struct modelnode *mtxnode;
+	f32 rest[3];
+
+	if (!model || !bboxnode || !pos || (!xblaMeshModelHasMesh(model) && !xblaMeshModelDrawsBean(model))) {
+		return;
+	}
+
+	mtxnode = modelNodeFindMtxNode(bboxnode);
+	w = mtxnode ? xblaMeshWoundsFor(model, 1) : NULL;
+
+	if (!w) {
+		return;
+	}
+
+	// pos is in the part's own frame (chrHit() takes it out of the bbox's
+	// matrix), and the map's rest space is that frame moved out to the part's
+	// rest offset - the same sum the map took for its stock vertices.
+	xblaMeshNodeRestOffset(mtxnode, rest);
+
+	wd = &w->ring[w->serial % XBLAMESH_WOUNDRING];
+	wd->pos[0] = pos->x + rest[0];
+	wd->pos[1] = pos->y + rest[1];
+	wd->pos[2] = pos->z + rest[2];
+	wd->alpha = (u8)(alpha < 0 ? 0 : alpha > 255 ? 255 : alpha);
+	// A grafted head's mesh is matched apart from the body's, and a hit on
+	// the head's own box wounds only that. GoldenEye's bodies carry the head's
+	// box themselves (the converted Cgx bodies' part 8), so a head shot was a
+	// body wound the grafted head never read: that one lands on both, which
+	// share the body's rest space (xblaMeshNodeRestOffset() walks up through
+	// the headspot).
+	if (xblaMeshNodeIsGrafted(model, bboxnode)) {
+		wd->kinds = 2;
+	} else if ((bboxnode->type & 0xff) == MODELNODETYPE_BBOX && bboxnode->rodata
+			&& bboxnode->rodata->bbox.hitpart == HITPART_HEAD) {
+		wd->kinds = 3;
+	} else {
+		wd->kinds = 1;
+	}
+
+	w->serial++;
+	w->frame = frameCount;
+}
+
+/**
+ * How wounded each of the mesh's vertices is on this model, with any wounds
+ * noted since the last draw laid on: 255 minus the bruise's alpha at the
+ * wound, falling off with the square of the distance to nothing at the
+ * radius, and a second wound over the first deepening it. NULL for none.
+ */
+static const u8 *xblaMeshWoundStrength(const struct xblameshbuilt *m, const struct model *model,
+		const struct xblameshbruise *br, s32 kind)
+{
+	struct xblameshwounds *w = xblaMeshWoundsFor(model, 0);
+	const f32 radius = kind ? XBLAMESH_WOUND_RADIUS_HEAD : XBLAMESH_WOUND_RADIUS;
+	const f32 r2 = radius * radius;
+	u32 from;
+
+	if (!w || !br->mappos) {
+		return NULL;
+	}
+
+	w->frame = frameCount;
+
+	if (w->mesh[kind] != m || w->numvertices[kind] != m->numvertices || !w->strength[kind]) {
+		free(w->strength[kind]);
+		w->strength[kind] = calloc((size_t)m->numvertices, 1);
+		w->mesh[kind] = w->strength[kind] ? m : NULL;
+		w->numvertices[kind] = m->numvertices;
+		w->applied[kind] = 0;
+
+		if (!w->strength[kind]) {
+			return NULL;
+		}
+	}
+
+	from = w->applied[kind];
+
+	if (w->serial - from > XBLAMESH_WOUNDRING) {
+		from = w->serial - XBLAMESH_WOUNDRING;
+	}
+
+	for (u32 s = from; s < w->serial; s++) {
+		const struct xblameshwound *wd = &w->ring[s % XBLAMESH_WOUNDRING];
+		const f32 depth = 255.0f - wd->alpha;
+
+		if (!(wd->kinds & (1 << kind))) {
+			continue;
+		}
+
+		for (s32 i = 0; i < m->numvertices; i++) {
+			const f32 *p = &br->mappos[i * 3];
+			const f32 dx = p[0] - wd->pos[0];
+			const f32 dy = p[1] - wd->pos[1];
+			const f32 dz = p[2] - wd->pos[2];
+			const f32 d2 = dx * dx + dy * dy + dz * dz;
+
+			if (d2 < r2 && (!br->solid || br->solid[i])) {
+				const u32 add = (u32)(depth * (1.0f - d2 / r2) + 0.5f);
+				const u32 cur = w->strength[kind][i];
+
+				w->strength[kind][i] = (u8)(255 - (255 - cur) * (255 - add) / 255);
+			}
+		}
+	}
+
+	w->applied[kind] = w->serial;
+
+	return w->strength[kind];
+}
+
+/**
+ * The colours a skinned mesh draws with for one model this frame: its own when
+ * nothing has touched the model's stock tables (NULL, the usual case, a
+ * pointer compare a list), or a frame-arena copy with the game's bruises laid
+ * on. See struct xblameshbruise.
+ */
+static Col *xblaMeshBruiseColours(struct xblameshbuilt *m, struct model *model,
+		struct xblameshuse *use, s32 samebone, s32 slot)
+{
+	const Col *cur[XBLAMESH_BRUISENODES];
+	const Col *stock[XBLAMESH_BRUISENODES];
+	const Vtx *curv[XBLAMESH_BRUISENODES];
+	const Vtx *stockv[XBLAMESH_BRUISENODES];
+	struct xblameshbruise *br;
+	s32 any = 0;
+	Col *out;
+
+	if (!model || !model->rwdatas || !m->colours) {
+		return NULL;
+	}
+
+	if (m->bruisemodel == model && m->bruiseframe == frameCount) {
+		return m->bruisecol;
+	}
+
+	br = xblaMeshBruiseReady(m, use);
+
+	if (!br) {
+		return NULL;
+	}
+
+	m->bruisemodel = model;
+	m->bruiseframe = frameCount;
+	m->bruisecol = NULL;
+	m->bruisewound = NULL;
+
+	for (s32 ni = 0; ni < br->numnodes; ni++) {
+		const union modelrwdata *rw = modelGetNodeRwData(model, br->nodes[ni]);
+
+		stock[ni] = xblaMeshStockColours(br->nodes[ni]);
+		cur[ni] = rw && rw->dl.colours ? rw->dl.colours : stock[ni];
+		stockv[ni] = br->nodes[ni]->rodata->dl.vertices;
+		curv[ni] = rw && rw->dl.vertices ? rw->dl.vertices : stockv[ni];
+
+		if (cur[ni] != stock[ni]) {
+			any = 1;
+		}
+	}
+
+	if (!any) {
+		if (m->bindpos) {
+			xblaMeshWoundsForget(model, samebone ? 0 : 1);
+		}
+
+		return NULL;
+	}
+
+	if (br->state == 0) {
+		br->state = xblaMeshBruiseMap(br, m, model, use->modeldef, samebone, slot,
+				xblaMeshMapShift(m, use, slot)) ? 1 : -1;
+	}
+
+	if (br->state < 0) {
+		return NULL;
+	}
+
+	out = xblaMeshFrameAlloc((u32)m->numvertices * sizeof(Col));
+
+	if (!out) {
+		return NULL;
+	}
+
+	memcpy(out, m->colours, (size_t)m->numvertices * sizeof(Col));
+
+	for (s32 i = 0; i < m->numvertices; i++) {
+		const struct xblameshbruiseref *r = &br->refs[i * XBLAMESH_BRUISEREFS];
+		f32 f[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+		s32 changed = 0;
+
+		if (br->solid && !br->solid[i]) {
+			continue;
+		}
+
+		for (s32 k = 0; k < XBLAMESH_BRUISEREFS && r[k].node != XBLAMESH_NOPART; k++) {
+			// objDeform() points a vertex at another entry as well as clearing
+			// the entries' alpha, so the entry is the one the vertex names now.
+			u32 ci = r[k].colour;
+
+			if (curv[r[k].node] != stockv[r[k].node]) {
+				const u32 now = r[k].base + ((u32)curv[r[k].node][r[k].vtx].colour >> 2);
+
+				if (now < (u32)br->nodes[r[k].node]->rodata->dl.numcolours) {
+					ci = now;
+				}
+			}
+
+			const Col *c = &cur[r[k].node][ci];
+			const Col *o = &stock[r[k].node][r[k].colour];
+			const u8 now[4] = { c->r, c->g, c->b, c->a };
+			const u8 was[4] = { o->r, o->g, o->b, o->a };
+
+			for (s32 ch = 0; ch < 4; ch++) {
+				// What the game did to the entry, as a fraction of what it was:
+				// a bruise writes 20-70 over a 255, a burn darkens the colour.
+				f32 frac = 1.0f;
+
+				if (now[ch] != was[ch]) {
+					changed = 1;
+					frac = was[ch] ? (f32)now[ch] / was[ch] : 1.0f;
+					frac = frac > 1.0f ? 1.0f : frac;
+				}
+
+				f[ch] += r[k].weight * frac;
+			}
+		}
+
+		if (changed) {
+			out[i].r = (u8)(out[i].r * f[0] + 0.5f);
+			out[i].g = (u8)(out[i].g * f[1] + 0.5f);
+			out[i].b = (u8)(out[i].b * f[2] + 0.5f);
+			out[i].a = (u8)(out[i].a * f[3] + 0.5f);
+		}
+	}
+
+	// A skinned mesh's alpha is the wounds', from where the shots landed, not
+	// the mirror's; and the colour under a wound is lifted so the tint shows.
+	if (m->bindpos && br->mappos) {
+		const u8 *strength = xblaMeshWoundStrength(m, model, br, samebone ? 0 : 1);
+
+		for (s32 i = 0; i < m->numvertices; i++) {
+			if (br->solid && !br->solid[i]) {
+				continue;
+			}
+
+			out[i].a = m->colours[i].a;
+
+			if (strength && strength[i]) {
+				const u32 k = strength[i];
+
+				out[i].a = (u8)((out[i].a * (255 - k) + 127) / 255);
+				out[i].r = (u8)(out[i].r + ((255 - out[i].r) * k + 127) / 255);
+				out[i].g = (u8)(out[i].g + ((255 - out[i].g) * k + 127) / 255);
+				out[i].b = (u8)(out[i].b + ((255 - out[i].b) * k + 127) / 255);
+			}
+		}
+
+		m->bruisewound = strength;
+	}
+
+	m->bruisecol = out;
+
+	return out;
+}
+
+/**
+ * Whether the game would draw a translucent list of its own for this node, in
+ * the translucent pass.
+ *
+ * A list node holds two lists and a count that says how the pair is used: 4 is
+ * the one that puts the second list in the translucent pass, and it is the
+ * only one that does. 3 draws it inside the opaque pass, 1 and 2 do not draw
+ * it at all. So this is the question "is there a piece of this node that
+ * belongs in the other pass", asked of the game rather than guessed at, and
+ * the release's own answer - an alpha material in the mesh - is what has to
+ * meet it.
+ */
+static s32 xblaMeshNodeDrawsXlu(const struct modelnode *node)
+{
+	const u32 type = node->type & 0xff;
+
+	if (!node->rodata) {
+		return 0;
+	}
+
+	if (type == MODELNODETYPE_DL) {
+		return node->rodata->dl.mcount == 4 && node->rodata->dl.xlugdl != NULL;
+	}
+
+	if (type == MODELNODETYPE_GUNDL) {
+		return node->rodata->gundl.unk12 == 4 && node->rodata->gundl.xlugdl != NULL;
+	}
+
+	return 0;
+}
+
+/**
+ * The mode word a node's list is drawn under: the mcount of a display list
+ * node, the unk12 of a gun one, which modelRenderNodeDl() and
+ * modelRenderNodeGunDl() switch on to pick the render mode. 1 is untextured
+ * one-cycle, 2 is a pass-through first cycle, 3 and 4 are the fog blend, and
+ * 4 is also the one whose translucent list the game draws in the translucent
+ * pass.
+ */
+static s32 xblaMeshNodeMode(const struct modelnode *node)
+{
+	const u32 type = node->type & 0xff;
+
+	if (!node->rodata) {
+		return 0;
+	}
+
+	if (type == MODELNODETYPE_DL) {
+		return node->rodata->dl.mcount;
+	}
+
+	if (type == MODELNODETYPE_GUNDL) {
+		return node->rodata->gundl.unk12;
+	}
+
+	return 0;
+}
+
+/**
+ * Writes the state the game writes round the node's own list, by the same
+ * functions modelRenderNodeDl() calls - which is where a model's lighting is.
+ *
+ * A Perfect Dark model has no G_LIGHTING: its vertex colours are baked, and
+ * the room reaches it through the render state. For a chr (mode 7) that is a
+ * two-cycle combiner, (texel - env) * shade alpha + env then times shade,
+ * under a G_RM_FOG_PRIM_A blend towards the fog colour, which chrRender() set
+ * to the chr's shade colour - the floor's colour times the room's brightness,
+ * with an alpha that grows as the room darkens, so that a guard in a dark
+ * room is mixed most of the way to a dark colour. Props are the same blend
+ * under G_CC_TRILERP. The mesh's lists used to write a one-cycle
+ * texture-times-shade over all of that, and drew at full brightness in every
+ * room.
+ *
+ * `opa` is the pass: the opaque one takes the switch the game's opaque draw
+ * takes, the translucent one takes what the game's translucent draw of a
+ * mode-4 node takes.
+ */
+static void xblaMeshApplyNodeMode(struct modelrenderdata *renderdata,
+		const struct modelnode *node, s32 opa)
+{
+	if (!opa) {
+		modelApplyRenderModeType4(renderdata, false);
+		return;
+	}
+
+	switch (xblaMeshNodeMode(node)) {
+	case 1:
+		modelApplyRenderModeType1(renderdata);
+		break;
+	case 3:
+		modelApplyRenderModeType3(renderdata, true);
+		break;
+	case 4:
+		modelApplyRenderModeType4(renderdata, true);
+		break;
+	case 2:
+		modelApplyRenderModeType2(renderdata);
+		break;
+	default:
+		modelApplyRenderModeType3(renderdata, true);
+		break;
+	}
+}
+
+/**
+ * A render mode for the mesh's alpha span that keeps the node's first cycle.
+ *
+ * What the game wrote is two-cycle with the fog blend in the first cycle (or
+ * a pass-through, for mode 2; or one-cycle, for mode 1), and the second cycle
+ * is where the surface type goes. A one-cycle pair written over it - the
+ * cutout's TEX_EDGE, the blend's XLU_SURF - puts the surface in cycle one and
+ * the blend towards the shade colour is gone, and the span draws unlit beside
+ * a body that is lit. So the first cycle is kept as the game set it and only
+ * the second is chosen: `cycle2` is the *2 half of a G_RM pair.
+ */
+// 0 draws a skinned mesh's alpha span as a hard cutout again (gdb, to compare):
+// see the soft span in xblaMeshRenderNode()
+s32 g_XblaMeshSoftCutouts = 1;
+
+static void xblaMeshSetSpanMode(struct modelrenderdata *renderdata,
+		const struct modelnode *node, u32 cycle2, u32 onecycle)
+{
+	const s32 mode = xblaMeshNodeMode(node);
+	u32 word;
+
+	if (mode == 1) {
+		word = onecycle | cycle2;
+	} else if (mode == 2) {
+		word = G_RM_PASS | cycle2;
+	} else {
+		word = G_RM_FOG_PRIM_A | cycle2;
+	}
+
+	gDPPipeSync(renderdata->gdl++);
+	gSPSetOtherMode(renderdata->gdl++, G_SETOTHERMODE_L, G_MDSFT_RENDERMODE, 29, word);
+}
+
+// The model whose opaque lists last went out under a float matrix: see
+// xblaMeshTakeFineModel()
+static struct model *fineModel = NULL;
+
+/**
+ * For wallhitRenderPropHits(): whether `model`'s release mesh was just drawn
+ * under a float matrix (a pose written finer than the game's units, or a rest
+ * shift taken off), which the bullet holes on it must be drawn under too.
+ * The game's own matrix reaches the renderer as s15.16, and on a door 80
+ * units away that rounding is more than the decal z mode's two depth units:
+ * a hole laid exactly on a GoldenEye HD door's face lost the depth test to it
+ * outright up close and in patches further out. Cleared by asking.
+ */
+s32 xblaMeshTakeFineModel(struct model *model)
+{
+	const s32 fine = model != NULL && fineModel == model;
+
+	fineModel = NULL;
+
+	return fine;
+}
+
+// While set, every node draws the game's own geometry: see xblaMeshSetBypass().
+static s32 bypass = 0;
+
+// Which of a faded body's two passes is being drawn: see xblaMeshSetDepthPass()
+static s32 depthPass = XBLAMESH_DEPTHPASS_NONE;
+
+void xblaMeshSetDepthPass(s32 pass)
+{
+	depthPass = pass;
+}
+
+void xblaMeshSetBypass(s32 on)
+{
+	bypass = on != 0;
+}
+
+// While non-zero, the opaque pass's render mode: see xblaMeshSetOpaqueMode().
+static u32 opaquecycle2 = 0;
+static u32 opaqueonecycle = 0;
+
+void xblaMeshSetOpaqueMode(u32 cycle2, u32 onecycle)
+{
+	opaquecycle2 = cycle2;
+	opaqueonecycle = onecycle;
+}
+
+void xblaMeshSetOrthogonal(s32 on)
+{
+	orthogonal = on != 0;
+}
+
+// While set, the model whose screens tvscreenRender() has just written: see
+// xblaMeshSetScreens().
+static struct model *screenmodel = NULL;
+
+void xblaMeshSetScreens(struct model *model)
+{
+	screenmodel = model;
+}
+
+/**
+ * Whether a node is one of a monitor's screens - parts 0 to 3, which is where
+ * tvscreenRender() puts a screen - with the list the programme wrote for it
+ * this frame in place of its own.
+ */
+static s32 xblaMeshNodeIsLiveScreen(struct model *model, struct modelnode *node)
+{
+	union modelrwdata *rwdata;
+
+	if (!model || model != screenmodel || !model->definition) {
+		return 0;
+	}
+
+	for (s32 part = MODELPART_0000; part <= MODELPART_0003; part++) {
+		if (modelGetPart(model->definition, part) == node) {
+			rwdata = modelGetNodeRwData(model, node);
+
+			return rwdata && rwdata->dl.gdl && rwdata->dl.gdl != node->rodata->dl.opagdl;
+		}
+	}
+
+	return 0;
+}
+
+/**
+ * Moves the corners of a monitor's screen tvscreenRender() is writing onto
+ * the screen of the model it will be drawn as, when that is Bean's HD model
+ * and its screen is not where GoldenEye's quad is (gebean.c's
+ * beanScreenFit()): Facility's wall console, Silo's banks of four. The
+ * texture coordinates are the programme's and stay; only x, y and z move.
+ * Nothing changes for a model drawn as GoldenEye's own.
+ */
+s32 xblaMeshScreenQuad(struct model *model, struct modelnode *node, Vtx *vertices)
+{
+	struct xblameshentry *e;
+	const struct xblameshbuilt *m;
+	s32 part = -1;
+
+	if (!model || !model->definition || !node || !g_XblaMeshNumNodes || bypass) {
+		return 0;
+	}
+
+	for (s32 p = MODELPART_0000; p <= MODELPART_0003; p++) {
+		if (modelGetPart(model->definition, p) == node) {
+			part = p;
+			break;
+		}
+	}
+
+	if (part < 0) {
+		return 0;
+	}
+
+	// The screen's own node when the mesh has a group for it, else any list
+	// of the model's: Facility's wall console has none for its screen, and
+	// the game draws the programme on its own node beside the mesh
+	e = xblaMeshSlotFor(node);
+
+	if (!e || e->node != node || e->modeldef != model->definition) {
+		struct modelnode *walk = model->definition->rootnode;
+
+		e = NULL;
+
+		for (s32 walked = 0; walk && walked < 512 && !e; walked++) {
+			struct xblameshentry *we = xblaMeshSlotFor(walk);
+
+			if (we && we->node == walk && we->modeldef == model->definition && we->beanrow >= 0
+					&& we->packpart != XBLAMESH_NOPART) {
+				e = we;
+			}
+
+			if (walk->child) {
+				walk = walk->child;
+			} else {
+				while (walk && !walk->next) {
+					walk = walk->parent;
+				}
+
+				walk = walk ? walk->next : NULL;
+			}
+		}
+	}
+
+	// the test xblaMeshRenderNode() draws Bean's model by
+	if (!e || e->suppress
+			|| e->beanrow < 0 || e->packpart == XBLAMESH_NOPART
+			|| (e->fileid && modelpackFindN64(e->fileid))
+			|| (e->matched && xblaMeshEntryLive(e) && opened > 0)
+			|| !gebeanGetEnabled() || !(xblaMeshGetEnabled() || gebeanRowIsPool(e->beanrow))) {
+		return 0;
+	}
+
+	m = xblaMeshBuildBean(e, !xblaMeshGetEnabled());
+
+	if (!m) {
+		return 0;
+	}
+
+	if (m->beanscreenfit & (1 << part)) {
+		for (s32 c = 0; c < 4; c++) {
+			vertices[c].x = (s16)floorf(m->beanscreenquad[part][c][0] + 0.5f);
+			vertices[c].y = (s16)floorf(m->beanscreenquad[part][c][1] + 0.5f);
+			vertices[c].z = (s16)floorf(m->beanscreenquad[part][c][2] + 0.5f);
+		}
+	}
+
+	// on its recess's back, which lies in the same plane (beanScreenFace())
+	return (m->beanscreenrecess & (1 << part)) != 0;
+}
+
+void xblaMeshSetEnvironment(s32 force)
+{
+	envforce = force;
+}
+
+s32 xblaMeshGetReflections(void)
+{
+	return optReflect;
+}
+
+void xblaMeshSetReflections(s32 enabled)
+{
+	optReflect = enabled ? 1 : 0;
+}
+
+s32 xblaMeshGetReflectStyle(void)
+{
+	return optReflectStyle;
+}
+
+void xblaMeshSetReflectStyle(s32 style)
+{
+	optReflectStyle = style == XBLAMESH_REFLECT_N64 || style == XBLAMESH_REFLECT_METAL ? style : XBLAMESH_REFLECT_XBLA;
+}
+
+s32 xblaMeshGetLogoMaterial(void)
+{
+	return optLogoMaterial;
+}
+
+void xblaMeshSetLogoMaterial(s32 on)
+{
+	optLogoMaterial = on ? 1 : 0;
+}
+
+void xblaMeshSetLogoFade(s32 alpha)
+{
+	logoFade = alpha < 0 ? 0 : alpha > 255 ? 255 : alpha;
+}
+
+/**
+ * How much of the reflection the room leaves on this draw, 0 to 255 - and 0
+ * for a draw that takes none at all.
+ *
+ * The reflection pass adds to what the lists drew, and what they drew was
+ * blended towards the node's fog colour by its alpha in the first cycle (see
+ * xblaMeshApplyNodeMode()): a guard in a dark room is most of the way to the
+ * room's dark colour. Blending the whole of texture plus reflection that way
+ * is the list's own result plus the reflection times one minus that alpha, so
+ * that is the reflection's share. Which colour is the fog colour, and whether
+ * there is one, is what modelApplyRenderModeType3() and 4 decide by unk30:
+ * the environment colour's for 4, the fog colour's for 5 and 7, none for the
+ * rest and for nodes of modes 1 and 2. Modes 8 and 9 are the game's cloak and
+ * its shimmer, translucent draws a reflection has no place on. 9 is also every
+ * object's (objRender()), whose primitive alpha is a windowed door's fade or a
+ * tinted pane's opacity; a GoldenEye prop's own reflection (own, the gas
+ * tank's) is drawn on one that has neither.
+ *
+ * A draw without a depth buffer takes none: the pass adds only to the surface
+ * nearest the eye, and without one it would light the back faces too.
+ */
+static s32 xblaMeshEnvironmentLight(const struct modelrenderdata *renderdata,
+		const struct modelnode *node, s32 own, s32 *fading)
+{
+	const s32 mode = xblaMeshNodeMode(node);
+
+	*fading = 0;
+
+	if (!renderdata->zbufferenabled) {
+		return 0;
+	}
+
+	if (mode == 1 || mode == 2) {
+		return 255;
+	}
+
+	switch (renderdata->unk30) {
+	case 4:
+		return 255 - (renderdata->envcolour & 0xff);
+	case 5:
+		*fading = (renderdata->envcolour & 0xff) < 255;
+		return 255 - (renderdata->fogcolour & 0xff);
+	case 7:
+		return 255 - (renderdata->fogcolour & 0xff);
+	case 8:
+		return 0;
+	case 9:
+		return own && (renderdata->envcolour & 0xffff) == 0 ? 255 : 0;
+	default:
+		return 255;
+	}
+}
+
+/**
+ * How much of the reflection is left at the model's distance, 0 to 255, while
+ * the Reflection Cutoff is on - all of it within three quarters of
+ * Mod.XblaReflectDistance, none past it, and a straight fade between, so a
+ * sheen goes rather than pops. A reflection is per vertex, per model, per
+ * frame, and on a gun thirty metres off it is a few pixels: an 80-simulant
+ * match spent a third of its main thread on them.
+ *
+ * Measured from the eye to the mesh's nearest side: the root's translation in
+ * view space less the mesh's reach through the matrix's scale (a skinned
+ * model's rows carry its scale, a tenth). A hundred units is a metre. A zoomed
+ * view brings things nearer by its field of view against the unzoomed 60
+ * degrees; a wider view than that is not taken as further away. The title's
+ * own draws (XBLAMESH_ENV_ON) are never cut.
+ */
+#define XBLAMESH_ENV_UNITS_PER_METRE 100.0f
+
+static s32 xblaMeshEnvironmentReach(const struct xblameshbuilt *m, const Mtxf *root)
+{
+	f32 scale, dist, zoom, far, near;
+
+	if (envforce > 0 || !modIsXblaReflectCutoffOn() || optReflectDistance <= 0) {
+		return 255;
+	}
+
+	scale = sqrtf(root->m[0][0] * root->m[0][0] + root->m[0][1] * root->m[0][1] +
+			root->m[0][2] * root->m[0][2]);
+	dist = sqrtf(root->m[3][0] * root->m[3][0] + root->m[3][1] * root->m[3][1] +
+			root->m[3][2] * root->m[3][2]) - m->envradius * scale;
+
+	zoom = viGetFovY() / 60.0f;
+	zoom = zoom > 1.0f ? 1.0f : zoom < 0.05f ? 0.05f : zoom;
+	dist *= zoom;
+
+	far = optReflectDistance * XBLAMESH_ENV_UNITS_PER_METRE;
+	near = far * 0.75f;
+
+	if (dist <= near) {
+		return 255;
+	}
+
+	if (dist >= far) {
+		return 0;
+	}
+
+	return (s32)(255.0f * (far - dist) / (far - near));
+}
+
+/**
+ * The mesh's vertices with each reflecting vertex's atlas cell in its s and t,
+ * as xblaMeshEnvironmentVertices() writes them into its copy - made once, for
+ * the GPU's reflection pass (G_MESH_EXT), which poses the bind pose there. The
+ * cell does not move with the pose; only a GoldenEye prop's own map's lookup
+ * does (envown), and that is never drawn this way.
+ */
+static Vtx *xblaMeshEnvStatic(struct xblameshbuilt *m)
+{
+	Vtx *vtx;
+
+	if (m->envst || m->numenvcells <= 0 || !m->envidx) {
+		return m->envst;
+	}
+
+	vtx = malloc((size_t)m->numvertices * sizeof(Vtx));
+
+	if (!vtx) {
+		return NULL;
+	}
+
+	memcpy(vtx, m->vertices, (size_t)m->numvertices * sizeof(Vtx));
+
+	for (s32 k = 0; k < m->numenvidx; k++) {
+		const u32 i = m->envidx[k];
+
+		vtx[i].s = xblaMeshRound((m->venv[i * 2] + 0.5f) / m->numenvcells * XBLATEX_TILE_SCALE);
+		vtx[i].t = xblaMeshRound(1.0f / m->numenvcells * XBLATEX_TILE_SCALE);
+	}
+
+	m->envst = vtx;
+
+	return vtx;
+}
+
+/**
+ * xblaMeshEnvironmentVertices() for a draw posed on the GPU: the vertices are
+ * xblaMeshEnvStatic()'s, and the colours carry the amount in their alpha as
+ * that function makes it. A rigid mesh's normal goes in the colour's three
+ * bytes as it always did; a skinned mesh's is the renderer's to pose from the
+ * mesh's own (gfxmesh's normals), so its bytes are left at nothing.
+ */
+static s32 xblaMeshEnvironmentGpu(struct xblameshbuilt *m, const struct model *model, s32 light, s32 sheen,
+		const u8 *wound, Vtx **outVtx, Col **outCol)
+{
+	Vtx *vtx = xblaMeshEnvStatic(m);
+	const u32 matte = m->mattemask ? m->mattemask & xblaMeshMatteActive() : 0;
+	Col *col;
+
+	if (!vtx) {
+		return 0;
+	}
+
+	if (m->envvtx == vtx && m->envposed == NULL && m->envnormals == NULL && m->envmodel == model &&
+			m->envframe == frameCount && m->envlight == light && m->envsheen == sheen && m->envwound == wound) {
+		*outVtx = m->envvtx;
+		*outCol = m->envcol;
+		return 1;
+	}
+
+	col = xblaMeshFrameAlloc((u32)m->numvertices * sizeof(Col));
+
+	if (!col) {
+		return 0;
+	}
+
+	for (s32 k = 0; k < m->numenvidx; k++) {
+		const u32 i = m->envidx[k];
+		const u32 own = xblaMeshVertexAmount(m, i, matte);
+		const u32 share = XBLAMESH_SHEEN_SHARE(own);
+		const u32 amount = !sheen ? own : m->vink ? share * m->vink[i] / 255 : share;
+
+		if (m->bindpos) {
+			col[i].r = col[i].g = col[i].b = 0;
+		} else {
+			const f32 *n = &m->normals[i * 3];
+
+			col[i].r = (u8)(s8)xblaMeshRound(n[0] * 127.0f);
+			col[i].g = (u8)(s8)xblaMeshRound(n[1] * 127.0f);
+			col[i].b = (u8)(s8)xblaMeshRound(n[2] * 127.0f);
+		}
+
+		col[i].a = (u8)((amount * light * (wound ? 255u - wound[i] : 255u) / 255 + 127) / 255);
+	}
+
+	m->envmodel = model;
+	m->envframe = frameCount;
+	m->envposed = NULL;
+	m->envnormals = NULL;
+	m->envlight = light;
+	m->envsheen = sheen;
+	m->envwound = wound;
+	m->envvtx = vtx;
+	m->envcol = col;
+
+	*outVtx = vtx;
+	*outCol = col;
+
+	return 1;
+}
+
+/**
+ * This frame's copy of the mesh's vertices for the reflection pass, whose
+ * reflection the renderer works out per pixel (G_ENVMAP_EXT, gfx_pc.cpp and
+ * gfx_opengl.cpp): each reflecting vertex carries its normal in its colour's
+ * three bytes, as the signed normal an RSP light would read, and the
+ * material's amount times the room's light in its alpha. The renderer puts the
+ * normal and the position through the modelview the list is drawn under, and
+ * the fragment shader reflects the view ray in the interpolated normal and
+ * looks the result up in the atlas (xblaMeshBuildEnvironment()) - so the
+ * sphere map is sampled where each pixel's ray lands, not stretched between
+ * where three vertices' rays landed.
+ *
+ * Which cell of the atlas a vertex reads is in its texture coordinates, the
+ * same for every vertex of a batch: s is the middle of the cell, (cell + 1/2) /
+ * cells, and t one cell's width, 1 / cells. The shader rounds both back to
+ * whole cells, so the coordinate pipeline's rounding and its half-texel filter
+ * offset cannot move a lookup into the cell beside it.
+ *
+ * normals are in the space the vertices are drawn in: the mesh's own for a
+ * rigid mesh, whose file normals are unit length, and the first part's for a
+ * pose, blended and so measured and normalised here before they are rounded
+ * to bytes.
+ *
+ * Kept for the model, the frame and what it was made from, since every part
+ * of a skinned model draws the whole mesh's vertices.
+ */
+static s32 xblaMeshEnvironmentVertices(struct xblameshbuilt *m, const struct model *model,
+		const Vtx *posed, const f32 *normals, const Mtxf *root, s32 light, s32 sheen, const u8 *wound,
+		Vtx **outVtx, Col **outCol)
+{
+	const s32 unitnormals = normals == m->normals;
+	const u32 matte = m->mattemask ? m->mattemask & xblaMeshMatteActive() : 0;
+	Vtx *vtx;
+	Col *col;
+
+	// Not kept for a map of the prop's own, whose lookup is the view's: a
+	// second player's view draws the same model in the same frame
+	if (m->envvtx && !m->envown && m->envmodel == model && m->envframe == frameCount &&
+			m->envposed == posed && m->envnormals == normals && m->envlight == light &&
+			m->envsheen == sheen && m->envwound == wound) {
+		*outVtx = m->envvtx;
+		*outCol = m->envcol;
+		return 1;
+	}
+
+	vtx = xblaMeshFrameAlloc((u32)m->numvertices * sizeof(Vtx));
+	col = xblaMeshFrameAlloc((u32)m->numvertices * sizeof(Col));
+
+	if (!vtx || !col) {
+		return 0;
+	}
+
+	// Only the vertices that reflect (m->envidx). The rest are in batches the
+	// copy does not draw (xblaMeshBuildEnvironment(): a batch is one material),
+	// so their entries are never read and are not written.
+	for (s32 k = 0; k < m->numenvidx; k++) {
+		const u32 i = m->envidx[k];
+		const f32 *n = &normals[i * 3];
+		const u32 own = xblaMeshVertexAmount(m, i, matte);
+		const u32 share = XBLAMESH_SHEEN_SHARE(own);
+		const u32 amount = !sheen ? own : m->vink ? share * m->vink[i] / 255 : share;
+		f32 nx = n[0], ny = n[1], nz = n[2];
+
+		if (!unitnormals) {
+			const f32 len = sqrtf(nx * nx + ny * ny + nz * nz);
+
+			if (len > 1e-6f) {
+				nx /= len;
+				ny /= len;
+				nz /= len;
+			}
+		}
+
+		vtx[i] = posed[i];
+		vtx[i].s = xblaMeshRound((m->venv[i * 2] + 0.5f) / m->numenvcells * XBLATEX_TILE_SCALE);
+		vtx[i].t = xblaMeshRound(1.0f / m->numenvcells * XBLATEX_TILE_SCALE);
+
+		// A GoldenEye prop's own map is looked up by the view-space normal
+		// alone, as its shader does - not by the reflected ray, which near a
+		// tank as tall as the screen reached the landscape round the rim over
+		// the whole of the side facing the eye, where the spot map keeps it
+		// black. Worked out here, a vertex at a time, and drawn without
+		// G_ENVMAP_EXT; the vertex count is small (916 for the tank).
+		if (m->envown && root) {
+			f32 v[3];
+			f32 len;
+
+			for (s32 j = 0; j < 3; j++) {
+				v[j] = nx * root->m[0][j] + ny * root->m[1][j] + nz * root->m[2][j];
+			}
+
+			len = sqrtf(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+
+			if (len > 1e-6f) {
+				v[0] /= len;
+				v[1] /= len;
+			}
+
+			vtx[i].s = xblaMeshRound((m->venv[i * 2] + v[0] * 0.5f + 0.5f) / m->numenvcells * XBLATEX_TILE_SCALE);
+			vtx[i].t = xblaMeshRound((v[1] * 0.5f + 0.5f) * XBLATEX_TILE_SCALE);
+		}
+
+		col[i].r = (u8)(s8)xblaMeshRound(nx * 127.0f);
+		col[i].g = (u8)(s8)xblaMeshRound(ny * 127.0f);
+		col[i].b = (u8)(s8)xblaMeshRound(nz * 127.0f);
+		// Less where the vertex is wounded: see "Wounds".
+		col[i].a = (u8)((amount * light * (wound ? 255u - wound[i] : 255u) / 255 + 127) / 255);
+	}
+
+	m->envmodel = model;
+	m->envframe = frameCount;
+	m->envposed = posed;
+	m->envnormals = normals;
+	m->envlight = light;
+	m->envsheen = sheen;
+	m->envwound = wound;
+	m->envvtx = vtx;
+	m->envcol = col;
+
+	*outVtx = vtx;
+	*outCol = col;
+
+	return 1;
+}
+
+/**
+ * The first part's rest offset, where a rigid mesh has to have it taken off.
+ *
+ * A position node's matrix stands at the node's own rest offset
+ * (modelUpdatePositionNodeMtx() builds it from rodata->pos), and the node's
+ * lists are authored relative to that. The release's rigid meshes are authored
+ * in the model's space instead, rest offset included, so a mesh drawn under
+ * the first part's matrix is one rest offset out wherever that offset is not
+ * zero. Nearly every model's first part sits at the origin, which is why it did
+ * not show; the shell a gun ejects does not - GcartridgeZ's only node is at z
+ * 31.95, its N64 list is centred on it, the release's shell spans z 19..45 -
+ * and casingRender() spins the matrix about the node, so the release's shell
+ * orbited a point three units off its own middle, turning over itself.
+ *
+ * Asked of the geometry rather than assumed: the mesh's box against the stock
+ * lists' box in the model's space and in the first part's, once per model and
+ * mesh. The shift is taken off only where the model's space fits better, so a
+ * mesh authored the other way is drawn exactly as it was.
+ */
+static const f32 *xblaMeshRestShift(const struct xblameshbuilt *m, struct xblameshuse *use, s32 slot)
+{
+	if (use->restfit == 0) {
+		struct modelnode *posnode = NULL;
+		f32 mlo[3] = { 1e30f, 1e30f, 1e30f };
+		f32 mhi[3] = { -1e30f, -1e30f, -1e30f };
+		f32 slo[3] = { 1e30f, 1e30f, 1e30f };
+		f32 shi[3] = { -1e30f, -1e30f, -1e30f };
+		f32 dmodel = 0.0f;
+		f32 dnode = 0.0f;
+		s32 numstock = 0;
+
+		use->restfit = 1;
+		use->restshift[0] = use->restshift[1] = use->restshift[2] = 0.0f;
+
+		if (use->numparts > 0 && use->partmtx[0] >= 0) {
+			posnode = xblaMeshFindMtxNode(use->modeldef, use->partmtx[0]);
+		}
+
+		if (!posnode || m->numvertices <= 0) {
+			return NULL;
+		}
+
+		xblaMeshNodeRestOffset(posnode, use->restshift);
+
+		if (use->restshift[0] * use->restshift[0] + use->restshift[1] * use->restshift[1]
+				+ use->restshift[2] * use->restshift[2] < 0.25f) {
+			return NULL;
+		}
+
+		for (s32 i = 0; i < m->numvertices; i++) {
+			const f32 v[3] = { m->vertices[i].x, m->vertices[i].y, m->vertices[i].z };
+
+			for (s32 j = 0; j < 3; j++) {
+				if (v[j] < mlo[j]) mlo[j] = v[j];
+				if (v[j] > mhi[j]) mhi[j] = v[j];
+			}
+		}
+
+		for (s32 k = 0; k < use->numparts && k < XBLAMESH_MAXPARTS; k++) {
+			const struct modelnode *node = use->parts[k];
+			const Vtx *vertices;
+			s32 numvertices;
+			f32 rest[3];
+
+			if (!node || !node->rodata) {
+				continue;
+			}
+
+			// A gun's list as well as a prop's: the shell is one.
+			if ((node->type & 0xff) == MODELNODETYPE_DL) {
+				vertices = node->rodata->dl.vertices;
+				numvertices = node->rodata->dl.numvertices;
+			} else if ((node->type & 0xff) == MODELNODETYPE_GUNDL) {
+				vertices = node->rodata->gundl.vertices;
+				numvertices = node->rodata->gundl.numvertices;
+			} else {
+				continue;
+			}
+
+			if (!vertices) {
+				continue;
+			}
+
+			xblaMeshNodeRestOffset(node, rest);
+
+			for (s32 i = 0; i < numvertices; i++) {
+				const f32 v[3] = { vertices[i].x + rest[0], vertices[i].y + rest[1],
+						vertices[i].z + rest[2] };
+
+				for (s32 j = 0; j < 3; j++) {
+					if (v[j] < slo[j]) slo[j] = v[j];
+					if (v[j] > shi[j]) shi[j] = v[j];
+				}
+
+				numstock++;
+			}
+		}
+
+		if (numstock == 0) {
+			return NULL;
+		}
+
+		for (s32 j = 0; j < 3; j++) {
+			const f32 cm = (mlo[j] + mhi[j]) * 0.5f;
+			const f32 cs = (slo[j] + shi[j]) * 0.5f;
+
+			dmodel += (cm - cs) * (cm - cs);
+			dnode += (cm - cs + use->restshift[j]) * (cm - cs + use->restshift[j]);
+		}
+
+		if (dmodel < dnode) {
+			use->restfit = 2;
+
+			sysLogPrintf(LOG_NOTE, "xblamesh: slot %d is authored in the model's space; its first "
+					"part's rest offset (%.2f %.2f %.2f) is taken off its matrix", slot,
+					use->restshift[0], use->restshift[1], use->restshift[2]);
+		}
+	}
+
+	return use->restfit == 2 ? use->restshift : NULL;
+}
+
+// How much of a destroyed GoldenEye prop's colours is left (xblaMeshRenderNode())
+#define XBLAMESH_SCORCH 64
+
+s32 xblaMeshRenderNode(struct modelrenderdata *renderdata, struct model *model,
+		struct modelnode *node)
+{
+	struct xblameshentry *e;
+	struct xblameshbuilt *m;
+	struct xblameshuse *use;
+	s32 frompack;
+	s32 havemesh;
+	s32 frombean;
+	Mtxf *finemtx = NULL;
+	s32 fine = 1;
+	Mtxf *root;
+	Mtxf *drawmtx = NULL;
+	Vtx *posed;
+	Gfx *list;
+	Gfx *xlulist = NULL;
+	Gfx *fadelist = NULL;
+	s32 grafted = 0;
+	s32 xlupart = -1;
+	s32 xlucut = 0;
+	s32 fadepart = -1;
+	Vtx *envvtx = NULL;
+	Col *envcol = NULL;
+	s32 envlight = 0;
+	s32 envreach = 0;
+	s32 envfading = 0;
+	f32 *gpupal = NULL;
+	struct gfxmeshdraw *meshdraw = NULL;
+	struct gfxmeshdraw *envdraw = NULL;
+	const s32 opa = (renderdata->flags & MODELRENDERFLAG_OPA) != 0;
+	const s32 xlu = (renderdata->flags & MODELRENDERFLAG_XLU) != 0;
+
+	tintStockNode = NULL;
+
+	if (!node || !g_XblaMeshNumNodes || bypass) {
+		return 0;
+	}
+
+	if (!opa && !xlu) {
+		return 0;
+	}
+
+	e = xblaMeshSlotFor(node);
+
+	if (!e || e->node != node || !e->modeldef) {
+		return 0;
+	}
+
+	// Which of the two the node draws, asked every frame rather than settled
+	// at the model load - which is the whole of what makes a pack live. The
+	// pack's file for one of the game's own models needs no package and no
+	// switch but its own; the release's mesh needs both.
+	//
+	// Where a node has both, Mod.ModelPackPrefer says which: the pack's own
+	// model by default, since somebody who put an OBJ in n64/ meant it, or the
+	// mesh for somebody running the release's art who wants a pack's odd
+	// replacement not to punch an N64 model into the middle of it.
+	frompack = e->packpart != XBLAMESH_NOPART && e->fileid && modelpackFindN64(e->fileid) != NULL;
+	havemesh = e->matched && xblaMeshEntryLive(e) && opened > 0;
+
+	// The preference is the model's, not the node's: a model the release has a
+	// mesh for hands the whole of itself back, including the lists the matcher
+	// left alone, since those would otherwise draw the pack's geometry inside
+	// the mesh.
+	if (frompack && e->packhasmesh && xblaMeshGetEnabled() && opened > 0
+			&& modelpackGetPrefer() == MODELPACK_PREFER_XBLA) {
+		frompack = 0;
+	}
+
+	// A GoldenEye character: a GoldenEye X model, or one of the Combat
+	// Simulator pool's on a Perfect Dark body. Never a stock file, so the
+	// release never has a mesh for it; a pack's file for it still wins, since
+	// somebody put that there. Its look follows the release's meshes, so F6
+	// moves it with everything else: Bean's HD character with them on, and
+	// with them off the N64-look original Bean shipped beside it - except on
+	// GoldenEye X, whose own model is GoldenEye's N64 one and draws itself.
+	//
+	// A GoldenEye gun in the hand is drawn in both looks for the same reason
+	// its pickup is (gebeanRowIsPool()): it stands on a Perfect Dark weapon,
+	// so with the meshes off there is no GoldenEye model underneath to fall
+	// back to - only the PP9i the PP7 is held beside.
+	frombean = !frompack && !havemesh && e->beanrow >= 0 && e->packpart != XBLAMESH_NOPART
+			&& gebeanGetEnabled() && (xblaMeshGetEnabled() || gebeanRowIsPool(e->beanrow)
+				|| gebeanRowIsFirstPerson(e->beanrow));
+
+	if (!frompack && !havemesh && !frombean) {
+		return 0;
+	}
+
+	// Through the X-ray scanner, a model whose insides the scanner shows
+	if (havemesh && !frompack && e->xraystock && g_Vars.currentplayer
+			&& g_Vars.currentplayer->visionmode == VISIONMODE_XRAY) {
+		return 0;
+	}
+
+	// A GoldenEye monitor's screen: the programme it is running, not Bean's
+	// picture. Bean's mesh has the screen as a list of its own with one still
+	// texture on it - a spiral, or a grille under the Community Edition - where
+	// GoldenEye runs the monitor's programme, and on Facility's door consoles
+	// that is the lamp the level's AI turns red or green by its door. The
+	// game's own node draws the list tvscreenRender() wrote, the model's own
+	// quad on the screen's own node, and the mesh's other lists leave the hole
+	// it fills.
+	if (frombean && xblaMeshNodeIsLiveScreen(model, node)) {
+		return 0;
+	}
+
+	// A model file can be loaded twice at once, and a freed one's address can
+	// come back as something else's node. The definition the model is being
+	// drawn from is what says this entry is about this model - except for a
+	// head, which is a model of its own grafted into the body's tree.
+	if (model && model->definition && model->definition != e->modeldef) {
+		if (!xblaMeshNodeIsGraftedFrom(model, node, e->modeldef)) {
+			if (xblaMeshVerbose && !e->suppress) {
+				xblaMeshNoteDraw(model, e->slot, 0, 1);
+			}
+
+			return 0;
+		}
+
+		grafted = 1;
+	}
+
+	if (optOnlySlot && !frompack && !frombean && e->slot != optOnlySlot) {
+		if (xblaMeshVerbose) {
+			xblaMeshNoteDraw(model, e->slot, 0, 2);
+		}
+
+		return 0;
+	}
+
+	// A toggled stock piece the release's mesh carries itself: a head's hair.
+	// Drawing nothing is the whole of it, since the mesh beside it has one
+	// already - and it is only ever a head's, because xblaMeshIsHairList()
+	// files nothing else (it asks for the head skeleton before the hat).
+	//
+	// Whether the head is grafted is not asked here, and it used to be: the
+	// Combat Simulator's Character page, and the Ghost Trials pages made from
+	// it, zoom on a head by loading the head file as a model of its own - no
+	// body, no headspot, `model->definition` *is* the head - and every head
+	// with a hat piece came up there with the N64 hair hanging over the
+	// release's. A chr's head is the same head grafted; both draw the mesh,
+	// so both leave the hair to it. Mod.XblaMeshBoth keeps the hair, that
+	// switch being there to put the two on top of each other.
+	if (!frompack && e->suppress == XBLAMESH_SUPPRESS_HAIR) {
+		if (xblaMeshVerbose && optBoth) {
+			sysLogPrintf(LOG_NOTE, "xblamesh: a toggled piece the mesh has already drew "
+					"the game's own: model %p node %p grafted %d both %d",
+					model, node, grafted, optBoth);
+		}
+
+		return optBoth ? 0 : 1;
+	}
+
+	// A list of a model whose mesh has that geometry already: every list of a
+	// matched model but the one the id was written on, the far LOD
+	// alternatives and the toggled pieces. Drawing it is drawing the N64 model
+	// inside the release's one - fifteen body parts inside every guard.
+	//
+	// It is the mesh being drawn that this depends on, so the mesh is built
+	// here too: one that will not build leaves the model drawing all of its
+	// own geometry rather than most of it drawing nothing at all.
+	if (!frompack && e->suppress == XBLAMESH_SUPPRESS_COVERED) {
+		m = xblaMeshBuild(e->slot);
+
+		if (!m || optBoth) {
+			if (xblaMeshVerbose) {
+				xblaMeshNoteDraw(model, e->slot, 0, m ? 6 : 4);
+			}
+
+			return 0;
+		}
+
+		// Its translucent list too, on the fifteen nodes here that have one:
+		// the same rule the replaced nodes follow (see below). Until
+		// 2026-09-26 one of a mesh with no alpha anywhere drew the game's -
+		// the roof gun's, the autosurgeon's two, the interceptor's.
+		return 1;
+	}
+
+	// The mesh is built before the part is looked at, so that a mesh that will
+	// not build leaves every part of the model drawing its own geometry rather
+	// than only the first one.
+	m = frompack ? xblaMeshBuildPack(e) : frombean ? xblaMeshBuildBean(e, !xblaMeshGetEnabled()) : xblaMeshBuild(e->slot);
+
+	if (!m) {
+		if (xblaMeshVerbose) {
+			xblaMeshNoteDraw(model, e->slot, 0, 4);
+		}
+
+		return 0;
+	}
+
+	// A GoldenEye tinted pane on its way to opaque: GoldenEye's own pane is
+	// drawn as well, at the same opacity (xblaMeshKeptLists()). Only for a
+	// mesh that is nothing but panes (the window prop): a door's or a
+	// vehicle's node would bring its whole N64 body with the pane.
+	if (m->tintgdl && m->tintonly && renderdata->unk30 == 9 && ((renderdata->envcolour >> 8) & 0xff) != 0
+			&& (node->type & 0xff) == MODELNODETYPE_DL) {
+		tintStockNode = node;
+	}
+
+	// Which of the mesh's lists this node draws. A group is one part of the
+	// model, in the same order and the same number - true of all 542 (model,
+	// mesh) pairs in the release, with the parts numbered 0..n-1 - so the node
+	// carrying part p draws group p and nothing else. That is what lets a
+	// piece the game has hidden stay hidden: a head's earpiece is a part of
+	// its own under a toggle, and one list for the whole mesh drew it whatever
+	// the toggle said.
+	//
+	// A model whose parts do not line up with the mesh's groups - which is
+	// nothing in the release, but could be a mod's model or a model matched by
+	// size - falls back to what this did before: the first part draws every
+	// group and the rest draw nothing.
+	use = (e->use >= 0 && e->use < numUses && uses[e->use].modeldef == e->modeldef)
+			? &uses[e->use] : NULL;
+
+	if (m->frombean) {
+		// A GoldenEye character: group p is list node p's, the way a pack's
+		// file lays them out, but posed from the model's matrices like one of
+		// the release's skinned meshes - so the use stays, for the pose.
+		u16 part = e->packpart;
+
+		// A head that is not the body's own: the body's own neck, kept in a
+		// group of its own, fills the collar, where the node's group is left to
+		// the head it was made for - blank, or GoldenEye X's N64 stub
+		if (m->beanhead) {
+			// A head cut off the parka's neck is the face alone on the body
+			// that keeps its hood; anywhere else - another body, or on its
+			// own on the Character page - it brings the hood with it
+			if (part < 64 && m->beanhood[part] >= 0 && m->beanhood[part] < m->numgroups
+					&& !(m->groupabsent & (1ull << m->beanhood[part]))
+					&& !(e->modeldef != model->definition
+						&& gebeanRowKeepsHood(xblaMeshBodyBeanRow(model), m->beanrow))) {
+				part = (u16)m->beanhood[part];
+			}
+		}
+
+		// Grafted onto a body, a head draws the neck made under its face
+		// (gebean.c's beanAddNeckTube()) in place of the body's own
+		if (m->beanhead && e->packpart < 64 && e->modeldef != model->definition
+				&& xblaMeshHeadNeckWanted(model)
+				&& xblaMeshHeadTubeOn(model, m)
+				&& m->beanneckof[e->packpart] >= 0 && m->beanneckof[e->packpart] < m->numgroups
+				&& !(m->groupabsent & (1ull << m->beanneckof[e->packpart]))) {
+			part = (u16)m->beanneckof[e->packpart];
+		}
+
+		if (!m->beanhead && gebeanRowIsPool(m->beanrow)
+				&& part < 64 && m->beanownneck[part] >= 0 && m->beanownneck[part] < m->numgroups
+				&& !(m->groupabsent & (1ull << m->beanownneck[part]))
+				&& xblaMeshPoolNeckOwn(model)) {
+			// The body's own whole neck under a pool head ending at its jaw
+			part = (u16)m->beanownneck[part];
+		} else if (part < 64 && m->beanneckfill[part] >= 0 && m->beanneckfill[part] < m->numgroups
+				&& !(m->groupabsent & (1ull << m->beanneckfill[part]))
+				&& (xblaMeshHeadIsFitted(model) || xblaMeshPoolHeadIsSeated(model))) {
+			// drawing nothing, and not the N64 stub either
+			if (xblaMeshHeadBringsNeck(model)) {
+				return 1;
+			}
+
+			part = (u16)m->beanneckfill[part];
+		} else if (!m->beanhead && part < 64 && m->beanhood[part] >= 0 && m->beanhood[part] < m->numgroups
+				&& !(m->groupabsent & (1ull << m->beanhood[part]))
+				&& gebeanRowKeepsHood(m->beanrow, xblaMeshHeadBeanRow(model))) {
+			// The parka's hood, which the body keeps and skins with the back
+			// holding its rim (gebeanBuild()), round the face cut off the same
+			// neck, which no longer carries one - not round another head,
+			// whose hair comes out through it
+			part = (u16)m->beanhood[part];
+		} else if (!m->beanhead && part < 64 && m->beanbare[part] >= 0 && m->beanbare[part] < m->numgroups
+				&& !(m->groupabsent & (1ull << m->beanbare[part]))) {
+			// And round any other, the collar the hood would have covered
+			part = (u16)m->beanbare[part];
+		} else if (!m->beanhead && part < 64 && m->beannoskin[part] >= 0
+				&& part < m->numgroups && !(m->groupabsent & (1ull << part))
+				&& xblaMeshHeadIsNeckBack(model)) {
+			// A guard's body without the skin of its own neck below the cut,
+			// under a head file whose neck goes down into the collar there -
+			// and without the rest of the body file's head section, which the
+			// release switches off under a head file (gebean.c's
+			// headsecskel). A list holding nothing else draws nothing
+			if (m->beannoskin[part] >= m->numgroups || (m->groupabsent & (1ull << m->beannoskin[part]))) {
+				return 1;
+			}
+
+			part = (u16)m->beannoskin[part];
+		} else if (part >= m->numgroups || (m->groupabsent & (1ull << part))) {
+			// A neck node (one with a filler slot) under a head that brings
+			// its own HD neck draws nothing; under an N64 head the stub stays
+			return part < 64 && m->beanneckfill[part] >= 0 && xblaMeshHeadDrawsBean(model);
+		} else if (part < 64 && (m->beanneck & (1ull << part)) && xblaMeshHeadIsFitted(model)) {
+			return 0;
+		}
+
+		list = &m->gdl[m->groupgfx[part]];
+		xlupart = m->groupxlu[part];
+		xlucut = (m->groupxlucut >> part) & 1;
+		fadepart = m->groupfade[part];
+		use = (e->packuse >= 0 && e->packuse < numUses && uses[e->packuse].modeldef == e->modeldef)
+				? &uses[e->packuse] : NULL;
+	} else if (m->local) {
+		// A model pack's mesh for the game's own model: group p is list node
+		// p's, in that node's own space, under that node's own matrix - and a
+		// node the file has no group for keeps its own geometry.
+		u16 part = e->packpart;
+
+		// The release's rocket launcher is made with its rocket in the tube;
+		// with none in the hand, the same gun without it (gebean.c's fpRound)
+		if (part < 64 && (m->beanspent & (1ull << part)) && gegunsHandIsSpent(model)) {
+			const s8 spent = m->beanspentgroup[part];
+
+			if (spent >= 0 && spent < m->numgroups && !(m->groupabsent & (1ull << spent))) {
+				part = (u16)spent;
+			}
+		}
+
+		if (part >= m->numgroups || (m->groupabsent & (1ull << part))) {
+			return 0;
+		}
+
+		list = &m->gdl[m->groupgfx[part]];
+		xlupart = m->groupxlu[part];
+		xlucut = (m->groupxlucut >> part) & 1;
+		fadepart = m->groupfade[part];
+		use = NULL;
+	} else if (use && use->numparts == m->numgroups && e->part < m->numgroups) {
+		list = &m->gdl[m->groupgfx[e->part]];
+		xlupart = m->groupxlu[e->part];
+		xlucut = (m->groupxlucut >> e->part) & 1;
+		fadepart = m->groupfade[e->part];
+	} else if (e->part == 0) {
+		list = &m->gdl[m->allgfx];
+		xlupart = m->allxlu;
+		xlucut = m->allxlucut;
+		fadepart = m->allfade;
+	} else {
+		return 1;
+	}
+
+	// The release's own light, which fades by vertex alpha: blended, in the
+	// translucent pass, whatever the node says - see XBLAMESH_SPAN_FADE.
+	if (fadepart >= 0) {
+		fadelist = &m->gdl[fadepart];
+	}
+
+	// A windowed door's pane once three shots have shattered it
+	// (doorDestroyGlass() hides the toggle over the game's own pane). A
+	// GoldenEye XBLA door carries its window in the one mesh with the door,
+	// as its fading span, and it stood whole behind the shards (F3
+	// 20260929-213924, Bunker's cell doors)
+	if (fadelist && model && model->definition && model->definition->skel == &g_SkelWindowedDoor) {
+		struct modelnode *toggle = modelGetPart(model->definition, MODELPART_WINDOWEDDOOR_0001);
+		union modelrwdata *rw = toggle ? modelGetNodeRwData(model, toggle) : NULL;
+
+		if (rw && !rw->toggle.visible) {
+			fadelist = NULL;
+		}
+	}
+
+	// The release's own translucent geometry, and where it goes.
+	//
+	// A mesh's materials say which of its draws carry alpha, and those are
+	// built as a span of their own. Whether that span is a cutout in the
+	// opaque pass or a blend in the translucent one is the node's business,
+	// not the material's: a node the game draws a translucent list for (mcount
+	// 4, 54 of the nodes the release replaces) has a piece that belongs in the
+	// other pass, and everywhere else an alpha material is a grille or a fence
+	// that the game drew opaque and this keeps drawing opaque.
+	//
+	// Where the span does go in the translucent pass, the game's own list must
+	// not: 27 of those 54 have the same surface in both, and drawing them one
+	// over the other doubles a window's darkening.
+	//
+	// A span of cutouts only (groupxlucut) with a fading span beside it goes
+	// to the opaque pass with every other cutout, so that it writes the depth
+	// the fading span is then blended against. Without one it stays where it
+	// was: nothing is laid over it, and a plant's leaves (Pdd_plantspike's,
+	// Pdd_plantrubber's) keep the soft edge the blend gives them - cut at the
+	// threshold instead, the spike plant went dark and speckled.
+	if (xlucut && fadepart < 0) {
+		xlucut = 0;
+	}
+
+	if (xlupart >= 0 && xblaMeshNodeDrawsXlu(node) && !xlucut) {
+		xlulist = &m->gdl[xlupart];
+	}
+
+	// A character's or a gun's (a skinned mesh's) cutout span is a soft
+	// picture - hair, a lens - drawn in two: its solid core cut in the opaque
+	// pass, writing depth, and the whole span blended over it in the
+	// translucent pass, depth tested and not written. See the two draws below.
+	const s32 softspan = xlupart >= 0 && !xlulist && g_XblaMeshSoftCutouts
+			&& m->nummatrices > 0 && renderdata->zbufferenabled;
+
+	if (!opa && !xlulist && !fadelist && !softspan) {
+		// Only a node the game actually draws a translucent list for is a
+		// stock draw; every other replaced node reaches here in the
+		// translucent pass and the game draws nothing for it either.
+		//
+		// Nor does the release, whose mesh is the whole of the node. The
+		// other 27 are pieces the N64 cut out of a picture and 4J built
+		// solid - the BAFTA's face (a flat quad in the game, which drew
+		// through the release's sculpted one in patches), a dumpster's
+		// castors, the chairs' bases, the stations' arms - most of them
+		// within a few units of the mesh's own surface. 4J marked a
+		// translucent list they did want kept 0xFFFF (the Skedar console's,
+		// the king's sceptre's), and those never reach here. Until
+		// 2026-09-26 this left the game to draw its own on the rule the hair
+		// follows - take nothing away that nothing here replaces - but the
+		// mesh does replace it. A model pack's file and a GoldenEye
+		// character keep that rule.
+		//
+		// A GoldenEye prop does not: Bean's HD prop is built rigid over the
+		// whole model (gebeanBuildRigid()), glass included, so the converted
+		// model's translucent lists are the N64 prop drawn inside it. Dam's
+		// truck carries one on every node - its wheels' treads and hubs among
+		// them - and the N64 wheel drew over the HD one (F3 20260926-085130,
+		// "n64 wheel rendering with xbla in back"), and Surface's dish drew
+		// its N64 truss along the HD one, shimmering as the two fought (F3
+		// 20260926-090027). Eighteen props in the twenty missions had one
+		// drawn: palms and the vine tree, door and slide panes, the tank.
+		const s32 stock = xblaMeshNodeDrawsXlu(node)
+			&& (frompack || (frombean && !gebeanRowIsProp(e->beanrow)));
+
+		if (xblaMeshVerbose && stock) {
+			xblaMeshNoteDraw(model, e->slot, 0, 5);
+		}
+
+		return !stock && xblaMeshNodeDrawsXlu(node);
+	}
+
+	// The matrix this is drawn under is the first part's, whichever part is
+	// drawing. Every group is in the mesh's one space - a door's window pane
+	// is where the door has it, not where its own node would put it, and all
+	// five multi-part meshes the release has that are not skinned load one
+	// matrix for every part anyway - and a posed mesh comes out in the first
+	// part's space by construction. Naming it as well as loading it is what
+	// keeps the vertices inside the s16 a Perfect Dark vertex holds.
+	posed = m->vertices;
+	root = NULL;
+
+	if (use) {
+		root = xblaMeshSkinRoot(m, model, node, xblaMeshPartMtx(model, use, 0));
+
+		if (optPose && m->nummatrices && root) {
+			Vtx *pose = NULL;
+
+			// Normals only for a draw that will reflect: the opaque pass,
+			// within the cutoff.
+			const s32 normals = opa && m->envgdl && xblaTexGetEnabled() && XBLAMESH_ENV_WANTED() &&
+					xblaMeshEnvironmentReach(m, root) > 0;
+
+			if (m->posedmodel == model && m->posedframe == frameCount &&
+					m->posedvtx) {
+				pose = m->posedvtx;
+				finemtx = m->posedmtx;
+			} else if (m->gpumodel == model && m->gpuframe == frameCount && m->gpupal) {
+				gpupal = m->gpupal;
+				finemtx = m->gpumtx;
+			} else {
+				f32 headshift[3] = { 0.0f, 0.0f, 0.0f };
+
+				if (e->modeldef != model->definition) {
+					xblaMeshPoolHeadSeat(m, e, model, headshift);
+					headshift[1] += (f32)headfitAppliedOffset(e->modeldef);
+				}
+
+				// A destroyed GoldenEye prop's crumpling goes in with the pose:
+				// objRender()'s destroyed mode, as scorched below, and never a
+				// door's trim, which also moves the game's vertices
+				const f32 *disp = use && m->frombean && !gebeanRowIsChr(m->beanrow)
+						&& renderdata->unk30 == 9 && (renderdata->envcolour & 0xff) != 0
+						? xblaMeshDeformOffsets(m, model, use, e->slot) : NULL;
+
+				// Posed on the GPU (G_MESH_EXT) unless something drawn here reads
+				// the posed vertices themselves: the logo passes are lit from
+				// them, and a destroyed prop's crumpling goes in with them. The
+				// reflections are posed there too, from a copy of the vertices
+				// made once (xblaMeshEnvStatic()), which a mesh that reflects
+				// has to have.
+				if (!disp && envforce != XBLAMESH_ENV_LOGO && m->bindpos && m->weights && m->bones
+						&& (!normals || (!m->envown && m->normals && xblaMeshEnvStatic(m)))
+						&& gfxMeshGpuAvailable()) {
+					gpupal = xblaMeshGpuPalette(m, model, root, headshift, &finemtx);
+
+					if (gpupal) {
+						frameGpuPoses++;
+						m->gpumodel = model;
+						m->gpuframe = frameCount;
+						m->gpupal = gpupal;
+						m->gpumtx = finemtx;
+					}
+				}
+
+				if (!gpupal) {
+					pose = xblaMeshPose(m, model, root, &finemtx, &fine, normals, headshift, disp);
+
+					if (pose) {
+						framePoses++;
+					} else {
+						framePoseFails++;
+					}
+
+					// Not remembered when there was no room this frame, so that
+					// the next part tries again rather than inheriting a miss.
+					if (pose) {
+						m->posedmodel = model;
+						m->posedframe = frameCount;
+						m->posedvtx = pose;
+						m->posedmtx = finemtx;
+						m->posedfine = fine;
+					}
+				}
+			}
+
+			if (gpupal) {
+				// The bind pose goes under the bone's own matrix as floats,
+				// and the GPU poses it into that matrix's space (below)
+				drawmtx = finemtx;
+			} else if (pose) {
+				posed = pose;
+
+				// The pose was written finer than the game's units, so it goes
+				// under the matrix that takes that back out rather than under
+				// the bone's own. A pose that could not be taken any finer
+				// leaves this NULL and the bone's matrix stands.
+				drawmtx = finemtx;
+			} else if (xblaMeshVerbose) {
+				// Only reachable now at the cap or on a failed malloc: the
+				// arena adds a chunk for anything under it, in the frame that
+				// asks. Worth keeping, because what it draws instead is the
+				// bind pose - a head a body's height above the body.
+				sysLogPrintf(LOG_NOTE, "xblamesh: slot %d drew its bind pose - the frame "
+						"arena would not grow (%d chunks, %u bytes held, %u wanted "
+						"this frame)", e->slot, frameNumChunks[frameIndex],
+						frameBytes[frameIndex], frameWanted);
+			}
+		}
+	}
+
+	// A door the game is drawing trimmed: trim the mesh the same way. Only
+	// from the bind pose, which is in the model's own units like the game's
+	// vertices; a posed copy is finer and in the first part's space, and
+	// nothing the game trims is skinned.
+	if (posed == m->vertices && m->grad) {
+		s32 axis;
+		s16 ref;
+
+		if (xblaMeshNodeTrim(model, node, &axis, &ref)) {
+			Vtx *trimmed = xblaMeshTrimCopy(m, model, axis, ref);
+
+			if (trimmed) {
+				posed = trimmed;
+			}
+
+			if (xblaMeshVerbose && !m->trimlogged) {
+				m->trimlogged = 1;
+				sysLogPrintf(LOG_NOTE, "xblamesh: slot %d is a door the game trims: "
+						"%s %d, %s", e->slot, axis == 0 ? "x at or below" : "y at or above",
+						ref, trimmed ? "mirrored on the mesh" : "no room in the arena");
+			}
+		}
+	}
+
+	// A destroyed object: the game's deformation, mirrored. After the trim, which
+	// is exact and never a deformed object's.
+	if (posed == m->vertices && use && !m->local && !m->bindpos) {
+		Vtx *deformed = xblaMeshDeformVertices(m, model, use, e->slot);
+
+		if (deformed) {
+			posed = deformed;
+		}
+	}
+
+	// A GoldenEye first-person gun is built in the space of the matrix its
+	// list loads itself, which need not be the position node's above it
+	// (gebeanListLoadedMatrix(): the PP9i's gun list is under the root and
+	// loads matrix 33)
+	if (!root && frombean && m->local && model && model->matrices && model->definition) {
+		const s32 index = gebeanListLoadedMatrix(node);
+
+		if (index >= 0 && index < model->definition->nummatrices) {
+			root = &model->matrices[index];
+		}
+	}
+
+	if (!root) {
+		root = modelFindNodeMtx(model, node, 0);
+	}
+
+	if (xblaMeshVerbose && !m->logged) {
+		xblaMeshLogDrawn(model, node, e->slot);
+		m->logged = 1;
+	}
+
+	// The first few draws, with the model each came from. One node is shared
+	// by every instance of its model, so this is what says whether a mesh that
+	// covers more of the screen than the geometry it replaced is too big or is
+	// two of them - the G5 car lift doors are two.
+	if (xblaMeshVerbose && xblaMeshDrawLog < XBLAMESH_DRAWLOG) {
+		xblaMeshDrawLog++;
+		sysLogPrintf(LOG_NOTE, "xblamesh: draw %d: slot %d node %p model %p, "
+				"part %d of %d groups, %d palette entries, %s",
+				xblaMeshDrawLog, e->slot, node, model, e->part, m->numgroups,
+				m->nummatrices, posed == m->vertices ? "bind pose" :
+				m->posedfine > 1 ? "posed, in fractions of a unit" : "posed");
+	}
+
+	if (!drawmtx) {
+		drawmtx = root;
+	}
+
+	// A rigid mesh authored in the model's space, under a part matrix that
+	// already stands at the part's rest offset: the offset comes off a float
+	// copy, the way the pose's divided matrix is handed over, stage scale and
+	// all. See xblaMeshRestShift().
+	// Not under the orthogonal projection, for the pose's reason above.
+	if (drawmtx == root && root && use && !m->local && !m->bindpos && !orthogonal) {
+		const f32 *shift = xblaMeshRestShift(m, use, e->slot);
+
+		if (shift) {
+			Mtxf *fmtx = xblaMeshFrameAlloc(sizeof(Mtxf));
+
+			if (fmtx) {
+				*fmtx = *root;
+
+				for (s32 c = 0; c < 4; c++) {
+					fmtx->m[3][c] = root->m[3][c] - shift[0] * root->m[0][c]
+						- shift[1] * root->m[1][c] - shift[2] * root->m[2][c];
+				}
+
+				mtxApplyGfxScale(fmtx);
+				drawmtx = fmtx;
+			}
+		}
+	}
+
+	// The divided copy is floats and says so; the bone's own matrix is one of
+	// the model's, which the game converts to s15.16 in place after listing
+	// the model, and is read the way every matrix of the game's is.
+	if (drawmtx) {
+		gSPMatrix(renderdata->gdl++, osVirtualToPhysical(drawmtx),
+				G_MTX_NOPUSH | G_MTX_LOAD | G_MTX_MODELVIEW |
+				(drawmtx != root ? G_MTX_FLOATS : 0));
+
+		if (drawmtx != root && opa) {
+			fineModel = model;
+		}
+	}
+
+	gSPSegment(renderdata->gdl++, SPSEGMENT_MODEL_VTX, osVirtualToPhysical(posed));
+
+	// The lists below drawn from the renderer's copy of the mesh on the GPU,
+	// posed by gpupal there (G_MESH_EXT, gfxmesh.h): what they load from the
+	// mesh's own vertices costs nothing per vertex here or in the renderer. A
+	// trimmed or crumpled copy is drawn as it always was, and so is whatever
+	// the renderer cannot do on the GPU (it loads those lists on the CPU,
+	// posing them by the same palette).
+	if (posed == m->vertices && (gpupal || !m->bindpos || !m->nummatrices || !optPose || !root)
+			&& gfxMeshGpuAvailable()) {
+		meshdraw = xblaMeshFrameAlloc(sizeof(*meshdraw));
+
+		if (meshdraw) {
+			m->gpu.vertices = m->vertices;
+			m->gpu.numvertices = m->numvertices;
+			m->gpu.bindpos = m->bindpos;
+			m->gpu.weights = m->weights;
+			m->gpu.bones = m->bones;
+			m->gpu.nummatrices = m->nummatrices;
+			m->gpu.normals = m->normals;
+			meshdraw->mesh = &m->gpu;
+			meshdraw->palette = gpupal;
+			gSPMeshEXT(renderdata->gdl++, meshdraw);
+		}
+	}
+
+	// The N64 sheen (Mod.XblaReflectStyle) in place of the release's cube: the
+	// same pass from the copy that lights and sphere-maps 0x3eb the way the stock
+	// guns do (xblaMeshBuildSheen()), at the sheen's larger share. Never on a
+	// caller's forced draw - the title's 4J cubes are the release's intro.
+	const s32 metal = optReflectStyle == XBLAMESH_REFLECT_METAL;
+	const s32 sheen = envforce == XBLAMESH_ENV_SETTING &&
+			((optReflectStyle == XBLAMESH_REFLECT_N64 && m->sheengdl != NULL) ||
+			(metal && m->metalgdl != NULL));
+
+	// The title's marble logo in the levels' blue and metal, in place of the
+	// release's cube maps: see xblaMeshBuildLogo(). A mesh with none of the
+	// logo's materials - the red 4J tray - reflects as XBLAMESH_ENV_ON would.
+	if (envforce == XBLAMESH_ENV_LOGO && opa && !m->logotried) {
+		xblaMeshBuildLogo(m);
+	}
+
+	const s32 logo = envforce == XBLAMESH_ENV_LOGO && opa && m->logobase != NULL &&
+			renderdata->zbufferenabled && xblaTexGetEnabled();
+
+	// A GoldenEye prop the game has destroyed. objRender() draws a destroyed
+	// object under mode 9 with the environment alpha raised (100 + 50 a
+	// level): the object's alpha is its shade's plus that, cut by the alpha
+	// test (G_CC_CUSTOM_21, TEX_EDGE), and objDeform() has cleared all its
+	// colours' alpha but one entry's, so the crumpled prop is ragged and
+	// dark. Drawn under that mode a GoldenEye XBLA mesh vanished whole - every
+	// tank shot in Facility's bottling room left only its smoke in the HD look
+	// (2026-09-26) - so it is drawn under the whole object's mode, the
+	// environment alpha taken off round it. No reflection
+	// (xblaMeshEnvironmentLight(), which still sees the alpha).
+	//
+	// The crumpling and the blackening are GoldenEye's own (objDeformGe()),
+	// mirrored from the prop's lists through the bruise map as a Perfect Dark
+	// prop's are: the vertices pressed down and pushed about, black where
+	// GoldenEye wrote black (nine in ten of the upper half's, one in five of
+	// the lower's) and the rest their own colour - with the mesh's own alpha,
+	// not the cleared one. Only where the map cannot be made is the whole mesh
+	// scorched to a quarter, which is what every destroyed prop was until
+	// 2026-09-30: a shot crate stood whole as a black box and Train's brake
+	// unit as two black stems (F3 20260930-191713, 191733).
+	const s32 scorched = m->frombean && !m->local && renderdata->unk30 == 9
+			&& (renderdata->envcolour & 0xff) != 0;
+	const u32 scorchedenv = renderdata->envcolour;
+
+	// The colours, bruised where the game has bruised the model's own lists,
+	// and how wounded each vertex is, which the reflections below are scaled
+	// down by - so these come first.
+	Col *boundcol = m->colours;
+	const u8 *wound = NULL;
+
+	// A GoldenEye character's too: its map is made from the list nodes it
+	// covers on the pack's side (xblaMeshBruiseNodes()). A GoldenEye prop's
+	// only once destroyed (scorched), and with the mesh's own alpha: the
+	// mirror would carry objDeform()'s cleared alpha onto it.
+	const s32 beanprop = m->frombean && !gebeanRowIsChr(m->beanrow);
+	s32 scorchmirrored = 0;
+
+	if (use && !m->local && (!beanprop || scorched)) {
+		Col *bruised = xblaMeshBruiseColours(m, model, use, !grafted, e->slot);
+
+		if (bruised && beanprop) {
+			for (s32 i = 0; i < m->numvertices; i++) {
+				bruised[i].a = m->colours[i].a;
+			}
+
+			scorchmirrored = 1;
+		}
+
+		if (bruised) {
+			boundcol = bruised;
+			wound = m->bruisewound;
+		}
+	}
+
+	// Whether this draw takes the release's reflections, decided before the
+	// colours are bound since a reflecting material's colours are scaled for
+	// it. Only in the opaque pass: the pass goes over the opaque list. The
+	// renderer takes the normals and positions to view space through the
+	// matrix the list is drawn under (G_ENVMAP_EXT); the normals are the
+	// pose's where there is one, since a skinned mesh's bind normals point
+	// wherever the bind pose had the limb.
+	if (opa && m->envgdl && root && xblaTexGetEnabled() && XBLAMESH_ENV_WANTED() && !logo) {
+		const s32 isposed = posed == m->posedvtx && m->posedmodel == model &&
+				m->posedframe == frameCount;
+
+		// Posed on the GPU, a skinned mesh's normals are the renderer's to
+		// pose (G_MESH_EXT): its bind normals stand in here, where nothing
+		// reads their direction
+		const f32 *normals = isposed ? m->posednrm : m->normals;
+		const s32 envgpu = meshdraw && !m->envown && m->normals && xblaMeshEnvStatic(m);
+
+		// The distance fade is kept apart from the room's light: it takes the
+		// reflection away from the material altogether, so the colours below
+		// are given back what it took, where the room only darkens both.
+		if (normals) {
+			envreach = xblaMeshEnvironmentReach(m, root);
+			envlight = xblaMeshEnvironmentLight(renderdata, node, m->envown, &envfading) * envreach / 255;
+		}
+
+		// Made here rather than at the pass, so that a frame arena with no room
+		// for them leaves the colours unscaled as well.
+		if (envlight > 0 && envgpu) {
+			envdraw = xblaMeshFrameAlloc(sizeof(*envdraw));
+
+			if (!envdraw || !xblaMeshEnvironmentGpu(m, model, envlight, sheen, wound, &envvtx, &envcol)) {
+				envdraw = NULL;
+				envlight = 0;
+			} else {
+				// the same mesh over the copy, under a name of the renderer's own
+				const u32 envid = m->envgpu.id;
+
+				m->envgpu = m->gpu;
+				m->envgpu.id = envid;
+				m->envgpu.vertices = envvtx;
+				envdraw->mesh = &m->envgpu;
+				envdraw->palette = gpupal;
+			}
+		} else if (envlight > 0 && !xblaMeshEnvironmentVertices(m, model, posed, normals, root,
+					envlight, sheen, wound, &envvtx, &envcol)) {
+			envlight = 0;
+		}
+	}
+
+	{
+		// A reflecting material is blended towards its reflection, not added
+		// to: what the lists light is what is left of it, and the reflection
+		// pass below adds the rest. Fitted per pixel on the marble cube's faces,
+		// the release keeps 0.63/0.65/0.75 of their texture and adds 0.38/0.40/
+		// 0.42 of the cube - byte 16's 40% both ways - and the red tray keeps
+		// 0.85 of its red, which is the 139 the port drew against the 115 of
+		// the release's recording.
+		//
+		// Scaled by the material's amount and not by the room's light, which
+		// darkens the lists' colours and the reflection alike.
+		// The N64 sheen is added over the colours as they are: see
+		// XBLAMESH_SHEEN_SHARE().
+		if (envlight > 0 && !sheen && !m->envown) {
+			// A matte material's colours are left whole (xblaMeshMattes):
+			// dimcol was made at the release's amounts, so it is passed over.
+			// It cannot change inside a frame, so keptcol needs no key of it.
+			const u32 matte = m->mattemask ? m->mattemask & xblaMeshMatteActive() : 0;
+			Col *kept = NULL;
+
+			// Scaled by the amount the distance leaves (envreach), so the sheen
+			// fades into the plain colours past the cutoff instead of the
+			// colours jumping back up at it.
+			if (boundcol == m->colours && envreach == 255 && m->dimcol && !matte) {
+				kept = m->dimcol;
+			} else if (m->keptcol && m->keptmodel == model && m->keptframe == frameCount &&
+					m->keptsrc == boundcol && m->keptreach == envreach) {
+				kept = m->keptcol;
+			} else {
+				kept = xblaMeshFrameAlloc((u32)m->numvertices * sizeof(Col));
+
+				if (kept) {
+					memcpy(kept, boundcol, (size_t)m->numvertices * sizeof(Col));
+
+					for (s32 k = 0; k < m->numenvidx; k++) {
+						const u32 i = m->envidx[k];
+						const u32 own = xblaMeshVertexAmount(m, i, matte);
+						const u32 share = wound ? own * (255u - wound[i]) / 255 : own;
+						const u32 left = 255 - (share * envreach + 127) / 255;
+
+						kept[i].r = (u8)((boundcol[i].r * left + 127) / 255);
+						kept[i].g = (u8)((boundcol[i].g * left + 127) / 255);
+						kept[i].b = (u8)((boundcol[i].b * left + 127) / 255);
+					}
+
+					m->keptmodel = model;
+					m->keptframe = frameCount;
+					m->keptsrc = boundcol;
+					m->keptreach = envreach;
+					m->keptcol = kept;
+				}
+			}
+
+			if (kept) {
+				boundcol = kept;
+			} else {
+				envlight = 0;
+			}
+		}
+
+		// A destroyed GoldenEye prop with no map to mirror GoldenEye's
+		// blackening through, scorched whole: see scorched above
+		if (scorched && !scorchmirrored) {
+			Col *burnt = xblaMeshFrameAlloc((u32)m->numvertices * sizeof(Col));
+
+			if (burnt) {
+				for (s32 i = 0; i < m->numvertices; i++) {
+					burnt[i].r = (u8)(boundcol[i].r * XBLAMESH_SCORCH / 255);
+					burnt[i].g = (u8)(boundcol[i].g * XBLAMESH_SCORCH / 255);
+					burnt[i].b = (u8)(boundcol[i].b * XBLAMESH_SCORCH / 255);
+					burnt[i].a = boundcol[i].a;
+				}
+
+				boundcol = burnt;
+			}
+		}
+
+		gSPSegment(renderdata->gdl++, SPSEGMENT_MODEL_COL1, osVirtualToPhysical(boundcol));
+	}
+
+	// The environment alpha off round the mesh's own draws (scorched, above)
+	if (scorched) {
+		renderdata->envcolour &= 0xffffff00;
+	}
+
+	if (opa) {
+		// The lighting: the state the game would have written round its own
+		// list for this node. The list itself writes no combiner and no
+		// render mode - see xblaMeshSetMaterial() and xblaMeshApplyNodeMode().
+		xblaMeshApplyNodeMode(renderdata, node, 1);
+
+		if (opaquecycle2) {
+			xblaMeshSetSpanMode(renderdata, node, opaquecycle2, opaqueonecycle);
+		}
+
+		// A wounded chr's blood tint, brighter: the environment colour is what
+		// G_CC_CUSTOM_17 takes a vertex to as its shade alpha drops, and the
+		// game's (64 10 10) is so dark that on the release's dark cloth a wound
+		// read as more of the cloth. It shows nowhere else - at full alpha the
+		// texel is untouched - so the hue is kept and only the level raised.
+		// Put back after the lists, for the reflection pass and the next node.
+		const s32 tinted = wound && renderdata->unk30 == 7;
+
+		if (tinted) {
+			const u32 er = (renderdata->envcolour >> 24) & 0xff;
+			const u32 eg = (renderdata->envcolour >> 16) & 0xff;
+			const u32 eb = (renderdata->envcolour >> 8) & 0xff;
+			const u32 peak = er > eg ? (er > eb ? er : eb) : (eg > eb ? eg : eb);
+
+			if (peak > 0 && peak < XBLAMESH_WOUND_TINT_PEAK) {
+				gDPSetEnvColor(renderdata->gdl++, er * XBLAMESH_WOUND_TINT_PEAK / peak,
+						eg * XBLAMESH_WOUND_TINT_PEAK / peak, eb * XBLAMESH_WOUND_TINT_PEAK / peak, 0xff);
+			}
+		}
+
+		gSPDisplayList(renderdata->gdl++, logo ? m->logobase + (list - m->gdl) : list);
+		frameDraws++;
+
+		// An alpha span that is not going to the translucent pass is a cutout
+		// and belongs here, after the solid part of the same group - a grille,
+		// a fence, the leaves of a plant. This is where every alpha material
+		// was drawn before the span was split out; the mode is TEX_EDGE in the
+		// node's own first cycle, so it stays as lit as the rest.
+		//
+		// Under a prop's mode 9 the node's alpha is texel times shade *plus*
+		// the primitive alpha, which is a windowed door's fade (doorobj
+		// fadealpha, 0 close to 255 far) or a tinted pane's opacity. The game's
+		// own lists under it are opaque or its glass, so the sum is harmless
+		// there; a cutout reads it, and every clear texel of Investigation's
+		// "SECTOR THREE" sign drew as the door faded - a black box over the
+		// letters from about 300 to 600 units out. The cutout is cut on its
+		// texels alone.
+		//
+		// A character's or a gun's (a skinned mesh's) span is a soft picture,
+		// and only its core is cut here: the texels of three quarters alpha
+		// and more (G_ALPHA_CORE_EXT), solid and writing depth. The rest is
+		// blended over it in the translucent pass (softspan, below). Cut at
+		// the edge test's fifth, every half-clear strand of hair came out
+		// solid and Joanna's fringe drew as a thick slab over her face (F3
+		// 20260929-172810). Blended here instead, writing depth (e06d1298b,
+		// the release's own state, which leans on its own draw order), a
+		// strand was laid over whatever had been drawn by then - the sky, or
+		// the room behind her not yet drawn - and hid what came after it:
+		// the hair went see-through wherever it was half clear (F3
+		// 20260930-044656) and a lens showed the sky (F3 20260930-023254).
+		//
+		// A faded body (chrRender(): a depth pass, then the surface it left
+		// blended once) cuts its soft core in the depth pass alone, and
+		// unfaded: the fade is the environment alpha (unk30 8), which the
+		// core's three quarters are read against, so faded to 0.75 and less
+		// the core laid no depth at all. In the front pass the core is not
+		// drawn - cut solid, it stood unfaded through a fade down to 0.75
+		// and then went at once - and the soft draw below (all of the span)
+		// blends it at the fade with the rest of the body.
+		const s32 softfaded = softspan && depthPass != XBLAMESH_DEPTHPASS_NONE;
+
+		if (xlupart >= 0 && !xlulist && !(softfaded && depthPass == XBLAMESH_DEPTHPASS_FRONT)) {
+			xblaMeshSetSpanMode(renderdata, node,
+					renderdata->zbufferenabled ? G_RM_AA_ZB_TEX_EDGE2 : G_RM_AA_TEX_EDGE2,
+					renderdata->zbufferenabled ? G_RM_AA_ZB_TEX_EDGE : G_RM_AA_TEX_EDGE);
+
+			if (softspan) {
+				gSPSetExtraGeometryModeEXT(renderdata->gdl++, G_ALPHA_CORE_EXT);
+			}
+
+			if (renderdata->unk30 == 9) {
+				gDPSetPrimColor(renderdata->gdl++, 0, 0, 0, 0, 0, 0);
+			}
+
+			if (softfaded && renderdata->unk30 == 8) {
+				gDPSetEnvColorViaWord(renderdata->gdl++, renderdata->envcolour | 0xff);
+			}
+
+			gSPDisplayList(renderdata->gdl++, &m->gdl[xlupart]);
+
+			if (softfaded && renderdata->unk30 == 8) {
+				gDPSetEnvColorViaWord(renderdata->gdl++, renderdata->envcolour);
+			}
+
+			if (renderdata->unk30 == 9) {
+				gDPSetPrimColor(renderdata->gdl++, 0, 0, 0, 0, 0, (renderdata->envcolour >> 8) & 0xff);
+			}
+
+			if (softspan) {
+				gSPClearExtraGeometryModeEXT(renderdata->gdl++, G_ALPHA_CORE_EXT);
+			}
+		}
+
+		if (tinted) {
+			gDPSetEnvColorViaWord(renderdata->gdl++, renderdata->envcolour | 0xff);
+		}
+
+		// The release's reflections, over what was just drawn from colours
+		// already scaled by what the reflection leaves (above): the copy of the
+		// list that binds the atlas, from vertices carrying where each one's
+		// reflection lands in it and how much of it the material takes, added
+		// (G_ADDITIVE_EXT) onto the nearest surface only. The amount is the
+		// vertex alpha, times the fade while the title fades the model.
+		if (envlight > 0) {
+			// The N64 sheen: the lit shade times the streak, added at the
+			// vertex's alpha (the sheen's share times the room's light) over
+			// the colours the lists drew undimmed.
+			if (sheen) {
+				const s32 fading = envfading;
+
+				gSPSegment(renderdata->gdl++, SPSEGMENT_MODEL_VTX, osVirtualToPhysical(envvtx));
+				gSPSegment(renderdata->gdl++, SPSEGMENT_MODEL_COL1, osVirtualToPhysical(envcol));
+
+				if (envdraw) {
+					gSPMeshEXT(renderdata->gdl++, envdraw);
+				}
+
+				gDPPipeSync(renderdata->gdl++);
+				gDPSetCycleType(renderdata->gdl++, G_CYC_2CYCLE);
+				gDPSetRenderMode(renderdata->gdl++, G_RM_AA_ZB_XLU_INTER, G_RM_AA_ZB_XLU_INTER2);
+
+				// The light the stock gun's spans are drawn under: bgRender() sets
+				// it for the frame and bgunRender() leaves it for a gun without
+				// WEAPONFLAG_00008000, as the K7 is. Written here so a room's own
+				// lights left over from something else cannot stand in for it.
+				renderdata->gdl = lightsSetDefault(renderdata->gdl);
+
+				if (fading) {
+					gDPSetCombineLERP(renderdata->gdl++, TEXEL0, 0, SHADE, 0, SHADE, 0, ENVIRONMENT, 0,
+							0, 0, 0, COMBINED, 0, 0, 0, COMBINED);
+				} else {
+					gDPSetCombineLERP(renderdata->gdl++, TEXEL0, 0, SHADE, 0, 0, 0, 0, SHADE,
+							0, 0, 0, COMBINED, 0, 0, 0, COMBINED);
+				}
+
+				// The K7's streaks tile, so walking scrolls them. The levels'
+				// metal is a round map a scroll would run off, so under Level
+				// Metal walking turns the lookup as it does on the rooms. A
+				// prop drawn under Level Reflections has the turn flag on, and
+				// its own stock spans get the turn back after this
+				if (metal) {
+					renderdata->gdl = roomSheenTexgenTurn(renderdata->gdl);
+					gSPSetGeometryMode(renderdata->gdl++, G_LIGHTING | G_TEXTURE_GEN);
+					gSPSetExtraGeometryModeEXT(renderdata->gdl++, G_ADDITIVE_EXT | G_TEXGEN_EYE_EXT | G_TEXGEN_TURN_EXT);
+					gSPDisplayList(renderdata->gdl++, m->metalgdl + (list - m->gdl));
+				} else {
+					renderdata->gdl = roomSheenTexgenShift(renderdata->gdl);
+					gSPSetGeometryMode(renderdata->gdl++, G_LIGHTING | G_TEXTURE_GEN);
+					gSPClearExtraGeometryModeEXT(renderdata->gdl++, G_TEXGEN_TURN_EXT);
+					gSPSetExtraGeometryModeEXT(renderdata->gdl++, G_ADDITIVE_EXT | G_TEXGEN_EYE_EXT);
+					gSPDisplayList(renderdata->gdl++, m->sheengdl + (list - m->gdl));
+				}
+
+				gSPClearExtraGeometryModeEXT(renderdata->gdl++, G_ADDITIVE_EXT | G_TEXGEN_EYE_EXT | G_TEXGEN_TURN_EXT);
+				gSPClearGeometryMode(renderdata->gdl++, G_LIGHTING | G_TEXTURE_GEN);
+				renderdata->gdl = roomSheenStockResume(renderdata->gdl);
+				gSPSegment(renderdata->gdl++, SPSEGMENT_MODEL_VTX, osVirtualToPhysical(posed));
+				gSPSegment(renderdata->gdl++, SPSEGMENT_MODEL_COL1, osVirtualToPhysical(boundcol));
+
+				if (envdraw) {
+					gSPMeshEXT(renderdata->gdl++, meshdraw);
+				}
+
+				frameDraws++;
+			} else {
+				const s32 fading = envfading;
+
+				gSPSegment(renderdata->gdl++, SPSEGMENT_MODEL_VTX, osVirtualToPhysical(envvtx));
+				gSPSegment(renderdata->gdl++, SPSEGMENT_MODEL_COL1, osVirtualToPhysical(envcol));
+
+				if (envdraw) {
+					gSPMeshEXT(renderdata->gdl++, envdraw);
+				}
+
+				gDPPipeSync(renderdata->gdl++);
+				gDPSetCycleType(renderdata->gdl++, G_CYC_2CYCLE);
+				gDPSetRenderMode(renderdata->gdl++, G_RM_AA_ZB_XLU_INTER, G_RM_AA_ZB_XLU_INTER2);
+
+				if (fading) {
+					gDPSetCombineLERP(renderdata->gdl++, 0, 0, 0, TEXEL0, SHADE, 0, ENVIRONMENT, 0,
+							0, 0, 0, COMBINED, 0, 0, 0, COMBINED);
+				} else {
+					gDPSetCombineLERP(renderdata->gdl++, 0, 0, 0, TEXEL0, 0, 0, 0, SHADE,
+							0, 0, 0, COMBINED, 0, 0, 0, COMBINED);
+				}
+
+				// A map of a GoldenEye prop's own is looked up at the vertices
+				// (xblaMeshEnvironmentVertices())
+				gSPSetExtraGeometryModeEXT(renderdata->gdl++, G_ADDITIVE_EXT | (m->envown ? 0 : G_ENVMAP_EXT));
+				gSPDisplayList(renderdata->gdl++, m->envgdl + (list - m->gdl));
+				gSPClearExtraGeometryModeEXT(renderdata->gdl++, G_ADDITIVE_EXT | G_ENVMAP_EXT);
+				gSPSegment(renderdata->gdl++, SPSEGMENT_MODEL_VTX, osVirtualToPhysical(posed));
+				gSPSegment(renderdata->gdl++, SPSEGMENT_MODEL_COL1, osVirtualToPhysical(boundcol));
+
+				if (envdraw) {
+					gSPMeshEXT(renderdata->gdl++, meshdraw);
+				}
+
+				frameDraws++;
+			}
+		}
+
+		// The logos' own materials, lit and sphere-mapped where logobase left
+		// them out, and then the glint added over the ones that take it. The
+		// title has no player, so no camera LookAt: the logo's LookAt is in eye
+		// space, where the renderer reads it. See xblaMeshBuildLogo().
+		if (logo) {
+			static Lights1 lights = gdSPDefLights1(0x96, 0x96, 0x96, 0xff, 0xff, 0xff, 0x4d, 0x4d, 0x2e);
+			static LookAt lookat;
+			const s32 isposed = posed == m->posedvtx && m->posedmodel == model &&
+					m->posedframe == frameCount;
+			const s32 fading = renderdata->unk30 == 5 && (renderdata->envcolour & 0xff) < 255;
+			const s32 fade = (fading ? (s32)(renderdata->envcolour & 0xff) : 255) * logoFade / 255;
+			s32 replaces = 0;
+			Col *logocol = m->logocol;
+
+			if (isposed && m->posednrm) {
+				Col *col = xblaMeshFrameAlloc((u32)m->numvertices * sizeof(Col));
+
+				if (col) {
+					xblaMeshLogoColours(m, m->posednrm, col);
+					logocol = col;
+				}
+			}
+
+			for (s32 k = 0; k < XBLAMESH_LOGO_MATS; k++) {
+				replaces |= m->logogdl[k] != NULL;
+			}
+
+			lookat.l[0].l.dir[0] = 0x7f;
+			lookat.l[1].l.dir[1] = 0x7f;
+
+			gSPSegment(renderdata->gdl++, SPSEGMENT_MODEL_COL1, osVirtualToPhysical(logocol));
+			gDPPipeSync(renderdata->gdl++);
+			gDPSetCycleType(renderdata->gdl++, G_CYC_2CYCLE);
+
+			// A logo that only glints keeps the title's own light, which fades
+			// the Rare logo in; the marble logo's replaced faces are lit like
+			// the levels' spans.
+			if (replaces) {
+				gSPSetLights1(renderdata->gdl++, lights);
+			}
+
+			gSPLookAtX(renderdata->gdl++, &lookat.l[0]);
+			gSPLookAtY(renderdata->gdl++, &lookat.l[1]);
+			gDPSetTexgenShiftEXT(renderdata->gdl++, 0, 0);
+			gSPSetGeometryMode(renderdata->gdl++, G_LIGHTING | G_TEXTURE_GEN);
+			gSPClearExtraGeometryModeEXT(renderdata->gdl++, G_TEXGEN_TURN_EXT);
+			gSPSetExtraGeometryModeEXT(renderdata->gdl++, G_TEXGEN_EYE_EXT);
+
+			// Where the cube fades, the release's way: blended onto its own
+			// depth-only pass by the fade.
+			if (replaces) {
+				if (fading) {
+					gDPSetRenderMode(renderdata->gdl++, G_RM_AA_ZB_XLU_INTER, G_RM_AA_ZB_XLU_INTER2);
+				} else {
+					gDPSetRenderMode(renderdata->gdl++, G_RM_AA_ZB_OPA_SURF, G_RM_AA_ZB_OPA_SURF2);
+				}
+
+				for (s32 k = 0; k < XBLAMESH_LOGO_MATS; k++) {
+					if (!m->logogdl[k]) {
+						continue;
+					}
+
+					// The metal brighter than its picture: texel times one plus
+					// the gain, unlit, since the glint over it is what moves.
+					if (xblaMeshLogoMats[k].metal) {
+						gDPSetEnvColor(renderdata->gdl++, xblaLogoMetalGain, xblaLogoMetalGain, xblaLogoMetalGain, fade);
+						gDPSetCombineLERP(renderdata->gdl++, TEXEL0, 0, ENVIRONMENT, TEXEL0, 0, 0, 0, ENVIRONMENT,
+								0, 0, 0, COMBINED, 0, 0, 0, COMBINED);
+					} else {
+						gDPSetEnvColor(renderdata->gdl++, 0, 0, 0, fade);
+						gDPSetCombineLERP(renderdata->gdl++, TEXEL0, 0, SHADE, 0, 0, 0, 0, ENVIRONMENT,
+								0, 0, 0, COMBINED, 0, 0, 0, COMBINED);
+					}
+
+					gSPDisplayList(renderdata->gdl++, m->logogdl[k] + (list - m->gdl));
+				}
+			}
+
+			if (m->logoglint && xblaLogoGlintShare > 0) {
+				gDPPipeSync(renderdata->gdl++);
+				gDPSetRenderMode(renderdata->gdl++, G_RM_AA_ZB_XLU_INTER, G_RM_AA_ZB_XLU_INTER2);
+				gSPSetExtraGeometryModeEXT(renderdata->gdl++, G_ADDITIVE_EXT);
+				gDPSetEnvColor(renderdata->gdl++, 0, 0, 0, xblaLogoGlintShare * fade / 255);
+				gDPSetCombineLERP(renderdata->gdl++, TEXEL0, 0, SHADE, 0, 0, 0, 0, ENVIRONMENT,
+						0, 0, 0, COMBINED, 0, 0, 0, COMBINED);
+				gSPDisplayList(renderdata->gdl++, m->logoglint + (list - m->gdl));
+				gSPClearExtraGeometryModeEXT(renderdata->gdl++, G_ADDITIVE_EXT);
+			}
+
+			// The guns' Level Metal: Defection's grey map added over the paint,
+			// which the user found made the guns look good. Unlit: the Rare
+			// logo's light swings off the R as it settles facing the camera, and
+			// a lit sheen went out with it.
+			if (m->logometal && xblaLogoAddMetalShare > 0) {
+				gDPPipeSync(renderdata->gdl++);
+				gDPSetRenderMode(renderdata->gdl++, G_RM_AA_ZB_XLU_INTER, G_RM_AA_ZB_XLU_INTER2);
+				gSPSetExtraGeometryModeEXT(renderdata->gdl++, G_ADDITIVE_EXT);
+				gDPSetEnvColor(renderdata->gdl++, 0, 0, 0, xblaLogoAddMetalShare * fade / 255);
+				gDPSetCombineLERP(renderdata->gdl++, 0, 0, 0, TEXEL0, 0, 0, 0, ENVIRONMENT,
+						0, 0, 0, COMBINED, 0, 0, 0, COMBINED);
+				gSPDisplayList(renderdata->gdl++, m->logometal + (list - m->gdl));
+				gSPClearExtraGeometryModeEXT(renderdata->gdl++, G_ADDITIVE_EXT);
+			}
+
+			gSPClearExtraGeometryModeEXT(renderdata->gdl++, G_TEXGEN_EYE_EXT);
+			gSPClearGeometryMode(renderdata->gdl++, G_LIGHTING | G_TEXTURE_GEN);
+			gSPSegment(renderdata->gdl++, SPSEGMENT_MODEL_COL1, osVirtualToPhysical(boundcol));
+
+			// The node's own state back, for whatever it draws after.
+			xblaMeshApplyNodeMode(renderdata, node, 1);
+
+			if (opaquecycle2) {
+				xblaMeshSetSpanMode(renderdata, node, opaquecycle2, opaqueonecycle);
+			}
+
+			frameDraws++;
+		}
+	}
+
+	if (scorched) {
+		renderdata->envcolour = scorchedenv;
+	}
+
+	// Nor do the blended spans write their depth in a faded body's depth
+	// pass (they write none drawn solid either): see the soft span below.
+	if (xlu && xlulist && depthPass != XBLAMESH_DEPTHPASS_DEPTH) {
+		if (xblaMeshVerbose && !m->xlulogged) {
+			m->xlulogged = 1;
+			sysLogPrintf(LOG_NOTE, "xblamesh: slot %d part %d draws its alpha span "
+					"in the translucent pass", e->slot, e->part);
+		}
+
+		// The state the game's translucent draw of this node writes - the
+		// combiner, the fog and environment colours, the cycle - and then the
+		// translucent surface in the second cycle, with the fog blend kept in
+		// the first so the glass is lit like the body it is set in.
+		xblaMeshApplyNodeMode(renderdata, node, 0);
+		xblaMeshSetSpanMode(renderdata, node,
+				renderdata->zbufferenabled ? G_RM_AA_ZB_XLU_SURF2 : G_RM_AA_XLU_SURF2,
+				renderdata->zbufferenabled ? G_RM_AA_ZB_XLU_SURF : G_RM_AA_XLU_SURF);
+		gSPDisplayList(renderdata->gdl++, xlulist);
+	}
+
+	// The soft span's second draw: all of it, blended by its texels' alpha
+	// over the core the opaque pass cut and whatever is behind, which by the
+	// translucent pass is all there. Depth tested (less than, so the core is
+	// not laid over itself) and not written, and lit like the body it is on.
+	// Only the clear texels are thrown away.
+	//
+	// In a faded body's depth pass it is left out: every texel it keeps
+	// wrote its depth there, the half-clear strands' whole cards with them,
+	// and hid the hair and the head under them from the blended pass that
+	// follows: with the third person camera close (Camera Body Fade) the
+	// room showed through every gap between Joanna's fringe strands, where
+	// her forehead should be (F3 20261017-031402). Only the core, cut above,
+	// is laid in the depth.
+	if (xlu && softspan && depthPass != XBLAMESH_DEPTHPASS_DEPTH) {
+		xblaMeshApplyNodeMode(renderdata, node, 1);
+		xblaMeshSetSpanMode(renderdata, node, G_RM_AA_ZB_XLU_SURF2, G_RM_AA_ZB_XLU_SURF);
+		gDPSetAlphaCompare(renderdata->gdl++, G_AC_THRESHOLD);
+
+		if (renderdata->unk30 == 9) {
+			gDPSetPrimColor(renderdata->gdl++, 0, 0, 0, 0, 0, 0);
+		}
+
+		gSPDisplayList(renderdata->gdl++, &m->gdl[xlupart]);
+
+		if (renderdata->unk30 == 9) {
+			gDPSetPrimColor(renderdata->gdl++, 0, 0, 0, 0, 0, (renderdata->envcolour >> 8) & 0xff);
+		}
+
+		gDPSetAlphaCompare(renderdata->gdl++, G_AC_NONE);
+		frameDraws++;
+	}
+
+	if (xlu && fadelist && depthPass != XBLAMESH_DEPTHPASS_DEPTH) {
+		if (xblaMeshVerbose && !m->fadelogged) {
+			m->fadelogged = 1;
+			sysLogPrintf(LOG_NOTE, "xblamesh: slot %d part %d draws a fading span "
+					"in the translucent pass", e->slot, e->part);
+		}
+
+		// Blended by texel times vertex alpha, no depth write: a beam of light
+		// that darkens nothing behind it and hides nothing behind it. Not lit:
+		// the span carries its own combiner (see xblaMeshSetMaterial()) and
+		// the pair here has no fog blend in either cycle.
+		//
+		// A windowed door's pane goes opaque with the door's fade, as the
+		// game's own window does: the span's second cycle lays the primitive
+		// alpha over its own (xblaMeshSetMaterial()), and under mode 9 that is
+		// the fade. Investigation's sector doors hold their window as a 127
+		// pane in a group of its own, which was drawn at 127 at every distance
+		// where the game's own window goes from clear at 200 units to opaque
+		// at 900. Nought under every other mode, where nothing of the game's
+		// reads it.
+		//
+		// The primitive alpha is the second cycle's, so the cycle type is set
+		// here and not left to whatever drew last: a GoldenEye tinted pane in
+		// the HD look came here in one cycle and kept its own 26% all the way
+		// out to opadist, where GoldenEye's thickens from xludist on, then
+		// went solid blue at once (F3 20260925-225628, Facility's lab windows).
+		gDPPipeSync(renderdata->gdl++);
+		gDPSetCycleType(renderdata->gdl++, G_CYC_2CYCLE);
+		gDPSetRenderMode(renderdata->gdl++, G_RM_AA_ZB_XLU_SURF, G_RM_AA_ZB_XLU_SURF2);
+		gDPSetPrimColor(renderdata->gdl++, 0, 0, 0, 0, 0,
+				renderdata->unk30 == 9 ? (renderdata->envcolour >> 8) & 0xff : 0);
+		gSPDisplayList(renderdata->gdl++, fadelist);
+
+		// A tinted pane's far look: GoldenEye's own pane, drawn by the game
+		// after the mesh at the same opacity (xblaMeshKeptLists()), so the
+		// pane goes to the N64 look's glass as it goes opaque. That glass is
+		// environment-mapped (GoldenEye's flag 0x200, our ORTHOGONAL): a flat
+		// grey in its place (XBLAMESH_TINT_*, measured where Facility's lab
+		// windows reflect little) left Control's panes, opaque from 10 units
+		// (opadist), a black wall where GoldenEye's show the room's lights
+		// (F3 20261003-102904). The flat grey stays for a pane in a mesh with
+		// more than panes in it (the gas plant's clear door).
+		if (m->tintgdl && renderdata->unk30 == 9 && ((renderdata->envcolour >> 8) & 0xff) != 0
+				&& tintStockNode != node) {
+			gDPSetPrimColor(renderdata->gdl++, 0, 0, XBLAMESH_TINT_R, XBLAMESH_TINT_G, XBLAMESH_TINT_B,
+					(renderdata->envcolour >> 8) & 0xff);
+			gSPDisplayList(renderdata->gdl++, m->tintgdl + (fadelist - m->gdl));
+			gDPSetPrimColor(renderdata->gdl++, 0, 0, 0, 0, 0, (renderdata->envcolour >> 8) & 0xff);
+		}
+	}
+
+	if (meshdraw) {
+		gSPMeshEXT(renderdata->gdl++, NULL);
+	}
+
+	// Put segment 5 back to what the game's own draw of this node leaves in it:
+	// the model's base, which a later node's list is named against. Left on
+	// the mesh's colours, the next list resolved through it is read out of
+	// those colours - a Villa table's did that and the renderer stopped on
+	// "Unknown GBI opcode".
+	gSPSegment(renderdata->gdl++, SPSEGMENT_MODEL_COL1, osVirtualToPhysical(
+			(node->type & 0xff) == MODELNODETYPE_GUNDL
+				? (void *)node->rodata->gundl.baseaddr : (void *)node->rodata->dl.colours));
+
+	// Put the bone's own matrix back, because the divided one is this list's
+	// business and nobody else's. A display list node does not load a matrix -
+	// a chr is drawn under one matrix for the whole model, with the pose baked
+	// into its vertices - so whatever is loaded here is what the next node
+	// inherits, and a node that kept its own geometry would draw at a
+	// sixteenth of its size. This leaves behind exactly what a mesh drawn
+	// without the division leaves behind.
+	if (drawmtx != root && root) {
+		gSPMatrix(renderdata->gdl++, osVirtualToPhysical(root),
+				G_MTX_NOPUSH | G_MTX_LOAD | G_MTX_MODELVIEW);
+	}
+
+	if (xblaMeshVerbose) {
+		xblaMeshNoteDraw(model, e->slot, 1, 0);
+
+		if (optBoth) {
+			xblaMeshNoteDraw(model, e->slot, 0, 6);
+		}
+	}
+
+	// Mod.XblaMeshBoth: draw the game's geometry as well, so the two can be
+	// seen on top of each other. The only way to tell a mesh that is in the
+	// wrong place from one that is the wrong size.
+	return optBoth ? 0 : 1;
+}
+
+/* -------------------------------------------------------------------------
+ * Shots: the release's triangles, where the game would test its own
+ * ------------------------------------------------------------------------- */
+
+/**
+ * A shot at a chr is tested against the triangles the game draws: a bbox per
+ * part in screen space first (modelTestForHit()), then func0f06bea0() walks
+ * the model and hands each list under a hit box to bgTestHitOnChr(). With the
+ * release's mesh drawn in the stock lists' place that meant a guard was shot
+ * at the N64's body - the release's hair, shoulders or coat could be hit
+ * only where the N64's happened to be.
+ *
+ * So the walk asks xblaMeshHitSkipsNode() about each list it passes: a list
+ * that draws nothing (covered, or the hair the mesh paints on) is not tested,
+ * and a list that draws a group of the mesh is noted. After the walk
+ * xblaMeshHitTest() poses the noted meshes the way xblaMeshPose() does, from
+ * the same matrices bgTestHitOnChr() reads - so the triangles land in the
+ * shot's own space with nothing to convert - and tests them with the game's
+ * own triangle routine. The nearer of that and any stock list still drawn
+ * (a far LOD alternative, a piece the release left alone) is the hit.
+ *
+ * A body is one mesh on one node, so the part a hit counts as cannot come
+ * from where the list sits in the tree the way the game's does: it comes from
+ * the bone the hit triangle hangs off, as the bbox node on that bone's matrix,
+ * and from the bbox nearest the hit where a bone has none. The damage a head
+ * shot does depends on it.
+ *
+ * Not reached when the game tests boxes only - two or more human players
+ * (shotCalculateHits()'s `cheap`), or a chr's shield.
+ */
+// (with the notes full, xblaMeshObjShotTest() counts the model as wholly
+// drawn from the release rather than shooting lists past the cap on the ROM)
+#define XBLAMESH_HITLISTS 32
+
+struct xblameshhitlist {
+	struct modelnode *node;
+	struct xblameshentry *e;
+	struct xblameshbuilt *bean; // a GoldenEye release mesh (beanBuilt), or NULL for the release's slot
+};
+
+static struct xblameshhitlist hitLists[XBLAMESH_HITLISTS];
+static s32 numHitLists;
+static f32 *hitPosed;
+static s32 hitPosedCap;
+
+void xblaMeshHitBegin(void)
+{
+	numHitLists = 0;
+}
+
+// xblaMeshObjShotTest()'s noted lists, kept for the ROM walk it sends its
+// caller to (the walk starts its own notes with xblaMeshHitBegin())
+static struct modelnode *hitSkipNodes[XBLAMESH_HITLISTS];
+static s32 hitSkipNoted;
+
+static s32 xblaMeshHitIsNoted(struct modelnode *node)
+{
+	s32 i;
+
+	for (i = 0; i < numHitLists; i++) {
+		if (hitLists[i].node == node) {
+			return 1;
+		}
+	}
+
+	return 0;
+}
+
+static s32 xblaMeshHitIsSkipped(struct modelnode *node)
+{
+	s32 i;
+
+	for (i = 0; i < hitSkipNoted; i++) {
+		if (hitSkipNodes[i] == node) {
+			return 1;
+		}
+	}
+
+	return 0;
+}
+
+s32 xblaMeshHitSkipsNode(struct model *model, struct modelnode *node)
+{
+	struct xblameshentry *e;
+	s32 frompack;
+	const u32 type = node ? node->type & 0xff : 0;
+
+	if (g_NetMode == NETMODE_CLIENT) {
+		return 0;
+	}
+
+	// xblaMeshObjShotTest()'s ROM walk: a list noted as drawn from a mesh is
+	// tested on the mesh, not here
+	if (hitSkipNoted && (type == MODELNODETYPE_DL || type == MODELNODETYPE_GUNDL) && xblaMeshHitIsSkipped(node)) {
+		return 1;
+	}
+
+	if (!model || !g_XblaMeshNumNodes || (!xblaMeshGetEnabled() && !releaseOnlyLoaded) || opened <= 0 || !built ||
+			(type != MODELNODETYPE_DL && type != MODELNODETYPE_GUNDL)) {
+		return 0;
+	}
+
+	e = xblaMeshSlotFor(node);
+
+	// The same decision xblaMeshRenderNode() makes, so that what is tested is
+	// what is drawn.
+	if (!e || e->node != node || !e->modeldef || !e->matched || !xblaMeshEntryLive(e)) {
+		return 0;
+	}
+
+	frompack = e->packpart != XBLAMESH_NOPART && e->fileid && modelpackFindN64(e->fileid) != NULL;
+
+	if (frompack && e->packhasmesh && modelpackGetPrefer() == MODELPACK_PREFER_XBLA) {
+		frompack = 0;
+	}
+
+	if (frompack) {
+		return 0;
+	}
+
+	if (model->definition && model->definition != e->modeldef && !xblaMeshNodeIsGraftedFrom(model, node, e->modeldef)) {
+		return 0;
+	}
+
+	if (optOnlySlot && e->slot != optOnlySlot) {
+		return 0;
+	}
+
+	if (e->suppress == XBLAMESH_SUPPRESS_HAIR) {
+		return optBoth ? 0 : 1;
+	}
+
+	if (!xblaMeshBuild(e->slot)) {
+		return 0;
+	}
+
+	if (e->suppress == XBLAMESH_SUPPRESS_COVERED) {
+		return optBoth ? 0 : 1;
+	}
+
+	if (numHitLists < XBLAMESH_HITLISTS) {
+		hitLists[numHitLists].node = node;
+		hitLists[numHitLists].e = e;
+		hitLists[numHitLists].bean = NULL;
+		numHitLists++;
+	}
+
+	return optBoth ? 0 : 1;
+}
+
+/**
+ * Ends the ROM walk xblaMeshObjShotTest() sent its caller to with -1 for a
+ * model partly drawn from the release.
+ */
+void xblaMeshObjShotTestEnd(void)
+{
+	hitSkipNoted = 0;
+}
+
+s32 xblaMeshModelHasMesh(struct model *model)
+{
+	static const struct model *cachemodel;
+	static u32 cacheframe;
+	static s32 cacheresult;
+	struct modelnode *nodes[128];
+	s32 n;
+
+	if (!model || !model->definition || !g_XblaMeshNumNodes || (!xblaMeshGetEnabled() && !releaseOnlyLoaded) || opened <= 0 || !built) {
+		return 0;
+	}
+
+	if (model == cachemodel && frameCount == cacheframe) {
+		return cacheresult;
+	}
+
+	cachemodel = model;
+	cacheframe = frameCount;
+	cacheresult = 0;
+
+	n = xblaMeshEnumListNodes(model->definition, nodes, ARRAYCOUNT(nodes));
+
+	for (s32 i = 0; i < n && i < (s32)ARRAYCOUNT(nodes); i++) {
+		const struct xblameshentry *e = xblaMeshSlotFor(nodes[i]);
+
+		if (e && e->node == nodes[i] && e->modeldef && e->matched && !e->suppress && xblaMeshEntryLive(e) &&
+				(!e->fileid || e->packpart == XBLAMESH_NOPART || !modelpackFindN64(e->fileid) ||
+				 modelpackGetPrefer() == MODELPACK_PREFER_XBLA) &&
+				built[e->slot].state > 0) {
+			cacheresult = 1;
+			break;
+		}
+	}
+
+	return cacheresult;
+}
+
+/**
+ * How far to move what a chr holds in one hand so that it sits in the hand the
+ * GoldenEye XBLA character draws there, in the space of the hand's own matrix;
+ * 0 where the chr is not drawn as one.
+ *
+ * A held gun hangs off the hand's matrix, where GoldenEye's N64 hand closes
+ * round it. Bean's HD body is skinned onto the same matrices, but its fist is
+ * modelled somewhere else relative to that joint - higher up and further along
+ * the arm - so in the HD look every gun hung below the hand holding it, the
+ * silenced PP7's grip a whole fist under Bond's knuckles in third person (F3
+ * 20260924-053452). The N64 look draws GoldenEye's own hand and is right.
+ *
+ * Measured, once per model and hand: the centre of the HD vertices the hand's
+ * matrix carries most of, taken out of the bind pose into the hand's space
+ * (the same invbind the pose uses), less the centre of the N64 lists drawn
+ * under that matrix. The difference is where the one hand sits against the
+ * other, and the gun is moved by it.
+ */
+s32 xblaMeshHeldOffset(struct model *model, struct modelnode *handnode, f32 out[3])
+{
+	static struct {
+		const struct xblameshbuilt *m;
+		const struct modeldef *modeldef;
+		s32 mtx;
+		s32 ok;
+		f32 off[3];
+	} cache[8];
+	static s32 nextcache;
+	struct modelnode *nodes[128];
+	const struct xblameshbuilt *m = NULL;
+	const struct modeldef *modeldef;
+	f64 hd[3] = { 0.0, 0.0, 0.0 };
+	f64 n64[3] = { 0.0, 0.0, 0.0 };
+	s32 numhd = 0;
+	s32 numn64 = 0;
+	s32 mtx;
+	s32 n;
+	s32 c;
+
+	out[0] = out[1] = out[2] = 0.0f;
+
+	if (!model || !model->definition || !handnode || !xblaMeshGetEnabled() || opened <= 0 || !beanBuilt[0]
+			|| !gebeanGetEnabled()) {
+		return 0;
+	}
+
+	modeldef = model->definition;
+	n = xblaMeshEnumListNodes(model->definition, nodes, ARRAYCOUNT(nodes));
+
+	for (s32 i = 0; i < n && i < (s32)ARRAYCOUNT(nodes) && !m; i++) {
+		const struct xblameshentry *e = xblaMeshSlotFor(nodes[i]);
+
+		// the body's own lists, drawn as Bean's character (xblaMeshRenderNode()'s frombean)
+		if (e && e->node == nodes[i] && e->modeldef == modeldef && e->beanrow >= 0
+				&& e->packpart != XBLAMESH_NOPART && !gebeanRowIsFirstPerson(e->beanrow)
+				&& !(e->matched && xblaMeshEntryLive(e)) && !modelpackFindN64(e->fileid)
+				&& beanBuilt[0][e->fileid] && beanBuilt[0][e->fileid]->state > 0) {
+			m = beanBuilt[0][e->fileid];
+		}
+	}
+
+	if (!m || !m->bindpos || !m->invbind || !m->bones || !m->weights) {
+		return 0;
+	}
+
+	mtx = modelFindNodeMtxIndex(handnode, 0);
+
+	if (mtx < 0 || mtx >= m->nummatrices || mtx >= modeldef->nummatrices) {
+		return 0;
+	}
+
+	for (c = 0; c < ARRAYCOUNT(cache); c++) {
+		if (cache[c].m == m && cache[c].modeldef == modeldef && cache[c].mtx == mtx) {
+			out[0] = cache[c].off[0];
+			out[1] = cache[c].off[1];
+			out[2] = cache[c].off[2];
+
+			return cache[c].ok;
+		}
+	}
+
+	for (s32 i = 0; i < m->numvertices; i++) {
+		const u8 *bn = &m->bones[i * 4];
+		const f32 *wt = &m->weights[i * 3];
+		const s32 num = bn[3] < 3 ? bn[3] : 3;
+		struct coord in;
+		struct coord pos;
+
+		for (s32 j = 0; j < num; j++) {
+			if (bn[j] == mtx && wt[j] >= 0.6f) {
+				in.x = m->bindpos[i * 3];
+				in.y = m->bindpos[i * 3 + 1];
+				in.z = m->bindpos[i * 3 + 2];
+				mtx4TransformVec((Mtxf *)&m->invbind[mtx], &in, &pos);
+				hd[0] += pos.x;
+				hd[1] += pos.y;
+				hd[2] += pos.z;
+				numhd++;
+				break;
+			}
+		}
+	}
+
+	for (s32 i = 0; i < n && i < (s32)ARRAYCOUNT(nodes); i++) {
+		const Vtx *vertices;
+		s32 numvertices;
+
+		if ((nodes[i]->type & 0xff) == MODELNODETYPE_DL) {
+			vertices = nodes[i]->rodata->dl.vertices;
+			numvertices = nodes[i]->rodata->dl.numvertices;
+		} else if ((nodes[i]->type & 0xff) == MODELNODETYPE_GUNDL) {
+			vertices = nodes[i]->rodata->gundl.vertices;
+			numvertices = nodes[i]->rodata->gundl.numvertices;
+		} else {
+			continue;
+		}
+
+		if (!vertices || modelFindNodeMtxIndex(nodes[i], 0) != mtx) {
+			continue;
+		}
+
+		for (s32 v = 0; v < numvertices; v++) {
+			n64[0] += vertices[v].x;
+			n64[1] += vertices[v].y;
+			n64[2] += vertices[v].z;
+			numn64++;
+		}
+	}
+
+	c = nextcache;
+	nextcache = (nextcache + 1) % ARRAYCOUNT(cache);
+	cache[c].m = m;
+	cache[c].modeldef = modeldef;
+	cache[c].mtx = mtx;
+	cache[c].ok = 0;
+	cache[c].off[0] = cache[c].off[1] = cache[c].off[2] = 0.0f;
+
+	if (numhd >= 8 && numn64 >= 3) {
+		f32 len = 0.0f;
+
+		for (s32 a = 0; a < 3; a++) {
+			cache[c].off[a] = (f32)(hd[a] / numhd - n64[a] / numn64);
+			len += cache[c].off[a] * cache[c].off[a];
+		}
+
+		// A hand is a few dozen units across; an answer the size of a forearm
+		// is a mesh that weights something else to the wrist, and is left alone
+		cache[c].ok = len < 150.0f * 150.0f;
+
+		sysLogPrintf(LOG_NOTE, "xblamesh: held item on matrix %d of %p moved %.1f %.1f %.1f into the HD hand "
+				"(%d HD vertices, %d N64)%s", mtx, (const void *)modeldef,
+				cache[c].off[0], cache[c].off[1], cache[c].off[2], numhd, numn64,
+				cache[c].ok ? "" : " - too far, left where it was");
+	}
+
+	out[0] = cache[c].ok ? cache[c].off[0] : 0.0f;
+	out[1] = cache[c].ok ? cache[c].off[1] : 0.0f;
+	out[2] = cache[c].ok ? cache[c].off[2] : 0.0f;
+
+	return cache[c].ok;
+}
+
+/**
+ * Whether a model draws a GoldenEye release mesh of gebean.c's in place of its
+ * own lists (xblaMeshRenderNode()'s frombean), in the current look, and that
+ * mesh has been built.
+ */
+s32 xblaMeshModelDrawsBean(struct model *model)
+{
+	struct modelnode *nodes[128];
+	const s32 look = !xblaMeshGetEnabled();
+	s32 n;
+
+	if (!model || !model->definition || !g_XblaMeshNumNodes || !gebeanGetEnabled() || !beanBuilt[look]) {
+		return 0;
+	}
+
+	n = xblaMeshEnumListNodes(model->definition, nodes, ARRAYCOUNT(nodes));
+
+	for (s32 i = 0; i < n && i < (s32)ARRAYCOUNT(nodes); i++) {
+		const struct xblameshentry *e = xblaMeshSlotFor(nodes[i]);
+
+		if (e && e->node == nodes[i] && e->modeldef == model->definition && e->beanrow >= 0
+				&& e->packpart != XBLAMESH_NOPART && e->fileid
+				&& !(e->matched && xblaMeshEntryLive(e) && opened > 0)
+				&& !modelpackFindN64(e->fileid)
+				&& (xblaMeshGetEnabled() || gebeanRowIsPool(e->beanrow) || gebeanRowIsFirstPerson(e->beanrow))
+				&& beanBuilt[look][e->fileid] && beanBuilt[look][e->fileid]->state > 0) {
+			return 1;
+		}
+	}
+
+	return 0;
+}
+
+s32 xblaMeshModeldefDrawsMesh(const struct modeldef *modeldef)
+{
+	if (!modeldef || !g_XblaMeshNumNodes || (!xblaMeshGetEnabled() && !releaseOnlyLoaded) || opened <= 0 || !built) {
+		return 0;
+	}
+
+	// The table rather than the tree: a toggle's child is only linked while it
+	// is visible, and both the Rare logo's mesh node and the cube's are under
+	// a toggle the title switches off.
+	for (s32 i = 0; i < XBLAMESH_HASHSIZE; i++) {
+		const struct xblameshentry *e = &hash[i];
+
+		if (e->node && e->modeldef == modeldef && e->matched && !e->suppress && xblaMeshEntryLive(e) &&
+				(!e->fileid || e->packpart == XBLAMESH_NOPART || !modelpackFindN64(e->fileid) ||
+				 modelpackGetPrefer() == MODELPACK_PREFER_XBLA) &&
+				xblaMeshBuild(e->slot)) {
+			return 1;
+		}
+	}
+
+	return 0;
+}
+
+/**
+ * The bbox a hit counts against: the one on the hit bone's own matrix, or
+ * failing that the one whose box stands nearest the hit.
+ *
+ * Nearest is measured to the box and not to its matrix: a matrix's origin is
+ * the joint the part turns about, at one end of it, so a hit high on a thigh
+ * stood nearer the pelvis's pivot than the thigh's. The box is in its matrix's
+ * own space the way modelTestBboxNodeForHit() reads it - a local coordinate is
+ * (at - m[3]) . m[i] / |m[i]|^2 - and a distance outside it is scaled back by
+ * |m[i]|. A hit inside two boxes goes to the one whose centre is nearer.
+ */
+static struct modelnode *xblaMeshHitBbox(struct model *model, s32 mtxindex, const struct coord *at)
+{
+	struct modelnode *node = model->definition->rootnode;
+	struct modelnode *nearest = NULL;
+	f32 bestout = 3.4e38f;
+	f32 bestcentre = 3.4e38f;
+
+	for (s32 walked = 0; node && walked < 4096; walked++) {
+		if ((node->type & 0xff) == MODELNODETYPE_BBOX) {
+			const s32 index = modelFindNodeMtxIndex(node, 0);
+
+			if (index >= 0 && index == mtxindex) {
+				return node;
+			}
+
+			if (index >= 0 && index < model->definition->nummatrices) {
+				const Mtxf *mtx = &model->matrices[index];
+				const struct modelrodata_bbox *box = &node->rodata->bbox;
+				const f32 lo[3] = { box->xmin, box->ymin, box->zmin };
+				const f32 hi[3] = { box->xmax, box->ymax, box->zmax };
+				const f32 rel[3] = { at->x - mtx->m[3][0], at->y - mtx->m[3][1], at->z - mtx->m[3][2] };
+				f32 out = 0.0f;
+				f32 centre = 0.0f;
+
+				for (s32 a = 0; a < 3; a++) {
+					const f32 sq = mtx->m[a][0] * mtx->m[a][0] + mtx->m[a][1] * mtx->m[a][1]
+						+ mtx->m[a][2] * mtx->m[a][2];
+					f32 local;
+					f32 past;
+					f32 off;
+
+					if (sq <= 0.0f) {
+						continue;
+					}
+
+					local = (rel[0] * mtx->m[a][0] + rel[1] * mtx->m[a][1] + rel[2] * mtx->m[a][2]) / sq;
+					past = local < lo[a] ? lo[a] - local : local > hi[a] ? local - hi[a] : 0.0f;
+					off = local - (lo[a] + hi[a]) * 0.5f;
+					out += past * past * sq;
+					centre += off * off * sq;
+				}
+
+				if (out < bestout || (out == bestout && centre < bestcentre)) {
+					bestout = out;
+					bestcentre = centre;
+					nearest = node;
+				}
+			}
+		}
+
+		if (node->child) {
+			node = node->child;
+		} else {
+			while (node) {
+				if (node->next) {
+					node = node->next;
+					break;
+				}
+
+				node = node->parent;
+			}
+		}
+	}
+
+	return nearest;
+}
+
+s32 xblaMeshHitTest(struct model *model, struct coord *pos, struct coord *far, struct coord *dir,
+		f32 *sqdist, struct hitthing *hitthing, struct modelnode **bboxnode, s32 *hitpart,
+		struct modelnode **dlnode)
+{
+	const f32 origsqdist = *sqdist;
+	struct xblameshbuilt *bestm = NULL;
+	struct modelnode *bestnode = NULL;
+	struct modelnode *bbox;
+	struct coord besthit;
+	struct coord bestnormal;
+	Gfx *besttri = NULL;
+	s32 bestidx[3] = { -1, -1, -1 };
+	f32 bestbary[3] = { 1.0f, 0.0f, 0.0f };
+	s32 mtxindex = -1;
+
+	/* Net clients never resolve shots on local XBLA triangles — host SVC wins. */
+	if (g_NetMode == NETMODE_CLIENT) {
+		numHitLists = 0;
+		return 0;
+	}
+
+	if (!numHitLists || !model || !model->matrices || !model->definition) {
+		numHitLists = 0;
+		return 0;
+	}
+
+	for (s32 r = 0; r < numHitLists; r++) {
+		struct xblameshentry *e = hitLists[r].e;
+		struct modelnode *node = hitLists[r].node;
+		struct xblameshbuilt *m = hitLists[r].bean ? hitLists[r].bean : xblaMeshBuild(e->slot);
+		struct xblameshuse *use;
+		s32 groups[XBLAMESH_MAXPARTS];
+		s32 numgroups = 0;
+		Mtxf pal[XBLAMESH_MAXMTX];
+		Mtxf *root = NULL;
+		s32 skinned = 0;
+		struct coord lo;
+		struct coord hi;
+
+		if (!m || m->local || m->numvertices <= 0) {
+			continue;
+		}
+
+		if (hitLists[r].bean) {
+			// GoldenEye's release (Bean): group p is list node p's, posed from
+			// the pack's use, as xblaMeshRenderNode()'s frombean branch draws
+			// it. The release's own rule below (e->part, e->use) is not a Bean
+			// entry's: its part is 0 on every list, so each list tested the
+			// whole mesh under its own node's matrix, and Dam's truck, whose
+			// lists sit on five matrices, was shot on copies of itself standing
+			// beside and behind the one drawn (F3 20261003-231401)
+			use = (e->packuse >= 0 && e->packuse < numUses && uses[e->packuse].modeldef == e->modeldef)
+					? &uses[e->packuse] : NULL;
+
+			if (e->packpart >= m->numgroups || (e->packpart < 64 && (m->groupabsent & (1ull << e->packpart)))) {
+				continue;
+			}
+
+			groups[numgroups++] = e->packpart;
+		} else {
+			use = (e->use >= 0 && e->use < numUses && uses[e->use].modeldef == e->modeldef)
+					? &uses[e->use] : NULL;
+		}
+
+		// The groups this node draws, by xblaMeshRenderNode()'s rule.
+		if (numgroups) {
+			// a Bean list's, above
+		} else if (use && use->numparts == m->numgroups && e->part < m->numgroups) {
+			groups[numgroups++] = e->part;
+		} else if (e->part == 0) {
+			for (s32 g = 0; g < m->numgroups; g++) {
+				groups[numgroups++] = g;
+			}
+		} else {
+			continue;
+		}
+
+		if (use) {
+			root = xblaMeshSkinRoot(m, model, node, xblaMeshPartMtx(model, use, 0));
+			skinned = optPose && m->nummatrices && m->bindpos && root &&
+				m->nummatrices <= XBLAMESH_MAXMTX;
+		}
+
+		if (!root) {
+			root = modelFindNodeMtx(model, node, 0);
+		}
+
+		if (!root) {
+			continue;
+		}
+
+		// Where the draw puts a rigid mesh, the shot looks for it: the first
+		// part's rest offset off a mesh authored with it (xblaMeshRestShift()),
+		// and a destroyed object's deformation on.
+		const f32 *shift = !skinned && use && !m->bindpos ? xblaMeshRestShift(m, use, e->slot) : NULL;
+		const Vtx *rigid = !skinned && use && !m->bindpos ? xblaMeshDeformVertices(m, model, use, e->slot) : NULL;
+
+		if (!rigid) {
+			rigid = m->vertices;
+		}
+
+		if (skinned) {
+			const s32 posable = m->nummatrices < model->definition->nummatrices
+				? m->nummatrices : model->definition->nummatrices;
+
+			for (s32 i = 0; i < m->nummatrices; i++) {
+				s32 back;
+				Mtxf backbind;
+
+				if (i == 1 && i < posable && xblaMeshNeckBack(m, model->definition, &back, &backbind)) {
+					mtx4MultMtx4(&model->matrices[back], &backbind, &pal[i]);
+				} else if (i < posable) {
+					mtx4MultMtx4(&model->matrices[i], &m->invbind[i], &pal[i]);
+
+					if (m->beannumhubs) {
+						xblaMeshHubShift(m, model, i, posable, &pal[i]);
+					}
+
+					xblaMeshRotorShift(m, model, i, posable, &pal[i]);
+				} else if (posable > 0) {
+					mtx4Copy(&pal[0], &pal[i]);
+				} else {
+					mtx4LoadIdentity(&pal[i]);
+				}
+			}
+		}
+
+		if (m->numvertices > hitPosedCap) {
+			f32 *grown = realloc(hitPosed, (size_t)m->numvertices * 3 * sizeof(f32));
+
+			if (!grown) {
+				continue;
+			}
+
+			hitPosed = grown;
+			hitPosedCap = m->numvertices;
+		}
+
+		// Posed into the shot's space: the game's own matrix on each bone,
+		// out of the bind pose - no root to take back out, since nothing here
+		// has to fit in an s16.
+		for (s32 i = 0; i < m->numvertices; i++) {
+			f32 *out = &hitPosed[i * 3];
+			struct coord in;
+			struct coord moved;
+
+			if (skinned) {
+				const f32 *weight = &m->weights[i * 3];
+				const u8 *bone = &m->bones[i * 4];
+				const s32 num = bone[3] < 3 ? bone[3] : 3;
+
+				in.x = m->bindpos[i * 3];
+				in.y = m->bindpos[i * 3 + 1];
+				in.z = m->bindpos[i * 3 + 2];
+
+				out[0] = out[1] = out[2] = 0.0f;
+
+				for (s32 j = 0; j < num; j++) {
+					mtx4TransformVec(&pal[bone[j]], &in, &moved);
+					out[0] += moved.x * weight[j];
+					out[1] += moved.y * weight[j];
+					out[2] += moved.z * weight[j];
+				}
+			} else {
+				in.x = rigid[i].x - (shift ? shift[0] : 0.0f);
+				in.y = rigid[i].y - (shift ? shift[1] : 0.0f);
+				in.z = rigid[i].z - (shift ? shift[2] : 0.0f);
+				mtx4TransformVec(root, &in, &moved);
+				out[0] = moved.x;
+				out[1] = moved.y;
+				out[2] = moved.z;
+			}
+
+			if (i == 0) {
+				lo.x = hi.x = out[0];
+				lo.y = hi.y = out[1];
+				lo.z = hi.z = out[2];
+			} else {
+				lo.x = out[0] < lo.x ? out[0] : lo.x;
+				lo.y = out[1] < lo.y ? out[1] : lo.y;
+				lo.z = out[2] < lo.z ? out[2] : lo.z;
+				hi.x = out[0] > hi.x ? out[0] : hi.x;
+				hi.y = out[1] > hi.y ? out[1] : hi.y;
+				hi.z = out[2] > hi.z ? out[2] : hi.z;
+			}
+		}
+
+		// The first few only: the game traces the crosshair through every chr on
+		// screen every tick, so this would otherwise be most of the log.
+		static s32 hitlogs;
+		const s32 logthis = xblaMeshVerbose && hitlogs < 8;
+
+		if (logthis) {
+			hitlogs++;
+			sysLogPrintf(LOG_NOTE, "xblamesh: hit test slot %d part %d: %d verts %s, %d groups, box [%.0f %.0f %.0f]..[%.0f %.0f %.0f], "
+					"ray from [%.1f %.1f %.1f] along [%.3f %.3f %.3f]", e->slot, e->part, m->numvertices,
+					skinned ? "posed" : "under the root", numgroups, lo.x, lo.y, lo.z, hi.x, hi.y, hi.z,
+					pos->x, pos->y, pos->z, dir->x, dir->y, dir->z);
+		}
+
+		if ((pos->x < lo.x && far->x < lo.x) || (pos->x > hi.x && far->x > hi.x)
+				|| (pos->y < lo.y && far->y < lo.y) || (pos->y > hi.y && far->y > hi.y)
+				|| (pos->z < lo.z && far->z < lo.z) || (pos->z > hi.z && far->z > hi.z)
+				|| !bgTestLineIntersectsBbox(pos, dir, &lo, &hi)) {
+			if (logthis) {
+				sysLogPrintf(LOG_NOTE, "xblamesh: hit test slot %d: the ray misses the posed box", e->slot);
+			}
+
+			continue;
+		}
+
+		for (s32 k = 0; k < numgroups; k++) {
+			// The solid span and the cutouts (hair, a grille); not the fading
+			// span, which is light and glow a shot goes through.
+			const s32 lists[2] = { m->groupgfx[groups[k]], m->groupxlu[groups[k]] };
+
+			for (s32 l = 0; l < 2; l++) {
+				Gfx *gdl;
+				s32 base = 0;
+
+				if (lists[l] < 0) {
+					continue;
+				}
+
+				gdl = &m->gdl[lists[l]];
+
+				for (s32 c = 0; c < 0x100000; c++, gdl++) {
+					// Read through the words, the way the renderer reads these
+					// lists: they are written by the gbi macros into 64-bit
+					// words, and `Gtri`'s `tri` sits four bytes in, in the
+					// upper half of w0, where a list of ours holds nothing -
+					// read that way every triangle is vertex 0 three times.
+					const u8 op = (u8)(gdl->words.w0 >> 24);
+					const uintptr_t w1 = gdl->words.w1;
+					s32 idx[3];
+					struct coord *p[3];
+					struct coord tlo;
+					struct coord thi;
+					struct coord hitpos;
+					struct coord normal;
+
+					if (op == (u8)G_ENDDL) {
+						break;
+					}
+
+					if (op == (u8)G_VTX) {
+						base = (s32)((UNSEGADDR(w1) & 0xffffff) / sizeof(Vtx))
+							- (s32)((gdl->words.w0 >> 16) & 0xf);
+						continue;
+					}
+
+					if (op != (u8)G_TRI1) {
+						continue;
+					}
+
+					idx[0] = base + (s32)((w1 >> 16) & 0xff) / 10;
+					idx[1] = base + (s32)((w1 >> 8) & 0xff) / 10;
+					idx[2] = base + (s32)(w1 & 0xff) / 10;
+
+					if (idx[0] < 0 || idx[1] < 0 || idx[2] < 0 || idx[0] >= m->numvertices
+							|| idx[1] >= m->numvertices || idx[2] >= m->numvertices) {
+						continue;
+					}
+
+					for (s32 v = 0; v < 3; v++) {
+						p[v] = (struct coord *)&hitPosed[idx[v] * 3];
+					}
+
+					tlo = thi = *p[0];
+
+					for (s32 v = 1; v < 3; v++) {
+						for (s32 a = 0; a < 3; a++) {
+							tlo.f[a] = p[v]->f[a] < tlo.f[a] ? p[v]->f[a] : tlo.f[a];
+							thi.f[a] = p[v]->f[a] > thi.f[a] ? p[v]->f[a] : thi.f[a];
+						}
+					}
+
+					if ((pos->x < tlo.x && far->x < tlo.x) || (pos->x > thi.x && far->x > thi.x)
+							|| (pos->z < tlo.z && far->z < tlo.z) || (pos->z > thi.z && far->z > thi.z)
+							|| (pos->y < tlo.y && far->y < tlo.y) || (pos->y > thi.y && far->y > thi.y)) {
+						continue;
+					}
+
+					if (bgTestLineIntersectsBbox(pos, dir, &tlo, &thi)
+							&& func0002f560(p[0], p[1], p[2], NULL, pos, far, dir, &hitpos, &normal)) {
+						const f32 dx = hitpos.x - pos->x;
+						const f32 dy = hitpos.y - pos->y;
+						const f32 dz = hitpos.z - pos->z;
+						const f32 sq = dx * dx + dy * dy + dz * dz;
+
+						if (sq < *sqdist) {
+							// Where on the triangle it landed, taken now: the
+							// posed positions are overwritten by the next mesh.
+							const struct coord e0 = { p[1]->x - p[0]->x, p[1]->y - p[0]->y, p[1]->z - p[0]->z };
+							const struct coord e1 = { p[2]->x - p[0]->x, p[2]->y - p[0]->y, p[2]->z - p[0]->z };
+							const struct coord e2 = { hitpos.x - p[0]->x, hitpos.y - p[0]->y, hitpos.z - p[0]->z };
+							const f32 d00 = e0.x * e0.x + e0.y * e0.y + e0.z * e0.z;
+							const f32 d01 = e0.x * e1.x + e0.y * e1.y + e0.z * e1.z;
+							const f32 d11 = e1.x * e1.x + e1.y * e1.y + e1.z * e1.z;
+							const f32 d20 = e2.x * e0.x + e2.y * e0.y + e2.z * e0.z;
+							const f32 d21 = e2.x * e1.x + e2.y * e1.y + e2.z * e1.z;
+							const f32 denom = d00 * d11 - d01 * d01;
+
+							*sqdist = sq;
+							besthit = hitpos;
+							bestnormal = normal;
+							bestm = m;
+							bestnode = node;
+							besttri = gdl;
+
+							for (s32 v = 0; v < 3; v++) {
+								bestidx[v] = idx[v];
+							}
+
+							if (denom > 0.0f) {
+								const f32 b1 = (d11 * d20 - d01 * d21) / denom;
+								const f32 b2 = (d00 * d21 - d01 * d20) / denom;
+
+								bestbary[1] = b1 > 0.0f ? b1 : 0.0f;
+								bestbary[2] = b2 > 0.0f ? b2 : 0.0f;
+								bestbary[0] = 1.0f - b1 - b2 > 0.0f ? 1.0f - b1 - b2 : 0.0f;
+							} else {
+								bestbary[0] = 1.0f;
+								bestbary[1] = bestbary[2] = 0.0f;
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
+	numHitLists = 0;
+
+	if (!bestm) {
+		return 0;
+	}
+
+	// The part: the bone that moves the hit point most - each corner's weights,
+	// blended by where on the triangle the hit is, so a triangle across a joint
+	// counts as the side it was hit on rather than as its first vertex.
+	if (bestm->bindpos && bestm->bones && bestm->weights && optPose) {
+		u8 bonelist[9];
+		f32 bonesum[9];
+		s32 numbones = 0;
+		f32 bestsum = 0.0f;
+
+		for (s32 v = 0; v < 3; v++) {
+			const u8 *bone = &bestm->bones[bestidx[v] * 4];
+			const f32 *weight = &bestm->weights[bestidx[v] * 3];
+			const s32 num = bone[3] < 3 ? bone[3] : 3;
+
+			for (s32 j = 0; j < num; j++) {
+				s32 k = 0;
+
+				while (k < numbones && bonelist[k] != bone[j]) {
+					k++;
+				}
+
+				if (k == numbones) {
+					bonelist[numbones] = bone[j];
+					bonesum[numbones] = 0.0f;
+					numbones++;
+				}
+
+				bonesum[k] += weight[j] * bestbary[v];
+			}
+		}
+
+		for (s32 k = 0; k < numbones; k++) {
+			if (bonesum[k] > bestsum) {
+				bestsum = bonesum[k];
+				mtxindex = bonelist[k] < model->definition->nummatrices ? bonelist[k] : -1;
+			}
+		}
+	}
+
+	bbox = xblaMeshHitBbox(model, mtxindex, &besthit);
+
+	if (!bbox) {
+		*sqdist = origsqdist;
+		return 0;
+	}
+
+	hitthing->pos = besthit;
+	hitthing->unk0c = bestnormal;
+	hitthing->unk18 = NULL;
+	hitthing->unk1c = NULL;
+	hitthing->unk20 = NULL;
+	hitthing->tricmd = besttri;
+	hitthing->texturenum = -1;
+	hitthing->unk28 = 1;
+
+	*bboxnode = bbox;
+	*hitpart = bbox->rodata->bbox.hitpart;
+	*dlnode = bestnode;
+
+	return 1;
+}
+
+/**
+ * Notes every list of `model` whose release mesh is drawn in the current look
+ * for xblaMeshHitTest(): the release's own (xblaMeshHitSkipsNode()) and
+ * GoldenEye's release's (beanBuilt), by xblaMeshRenderNode()'s `frombean`
+ * rule. Returns how many were noted.
+ */
+static s32 xblaMeshHitNoteModel(struct model *model)
+{
+	struct modelnode *node;
+	const s32 look = !xblaMeshGetEnabled();
+
+	numHitLists = 0;
+
+	for (node = model->definition->rootnode; node; ) {
+		const u32 type = node->type & 0xff;
+
+		if (type == MODELNODETYPE_DL || type == MODELNODETYPE_GUNDL) {
+			// the release's own mesh for the list, as a shot finds it
+			xblaMeshHitSkipsNode(model, node);
+
+			// or GoldenEye's release's, by xblaMeshRenderNode()'s `frombean`
+			// rule: its HD props are drawn only with the meshes on (F6)
+			if (numHitLists < XBLAMESH_HITLISTS && gebeanGetEnabled() && beanBuilt[look]) {
+				struct xblameshentry *e = xblaMeshSlotFor(node);
+
+				if (e && e->node == node && e->modeldef == model->definition && e->beanrow >= 0
+						&& e->packpart != XBLAMESH_NOPART && e->fileid && !e->suppress
+						&& !(e->matched && xblaMeshEntryLive(e) && opened > 0)
+						&& !modelpackFindN64(e->fileid)
+						&& (xblaMeshGetEnabled() || gebeanRowIsPool(e->beanrow) || gebeanRowIsFirstPerson(e->beanrow))
+						&& beanBuilt[look][e->fileid] && beanBuilt[look][e->fileid]->state > 0) {
+					hitLists[numHitLists].node = node;
+					hitLists[numHitLists].e = e;
+					hitLists[numHitLists].bean = beanBuilt[look][e->fileid];
+					numHitLists++;
+				}
+			}
+		}
+
+		if (node->child) {
+			node = node->child;
+		} else {
+			while (node && !node->next) {
+				node = node->parent;
+			}
+
+			node = node ? node->next : NULL;
+		}
+	}
+
+	return numHitLists;
+}
+
+/**
+ * The first surface of the release's mesh drawn for `model` on the segment
+ * `from` to `to` (world space), for something that sticks where the ROM's
+ * collision surface is: the release's props are not the N64 ones' shape, and
+ * a mine stuck to a Facility tank sat inside the HD tank's fatter walls. The
+ * model's matrices are the last frame's, in the camera's space, as the shot
+ * tests them (and objEmbed() reads them); 0 where nothing of the release's is
+ * drawn on the model - the N64 look - or the segment meets none of it.
+ */
+s32 xblaMeshSurfaceAlong(struct model *model, const struct coord *from, const struct coord *to, struct coord *hit)
+{
+	struct coord pos;
+	struct coord far;
+	struct coord dir;
+	struct hitthing hitthing;
+	struct modelnode *bbox = NULL;
+	struct modelnode *dlnode = NULL;
+	s32 hitpart = 0;
+	Mtxf *camtoworld = camGetProjectionMtxF();
+	Mtxf worldtocam;
+	f32 len;
+	f32 sqdist;
+
+	if (!model || !model->matrices || !model->definition || !camtoworld || !g_XblaMeshNumNodes) {
+		return 0;
+	}
+
+	if (!xblaMeshHitNoteModel(model)) {
+		return 0;
+	}
+
+	mtx000172f0(camtoworld->m, worldtocam.m);
+	mtx4TransformVec(&worldtocam, (struct coord *)from, &pos);
+	mtx4TransformVec(&worldtocam, (struct coord *)to, &far);
+
+	dir.x = far.x - pos.x;
+	dir.y = far.y - pos.y;
+	dir.z = far.z - pos.z;
+	sqdist = dir.x * dir.x + dir.y * dir.y + dir.z * dir.z;
+	len = sqrtf(sqdist);
+
+	if (len <= 0.0f) {
+		numHitLists = 0;
+		return 0;
+	}
+
+	dir.x /= len;
+	dir.y /= len;
+	dir.z /= len;
+
+	if (!xblaMeshHitTest(model, &pos, &far, &dir, &sqdist, &hitthing, &bbox, &hitpart, &dlnode)) {
+		return 0;
+	}
+
+	mtx4TransformVec(camtoworld, &hitthing.pos, hit);
+
+	return 1;
+}
+
+/**
+ * A shot at an object that draws GoldenEye's release mesh (the HD look's
+ * props: Jungle's trees, crates, doors), against the triangles drawn rather
+ * than the ROM model's: the release's thin jungle trees stand inside the N64
+ * trunks' width, and a shot past the drawn trunk stopped on the invisible N64
+ * one (F3 20261002-234900). `pos`/`dir` are the shot's, in the camera's space
+ * as the model's matrices are, and `range` how far it reaches.
+ *
+ * -1: the model draws no GoldenEye release mesh, or the ray misses the mesh
+ * and some lists are still the ROM's - test the ROM's triangles (the mesh's
+ * lists left out until xblaMeshObjShotTestEnd()).
+ * 0: the ray misses what is drawn. 1: a hit, its position and normal in the
+ * space of the model matrix `*mtxindex` (as func0f0849dc() gives them), with
+ * the bbox it counts against and the list it was drawn for.
+ */
+s32 xblaMeshObjShotTest(struct model *model, struct coord *pos, struct coord *dir, f32 range,
+		struct hitthing *hitthing, s32 *mtxindex, struct modelnode **bboxnode, s32 *hitpart,
+		struct modelnode **dlnode)
+{
+	struct coord far;
+	struct coord local;
+	struct coord normal;
+	f32 sqdist;
+	s32 mtx;
+	Mtxf inv;
+
+	if (!model || !model->matrices || !model->definition || !g_XblaMeshNumNodes
+			|| !xblaMeshModelDrawsBean(model)) {
+		return -1;
+	}
+
+	if (!xblaMeshHitNoteModel(model)) {
+		return -1;
+	}
+
+	if (range <= 0.0f || range > 65536.0f) {
+		range = 65536.0f;
+	}
+
+	far.x = pos->x + dir->x * range;
+	far.y = pos->y + dir->y * range;
+	far.z = pos->z + dir->z * range;
+	sqdist = range * range;
+
+	if (!xblaMeshHitTest(model, pos, &far, dir, &sqdist, hitthing, bboxnode, hitpart, dlnode)) {
+		struct modelnode *node;
+
+		// A model only partly drawn from the release (some lists still the
+		// ROM's) is shot on those lists as the stock walk shoots them, with
+		// the mesh's lists left out of it; -1 sends the caller to that walk.
+		// With the notes full, lists past the cap may be the release's too
+		// and their ROM triangles invisible: the model counts as wholly the
+		// release's rather than shooting what is not drawn
+		for (node = numHitLists >= XBLAMESH_HITLISTS ? NULL : model->definition->rootnode; node; ) {
+			const u32 type = node->type & 0xff;
+
+			if ((type == MODELNODETYPE_DL || type == MODELNODETYPE_GUNDL) && !xblaMeshHitIsNoted(node)) {
+				s32 i;
+
+				for (i = 0; i < numHitLists; i++) {
+					hitSkipNodes[i] = hitLists[i].node;
+				}
+
+				hitSkipNoted = numHitLists;
+				return -1;
+			}
+
+			if (node->child) {
+				node = node->child;
+			} else {
+				while (node && !node->next) {
+					node = node->parent;
+				}
+
+				node = node ? node->next : NULL;
+			}
+		}
+
+		return 0;
+	}
+
+	mtx = modelFindNodeMtxIndex(*bboxnode, 0);
+
+	if (mtx < 0 || mtx >= model->definition->nummatrices) {
+		mtx = 0;
+	}
+
+	// into the matrix's own space, where the stock hit puts it (hitCreate()
+	// and the bullet hole read it through model->matrices[mtxindex])
+	mtx000172f0(model->matrices[mtx].m, inv.m);
+	mtx4TransformVec(&inv, &hitthing->pos, &local);
+	mtx4RotateVec(&inv, &hitthing->unk0c, &normal);
+	guNormalize(&normal.x, &normal.y, &normal.z);
+	hitthing->pos = local;
+	hitthing->unk0c = normal;
+	*mtxindex = mtx;
+
+	return 1;
+}
+
+/* -------------------------------------------------------------------------
+ * Settings
+ * ------------------------------------------------------------------------- */
+
+/**
+ * Whether there is a package to draw from. Asked of xblaimport rather than of
+ * the path, because the path unpacks an archive to answer and this is a
+ * question a menu draw is allowed to ask every frame.
+ */
+s32 xblaMeshIsAvailable(void)
+{
+	return xblaImportIsAvailable();
+}
+
+/**
+ * Whether the package is open to read: what a model load or the release's
+ * collision (xblaStageLoadTiles()) takes. mayUnpack takes a package still in
+ * its archive out of it first (seconds, once), as the switch does.
+ */
+s32 xblaMeshPackageReady(s32 mayUnpack)
+{
+	return xblaMeshOpen(mayUnpack);
+}
+
+/**
+ * For handtint.c: the mesh a model's lists are drawn from in the look the
+ * game is in, analysed at its build (xblaMeshAnalyse()) - a GoldenEye
+ * character's Bean mesh in either look, the release's own mesh in the XBLA
+ * look - or NULL, where the model draws its N64 lists or a model pack's.
+ */
+struct xblameshbuilt *xblaMeshAnalysedForModel(const struct modeldef *def)
+{
+	struct modelnode *node;
+
+	if (!def || !def->rootnode || !g_XblaMeshNumNodes || bypass) {
+		return NULL;
+	}
+
+	for (node = def->rootnode; node; ) {
+		struct xblameshentry *e = xblaMeshSlotFor(node);
+
+		if (e && e->node == node && e->modeldef == def) {
+			const s32 frompack = e->packpart != XBLAMESH_NOPART && e->fileid && modelpackFindN64(e->fileid) != NULL;
+			struct xblameshbuilt *m = NULL;
+			s32 mine = 0;
+
+			// built here if it has not been drawn yet: the player's own body
+			// is not drawn at all in first person
+			if (frompack) {
+				mine = 1;
+			} else if (e->matched && !e->suppress) {
+				mine = 1;
+
+				if (xblaMeshEntryLive(e) && opened > 0) {
+					m = xblaMeshBuild(e->slot);
+				}
+			} else if (!e->matched && e->beanrow >= 0 && e->packpart != XBLAMESH_NOPART) {
+				mine = 1;
+
+				if (gebeanGetEnabled() && (xblaMeshGetEnabled() || gebeanRowIsPool(e->beanrow))) {
+					m = xblaMeshBuildBean(e, !xblaMeshGetEnabled());
+				}
+			}
+
+			if (mine) {
+				return m && m->state > 0 && m->anatexbone ? m : NULL;
+			}
+		}
+
+		if (node->child) {
+			node = node->child;
+			continue;
+		}
+
+		while (node) {
+			if (node->next) {
+				node = node->next;
+				break;
+			}
+
+			node = node->parent;
+		}
+	}
+
+	return NULL;
+}
+
+s32 xblaMeshGetEnabled(void)
+{
+	// (off on a ROM hack's arena: xblaSwitchStageHeld())
+	return optEnabled && !xblaSwitchStageHeld();
+}
+
+/**
+ * A live switch either way: the models were matched as they loaded whether or
+ * not this was on, so turning it on draws them from the next frame.
+ *
+ * The one thing that happens here rather than at a model load is the unpack.
+ * A machine whose package is still inside its .7z has nothing to match against
+ * and has matched nothing, so the archive comes apart at the moment somebody
+ * first asks for the meshes - a few seconds, once, in a menu they have just
+ * clicked something in - and the level after that has them.
+ *
+ * Which is the one case where the switch does nothing anybody can see, so it
+ * is noted for the page to say so. The test is that this call is what opened
+ * the package: if it was already open the models were matched as they loaded
+ * and there is nothing to explain, and if it will not open there is no package
+ * and the page's items are not there to read.
+ */
+void xblaMeshSetEnabled(s32 enabled)
+{
+	// (live in a net match too: xblaSwitchSetParts())
+	enabled = enabled ? 1 : 0;
+
+	if (enabled == optEnabled) {
+		return;
+	}
+
+	optEnabled = enabled;
+	traceNoteEvent("release meshes %s", enabled ? "on" : "off");
+
+	if (enabled) {
+		const s32 wasopen = opened > 0;
+
+		if (xblaMeshOpen(1) && !wasopen && STAGE_IS_LEVEL(mainGetStageNum())) {
+			openedLate = 1;
+		}
+	}
+
+	// The rooms follow this switch (xblastage.h), and unlike the models they
+	// are not matched at the draw: the ones loaded so far have to go
+	xblaStageSwitched();
+
+	// And GoldenEye's guns, whose hands are on or off with the look
+	gebeanMeshesSwitched();
+
+	// And Agent 4, who has no N64 model and stands on the Shock Trooper's
+	xblaAgent4MeshesSwitched();
+}
+
+s32 xblaMeshModelsAreLate(void)
+{
+	return openedLate;
+}
+
+PD_CONSTRUCTOR static void xblaMeshConfigInit(void)
+{
+	configRegisterInt("Mod.XblaMeshes", &optEnabled, 0, 1);
+
+	// Mod.XblaMeshKey is registered by xblaswitch.c: the key it names switches
+	// the whole of the release now, this checkbox among it.
+
+	// Debugging one mesh at a time: everything else keeps its own geometry, so
+	// what is on screen is the game's except for the one thing being looked at
+	configRegisterInt("Mod.XblaMeshOnly", &optOnlySlot, 0, 0xffff);
+	configRegisterInt("Mod.XblaMeshBoth", &optBoth, 0, 1);
+	configRegisterInt("Mod.XblaMeshPose", &optPose, 0, 1);
+	configRegisterInt("Mod.XblaReflections", &optReflect, 0, 1);
+	configRegisterInt("Mod.XblaReflectStyle", &optReflectStyle, XBLAMESH_REFLECT_XBLA, XBLAMESH_REFLECT_METAL);
+	configRegisterInt("Mod.XblaReflectDistance", &optReflectDistance, 1, 1000);
+	configRegisterInt("Mod.XblaLogoMaterial", &optLogoMaterial, 0, 1);
+
+	// Mod.XblaMeshTextures is registered by xblatex.c, which is where the flag
+	// lives now: read at the point a picture is handed to the renderer rather
+	// than where a list is built, so it can be turned on and off in the menu.
+}
+
+void xblaMeshSetVerbose(s32 verbose)
+{
+	xblaMeshVerbose = verbose;
+}
+
+s32 xblaMeshIsVerbose(void)
+{
+	return xblaMeshVerbose;
+}
+
+u8 *xblaMeshReadFile(u16 fileid, u32 *outLen)
+{
+	if (fileid == 0 || !xblaMeshOpen(0)) {
+		return NULL;
+	}
+
+	// Slot i is file id i + 1, as everywhere in this container
+	return xblaMeshReadSlot((s32)fileid - 1, outLen);
+}
+
+void xblaMeshTrace(FILE *f)
+{
+	u32 arenakb = 0;
+	s32 chunks = 0;
+	u32 nodes = 0;
+	u32 slots = 0;
+
+	xblaMeshArenaStats(&arenakb, &chunks);
+
+	for (u32 i = 0; i < XBLAMESH_HASHSIZE; i++) {
+		if (hash[i].node) {
+			slots++;
+
+			if (hash[i].modeldef) {
+				nodes++;
+			}
+		}
+	}
+
+	fprintf(f, "xblamesh: enabled %d opened %d pose %d; %u meshes built, %u KB; pose arena %u KB in %d chunks, cap %d MB; %u nodes in %u of %d table slots; frame %u\n",
+			xblaMeshGetEnabled(), opened, optPose, g_XblaMeshNumMeshes,
+			(g_XblaMeshBytes + 1023) / 1024, arenakb, chunks,
+			XBLAMESH_ARENA_MAX / (1024 * 1024), nodes, slots, XBLAMESH_HASHSIZE,
+			frameCount);
+	fprintf(f, "xblamesh last frame: %u opaque lists drawn, %u poses written, %u posed on the GPU, %u poses refused by the arena (%u bytes wanted)\n",
+			frameDrawsLast, framePosesLast, frameGpuPosesLast, framePoseFailsLast, frameWanted);
+}
+
+s32 xblaMeshTraceModel(FILE *f, const struct model *model, const char *indent)
+{
+	struct modelnode *node;
+	s32 count = 0;
+	s32 walked = 0;
+	s32 frompack;
+
+	if (!model || !model->definition) {
+		return 0;
+	}
+
+	for (node = model->definition->rootnode; node; node = xblaMeshNextNode(node)) {
+		const struct xblameshentry *e = xblaMeshSlotFor(node);
+		const struct xblameshbuilt *m;
+
+		walked++;
+
+		if (!e || e->node != node) {
+			continue;
+		}
+
+		if (e->modeldef) {
+			count++;
+		}
+
+		if (!f) {
+			continue;
+		}
+
+		// The node's two sides, and which of them would draw: the pack's file
+		// when there is one, unless the preference hands it back to the mesh.
+		frompack = e->packpart != XBLAMESH_NOPART && e->fileid && modelpackFindN64(e->fileid) != NULL
+				&& !(e->packhasmesh && modelpackGetPrefer() == MODELPACK_PREFER_XBLA);
+
+		m = frompack ? (packBuilt ? packBuilt[e->fileid] : NULL)
+				: (built && e->matched && e->slot < numRecords ? &built[e->slot] : NULL);
+
+		if (!frompack && !e->matched && e->beanrow >= 0) {
+			const s32 look = !xblaMeshGetEnabled();
+
+			m = beanBuilt[look] ? beanBuilt[look][e->fileid] : NULL;
+			fprintf(f, "%sGoldenEye XBLA character for %s (release %s, %s look, list %d): ",
+					indent ? indent : "", gebeanRowName(e->beanrow),
+					gebeanGetEnabled() ? "here" : "not here", look ? "N64" : "HD", e->packpart);
+		}
+
+		fprintf(f, "%snode %p type %02x slot %d part %d def %p%s%s%s%s built %d",
+				indent ? indent : "", (const void *)node, node->type & 0xff,
+				e->matched ? e->slot : 0, e->matched ? e->part : 0,
+				(const void *)e->modeldef,
+				e->modeldef ? "" : " DROPPED",
+				e->suppress == XBLAMESH_SUPPRESS_HAIR ? " HAIR-suppressed" :
+				e->suppress == XBLAMESH_SUPPRESS_COVERED ? " covered" : "",
+				e->modeldef && e->modeldef != model->definition ? " (grafted or another load)" : "",
+				frompack ? " from the model pack" : "",
+				m ? m->state : 0);
+
+		if (m && m->state > 0) {
+			fprintf(f, " %d verts %d tris %d groups %d matrices, posed for %s at mesh frame %u (now %u) fine %d",
+					m->numvertices, m->numtris, m->numgroups, m->nummatrices,
+					m->posedmodel == model ? "this model" : "another model",
+					m->posedframe, frameCount, m->posedfine);
+		}
+
+		fprintf(f, "\n");
+	}
+
+	if (f && count == 0) {
+		fprintf(f, "%sno release mesh on any of the %d nodes walked (def %p)\n",
+				indent ? indent : "", walked, (const void *)model->definition);
+	}
+
+	return count;
+}
+
+/*
+ * A GoldenEye hat on a head drawn as the release's HD mesh (F3
+ * 20260930-020448, 022258: "hat needs fixing on this head").
+ *
+ * GoldenEye fits a hat to each of its 28 random heads by a table
+ * (headHat_array_8003E464, gexPlusHeadHat()): an offset and a scale made for
+ * the N64 heads. The release carries the same table byte for byte (its image
+ * at 0x82729b88), but its HD heads are 4J's, other shapes that mostly wear a
+ * hat where the hat's own model puts it: the table's lift of 25 to 40 units
+ * for Karl, Duncan, Dwayne and B (their N64 crowns stand high) floated the
+ * side cap over their HD hair, tipped back. So on an HD head the table is not
+ * applied, and a side cap or a helmet is only lifted where 4J's hair stands
+ * through it - Karl's quiff, Pete's and Dave's crowns, 6 to 21 units:
+ *
+ * 2026-09-30 that lift was all it did, and it floated the cap over the hair it
+ * was lifted clear of while hair still stood through its sides (F3 20261004-
+ * 153345 to 155030: Dave 51, Karl 42, 59, 48, and the peaked cap on 56 at Dam
+ * with hair through its crown). Now, in the frame of the joint the hat hangs
+ * on, both ways round: from each point of the hat's outside (faces up, or out
+ * from its middle and not down; a band's inward lining is not outside) along
+ * its normal, how far the head's surface stands beyond it - the triangles it
+ * leaves through until it first enters one, so a quiff over a peak is not
+ * counted; and from each point of the head above the hat's rim there, down
+ * and in towards its middle, how far it is to the outside it comes out of - a
+ * thin spike of quiff between the hat's few corners. Hair through the sides
+ * only a bigger hat covers (sized about the middle of its rim, so the rim
+ * stays where it was, as GoldenEye's own table sizes a hat to each N64 head,
+ * 0.77 to 1.18); hair through the crown a lift clears. The smallest size with
+ * the sides clear and the crown within 4 units, up to `maxscale` (1.25 for a
+ * side cap, 1.12 for a helmet or a peaked cap, which look like buckets past
+ * that); then the lift, 2 clear, at most 14 (a side cap 2: F3 20261013-001948
+ * and 002134, a side cap lifted 6 to 8 off Alan's and Karl's hair stood over
+ * it with its lining showing from below) - a few hairs through it beat a hat
+ * in the air. Each the third worst, so one stray strand is not the answer;
+ * through the sides deeper than 12 is a brow or a nape under the band, which
+ * no size fixes. A hat nothing stands through is set down until it meets the
+ * head (the third nearest, up from the head to any of its triangles), at most
+ * 20. A beret's and a fur hat's up-turned flaps read as hair and lifted them
+ * off their heads, so those are left as modelled (`maxscale` 0), as they sit.
+ *
+ * Handed back as an offset, a size and the point it is sized about, in the
+ * hat's own space, for chrRender() to apply where it applied the table's. Measured once per chr, head and hat (the hat
+ * hangs rigidly on the head joint), from this frame's matrices. 0 when either
+ * is not drawn from the release in this look, and GoldenEye's table applies.
+ */
+// A hat triangle faces up (its outside) past this much of its normal
+#define XBLAMESH_HAT_UP     0.3f
+// ... or out from its middle, short of facing down past this
+#define XBLAMESH_HAT_SIDE   -0.2f
+// The most hair is taken to stand through a hat's sides
+#define XBLAMESH_HAT_SIDEDEEP 12.0f
+// An upward face turned in towards the hat's middle past this is its lining
+#define XBLAMESH_HAT_INWARD -0.3f
+// How far clear of the hair a hat's outside is lifted
+#define XBLAMESH_HAT_CLEAR  2.0f
+// The most hair is taken to stand through a hat
+#define XBLAMESH_HAT_DEEPEST 40.0f
+#define XBLAMESH_HAT_CACHE  128
+// The largest a hat is made to cover 4J's hair, in steps from its own size
+#define XBLAMESH_HAT_STEPMAX 1.3f
+#define XBLAMESH_HAT_STEPS  30
+// A bigger hat is only worth what it takes off the hair standing through it
+#define XBLAMESH_HAT_GAIN   0.5f
+// The most a hat is lifted at a size before a bigger one is tried
+#define XBLAMESH_HAT_LIFTOK 4.0f
+// How near a hat's corners stand to a point of the head to be its rim there
+#define XBLAMESH_HAT_RIMNEAR 16.0f
+// The furthest a hat standing over the hair is set down onto it
+#define XBLAMESH_HAT_LOWEST 20.0f
+#define XBLAMESH_HAT_MAXPTS 8192
+
+static struct {
+	const struct model *chrmodel;
+	const struct modeldef *headdef;
+	const struct modeldef *hatdef;
+	s32 ok;
+	s32 headrow; // the release's rows, plus one, for the log
+	s32 hatrow;
+	f32 maxscale;
+	f32 maxlift;
+	f32 offset[7];
+} hatSeats[XBLAMESH_HAT_CACHE];
+static s32 hatSeatNext;
+
+static void xblaMeshHatSeatsReset(void)
+{
+	memset(hatSeats, 0, sizeof(hatSeats));
+	hatSeatNext = 0;
+}
+
+static const struct xblameshentry *xblaMeshBeanEntry(struct modeldef *def)
+{
+	struct modelnode *node = def ? def->rootnode : NULL;
+
+	for (s32 walked = 0; node && walked < 512; walked++) {
+		const struct xblameshentry *e = xblaMeshSlotFor(node);
+
+		if (e && e->node == node && e->modeldef == def && !e->suppress
+				&& e->beanrow >= 0 && e->packpart != XBLAMESH_NOPART) {
+			return e;
+		}
+
+		if (node->child && (node->type & 0xff) != MODELNODETYPE_HEADSPOT) {
+			node = node->child;
+		} else {
+			while (node && !node->next) {
+				node = node->parent;
+			}
+
+			node = node ? node->next : NULL;
+		}
+	}
+
+	return NULL;
+}
+
+/**
+ * Where a ray from `o` along `d` meets the triangle p0 p1 p2: its distance, 0
+ * when it misses, and `det`, which is below 0 when the ray goes the way of the
+ * triangle's normal (e1 x e2) - out through it.
+ */
+static f32 xblaMeshHatSeatTriHit(const f32 *p0, const f32 *p1, const f32 *p2, const f32 o[3], const f32 d[3], f32 *det)
+{
+	const f32 e1[3] = { p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2] };
+	const f32 e2[3] = { p2[0] - p0[0], p2[1] - p0[1], p2[2] - p0[2] };
+	const f32 h[3] = { d[1] * e2[2] - d[2] * e2[1], d[2] * e2[0] - d[0] * e2[2], d[0] * e2[1] - d[1] * e2[0] };
+	const f32 sv[3] = { o[0] - p0[0], o[1] - p0[1], o[2] - p0[2] };
+	f32 qv[3];
+	f32 u;
+	f32 v;
+	f32 t;
+
+	*det = e1[0] * h[0] + e1[1] * h[1] + e1[2] * h[2];
+
+	if (*det > -1e-6f && *det < 1e-6f) {
+		return 0.0f;
+	}
+
+	u = (sv[0] * h[0] + sv[1] * h[1] + sv[2] * h[2]) / *det;
+
+	if (u < 0.0f || u > 1.0f) {
+		return 0.0f;
+	}
+
+	qv[0] = sv[1] * e1[2] - sv[2] * e1[1];
+	qv[1] = sv[2] * e1[0] - sv[0] * e1[2];
+	qv[2] = sv[0] * e1[1] - sv[1] * e1[0];
+	v = (d[0] * qv[0] + d[1] * qv[1] + d[2] * qv[2]) / *det;
+
+	if (v < 0.0f || u + v > 1.0f) {
+		return 0.0f;
+	}
+
+	t = (e2[0] * qv[0] + e2[1] * qv[1] + e2[2] * qv[2]) / *det;
+
+	return t > 0.0f ? t : 0.0f;
+}
+
+/**
+ * How far the head's surface stands beyond a point of the hat's outside `o`
+ * along its outward normal `n` (both in the head joint's frame): the head's
+ * triangles the ray leaves through (facing along it), one after another, up to
+ * the first it enters (a quiff's underside over a cap's front is outside the
+ * hair) and no further than XBLAMESH_HAT_DEEPEST. 0 when the point is clear.
+ */
+static f32 xblaMeshHatSeatRay(const f32 *local, const s32 *tris, s32 numtris, const f32 o[3], const f32 n[3])
+{
+	f32 exitt = 0.0f;
+	f32 entert = XBLAMESH_HAT_DEEPEST;
+	f32 rlo[3];
+	f32 rhi[3];
+
+	for (s32 a = 0; a < 3; a++) {
+		const f32 end = o[a] + n[a] * XBLAMESH_HAT_DEEPEST;
+
+		rlo[a] = o[a] < end ? o[a] : end;
+		rhi[a] = o[a] > end ? o[a] : end;
+	}
+
+	// the first it enters, then the furthest it leaves short of that
+	for (s32 pass = 0; pass < 2; pass++) {
+		for (s32 i = 0; i < numtris; i++) {
+			const f32 *p0 = &local[tris[i * 3] * 3];
+			const f32 *p1 = &local[tris[i * 3 + 1] * 3];
+			const f32 *p2 = &local[tris[i * 3 + 2] * 3];
+			s32 apart = 0;
+			f32 det;
+			f32 t;
+
+			for (s32 a = 0; a < 3 && !apart; a++) {
+				apart = (p0[a] < rlo[a] && p1[a] < rlo[a] && p2[a] < rlo[a])
+					|| (p0[a] > rhi[a] && p1[a] > rhi[a] && p2[a] > rhi[a]);
+			}
+
+			if (apart) {
+				continue;
+			}
+
+			t = xblaMeshHatSeatTriHit(p0, p1, p2, o, n, &det);
+
+			// the triangle's own normal is e1 x e2: det < 0 is the ray
+			// leaving through it
+			if (t <= 0.0f || (pass == 0) != (det > 0.0f)) {
+				continue;
+			}
+
+			if (pass == 0) {
+				entert = t < entert ? t : entert;
+			} else if (t < entert && t > exitt) {
+				exitt = t;
+			}
+		}
+	}
+
+	return exitt;
+}
+
+/**
+ * The nearest of the hat's outside triangles `htris` (corners in the head
+ * joint's frame) a ray from `o` along `d` enters from in front, short of
+ * `maxt`; 0 when none. A hair from the head out through the hat's outside is
+ * one such - and a thin spike of a quiff between the hat's few corners, which
+ * xblaMeshHatSeatRay() from those corners passes by.
+ */
+static f32 xblaMeshHatSeatHit(const f32 *htris, s32 numhtris, const f32 o[3], const f32 d[3], f32 maxt, s32 anyface)
+{
+	f32 best = 0.0f;
+	f32 rlo[3];
+	f32 rhi[3];
+
+	for (s32 a = 0; a < 3; a++) {
+		const f32 end = o[a] + d[a] * maxt;
+
+		rlo[a] = o[a] < end ? o[a] : end;
+		rhi[a] = o[a] > end ? o[a] : end;
+	}
+
+	for (s32 i = 0; i < numhtris; i++) {
+		const f32 *p = &htris[i * 9];
+		s32 apart = 0;
+		f32 det;
+		f32 t;
+
+		for (s32 a = 0; a < 3 && !apart; a++) {
+			apart = (p[a] < rlo[a] && p[3 + a] < rlo[a] && p[6 + a] < rlo[a])
+				|| (p[a] > rhi[a] && p[3 + a] > rhi[a] && p[6 + a] > rhi[a]);
+		}
+
+		if (apart) {
+			continue;
+		}
+
+		t = xblaMeshHatSeatTriHit(p, p + 3, p + 6, o, d, &det);
+
+		// entering through its front: d against its normal
+		if (t > 0.0f && (anyface || det > 0.0f) && t < maxt && (best == 0.0f || t < best)) {
+			best = t;
+		}
+	}
+
+	return best;
+}
+
+static void xblaMeshHatSeatTop3(f32 worst[3], f32 d)
+{
+	for (s32 r = 0; r < 3; r++) {
+		if (d > worst[r]) {
+			for (s32 m2 = 2; m2 > r; m2--) {
+				worst[m2] = worst[m2 - 1];
+			}
+
+			worst[r] = d;
+			break;
+		}
+	}
+}
+
+/**
+ * With the hat sized `scale` about `anchor`, how far hair still stands through
+ * its sides (which only a bigger hat covers) and the lift that clears its
+ * crown - each the third worst, so one stray strand of hair is not the answer.
+ */
+static void xblaMeshHatSeatNeed(const f32 *pts, s32 numpts, const f32 anchor[3], f32 scale, f32 *side, f32 *need, s32 *through)
+{
+	f32 sides[3] = { 0.0f, 0.0f, 0.0f };
+	f32 lifts[3] = { 0.0f, 0.0f, 0.0f };
+
+	*through = 0;
+
+	for (s32 i = 0; i < numpts; i++) {
+		const f32 *pt = &pts[i * 7];
+		f32 r;
+
+		if (pt[6] <= 0.0f) {
+			continue;
+		}
+
+		r = pt[6] - (scale - 1.0f) * ((pt[0] - anchor[0]) * pt[3] + (pt[1] - anchor[1]) * pt[4] + (pt[2] - anchor[2]) * pt[5]);
+
+		if (r <= 0.0f) {
+			continue;
+		}
+
+		(*through)++;
+
+		// hair through the crown a lift clears; through the sides only a
+		// bigger hat, and deeper there than hair stands is a brow or a nape
+		// under the band, which none does
+		if (pt[4] >= XBLAMESH_HAT_UP) {
+			xblaMeshHatSeatTop3(lifts, r / pt[4]);
+		} else if (pt[6] <= XBLAMESH_HAT_SIDEDEEP) {
+			xblaMeshHatSeatTop3(sides, r);
+		}
+	}
+
+	*side = sides[2];
+	*need = lifts[2];
+}
+
+static s32 xblaMeshHatSeatMeasure(struct model *chrmodel, struct modeldef *headdef, struct model *hatmodel, f32 maxscale,
+		f32 maxlift, f32 out[7], s32 *outheadrow, s32 *outhatrow)
+{
+	const struct xblameshentry *he = xblaMeshBeanEntry(headdef);
+	const struct xblameshentry *te = xblaMeshBeanEntry(hatmodel->definition);
+	struct xblameshbuilt *head;
+	struct xblameshbuilt *hat;
+	const s32 nummtx = chrmodel->definition->nummatrices;
+	f32 headshift[3] = { 0.0f, 0.0f, 0.0f };
+	s32 votes[XBLAMESH_MAXMTX];
+	s32 bh = -1;
+	Mtxf lifted[XBLAMESH_MAXMTX];
+	Mtxf hj;
+	Mtxf invhj;
+	f32 *local;
+	f32 lift = 0.0f;
+	f32 worst[3] = { -1e9f, -1e9f, -1e9f };
+	s32 touches = 0;
+	f32 *pts;
+	s32 numpts = 0;
+	f32 alo[3] = { 1e9f, 1e9f, 1e9f };
+	f32 ahi[3] = { -1e9f, -1e9f, -1e9f };
+	f32 anchor[3];
+	f32 mid[2];
+	f32 scale = 1.0f;
+	s32 *tris = NULL;
+	s32 numtris = 0;
+	s32 captris = 0;
+	f32 *vnormals;
+	f32 *htris = NULL;
+	s32 numhtris = 0;
+	s32 caphtris = 0;
+	f32 *atris = NULL;
+	s32 numatris = 0;
+	s32 capatris = 0;
+	f32 drop = 0.0f;
+
+	if (!he || !te) {
+		return 0;
+	}
+
+	head = xblaMeshBuildBean(he, 0);
+	hat = xblaMeshBuildBean(te, 0);
+
+	if (!head || !hat || !head->beanhead || hat->beanhead || !head->bindpos || !head->bones
+			|| !head->weights || !head->invbind || !hat->vertices || hat->numvertices <= 0
+			|| head->nummatrices > XBLAMESH_MAXMTX || !chrmodel->matrices || !hatmodel->matrices) {
+		return 0;
+	}
+
+	out[0] = out[1] = out[2] = 0.0f;
+	out[3] = 1.0f;
+	out[4] = out[5] = out[6] = 0.0f;
+
+	if (maxscale <= 0.0f) {
+		return 1;
+	}
+
+	// The head's joint: the matrix most of its vertices hang from
+	memset(votes, 0, sizeof(votes));
+
+	for (s32 i = 0; i < head->numvertices; i++) {
+		const u8 *bone = &head->bones[i * 4];
+
+		if (bone[3] > 0 && bone[0] < XBLAMESH_MAXMTX) {
+			votes[bone[0]]++;
+		}
+	}
+
+	for (s32 i = 0; i < XBLAMESH_MAXMTX; i++) {
+		if (votes[i] > 0 && (bh < 0 || votes[i] > votes[bh])) {
+			bh = i;
+		}
+	}
+
+	if (bh < 0 || bh >= nummtx || bh >= head->nummatrices) {
+		return 0;
+	}
+
+	// Posed as the draw poses it (xblaMeshPose()), the seat it is given on
+	// this body included
+	xblaMeshPoolHeadSeat(head, he, chrmodel, headshift);
+	headshift[1] += (f32)headfitAppliedOffset(he->modeldef);
+
+	for (s32 b = 0; b < head->nummatrices; b++) {
+		const Mtxf *src = &chrmodel->matrices[b < nummtx ? b : bh];
+		Mtxf moved = *src;
+
+		for (s32 j = 0; j < 3; j++) {
+			moved.m[3][j] += src->m[0][j] * headshift[0] + src->m[1][j] * headshift[1] + src->m[2][j] * headshift[2];
+		}
+
+		mtx4MultMtx4(&moved, &head->invbind[b], &lifted[b]);
+
+		if (b == bh) {
+			hj = moved;
+		}
+	}
+
+	// The frame the hat hangs in - the head joint GoldenEye attaches it to -
+	// which is where up is the head's up whatever the pose (the mesh's own
+	// palette entries are the body's matrices)
+	if (hatmodel->attachedtonode) {
+		Mtxf *joint = modelFindNodeMtx(chrmodel, hatmodel->attachedtonode, 0);
+
+		if (joint) {
+			hj = *joint;
+		}
+	}
+
+	xblaMeshInvert(&hj, &invhj);
+
+	// The head in its joint's frame, where up is up
+	local = malloc((size_t)head->numvertices * 3 * sizeof(f32));
+
+	if (!local) {
+		return 0;
+	}
+
+	for (s32 i = 0; i < head->numvertices; i++) {
+		const u8 *bone = &head->bones[i * 4];
+		const f32 *weight = &head->weights[i * 3];
+		const s32 num = bone[3] < 3 ? bone[3] : 3;
+		struct coord in = { head->bindpos[i * 3], head->bindpos[i * 3 + 1], head->bindpos[i * 3 + 2] };
+		struct coord w = { 0.0f, 0.0f, 0.0f };
+		struct coord q;
+
+		for (s32 j = 0; j < num; j++) {
+			struct coord moved;
+
+			mtx4TransformVec(&lifted[bone[j] < head->nummatrices ? bone[j] : bh], &in, &moved);
+			w.x += moved.x * weight[j];
+			w.y += moved.y * weight[j];
+			w.z += moved.z * weight[j];
+		}
+
+		mtx4TransformVec(&invhj, &w, &q);
+		local[i * 3] = q.x;
+		local[i * 3 + 1] = q.y;
+		local[i * 3 + 2] = q.z;
+	}
+
+	// The head's triangles, the hair's cutout cards with them (not its fading
+	// span), read out of the lists as the hit test reads them
+	for (s32 k = 0; k < head->numgroups * 2 && k < 128; k++) {
+		const s32 group = k >> 1;
+		const s32 start = (k & 1) ? head->groupxlu[group] : head->groupgfx[group];
+		Gfx *gdl;
+		s32 base = 0;
+
+		if (start < 0 || (head->groupabsent & (1ull << group))) {
+			continue;
+		}
+
+		gdl = &head->gdl[start];
+
+		for (s32 c = 0; c < 0x100000; c++, gdl++) {
+			const u8 op = (u8)(gdl->words.w0 >> 24);
+			const uintptr_t w1 = gdl->words.w1;
+			s32 idx[3];
+
+			if (op == (u8)G_ENDDL) {
+				break;
+			}
+
+			if (op == (u8)G_VTX) {
+				base = (s32)((UNSEGADDR(w1) & 0xffffff) / sizeof(Vtx)) - (s32)((gdl->words.w0 >> 16) & 0xf);
+				continue;
+			}
+
+			if (op != (u8)G_TRI1) {
+				continue;
+			}
+
+			idx[0] = base + (s32)((w1 >> 16) & 0xff) / 10;
+			idx[1] = base + (s32)((w1 >> 8) & 0xff) / 10;
+			idx[2] = base + (s32)(w1 & 0xff) / 10;
+
+			if (idx[0] < 0 || idx[1] < 0 || idx[2] < 0 || idx[0] >= head->numvertices
+					|| idx[1] >= head->numvertices || idx[2] >= head->numvertices) {
+				continue;
+			}
+
+			// kept for the rays out from the hat's outside
+			if (numtris >= captris) {
+				s32 *grown = realloc(tris, (size_t)(captris + 1024) * 3 * sizeof(s32));
+
+				if (grown) {
+					tris = grown;
+					captris += 1024;
+				}
+			}
+
+			if (numtris < captris) {
+				tris[numtris * 3] = idx[0];
+				tris[numtris * 3 + 1] = idx[1];
+				tris[numtris * 3 + 2] = idx[2];
+				numtris++;
+			}
+		}
+	}
+
+	// The hat's middle across, which its sides face away from, and the head's
+	// triangles within reach of it (a ray goes no further than
+	// XBLAMESH_HAT_DEEPEST): the face and neck below are most of the head
+	{
+		f32 mlo[2] = { 1e9f, 1e9f };
+		f32 mhi[2] = { -1e9f, -1e9f };
+		f32 blo[3] = { 1e9f, 1e9f, 1e9f };
+		f32 bhi[3] = { -1e9f, -1e9f, -1e9f };
+		s32 kept = 0;
+
+		for (s32 i = 0; i < hat->numvertices; i++) {
+			struct coord in = { hat->vertices[i].x, hat->vertices[i].y, hat->vertices[i].z };
+			struct coord w;
+			struct coord q;
+
+			mtx4TransformVec(&hatmodel->matrices[0], &in, &w);
+			mtx4TransformVec(&invhj, &w, &q);
+			mlo[0] = q.x < mlo[0] ? q.x : mlo[0];
+			mhi[0] = q.x > mhi[0] ? q.x : mhi[0];
+			mlo[1] = q.z < mlo[1] ? q.z : mlo[1];
+			mhi[1] = q.z > mhi[1] ? q.z : mhi[1];
+
+			for (s32 a = 0; a < 3; a++) {
+				blo[a] = q.f[a] < blo[a] ? q.f[a] : blo[a];
+				bhi[a] = q.f[a] > bhi[a] ? q.f[a] : bhi[a];
+			}
+		}
+
+		mid[0] = (mlo[0] + mhi[0]) * 0.5f;
+		mid[1] = (mlo[1] + mhi[1]) * 0.5f;
+
+		// grown by the reach and by the most the hat is made bigger
+		for (s32 a = 0; a < 3; a++) {
+			const f32 grow = XBLAMESH_HAT_DEEPEST + (bhi[a] - blo[a]) * (XBLAMESH_HAT_STEPMAX - 1.0f);
+
+			blo[a] -= grow;
+			bhi[a] += grow;
+		}
+
+		for (s32 i = 0; i < numtris; i++) {
+			s32 near = 1;
+
+			for (s32 a = 0; a < 3 && near; a++) {
+				const f32 v0 = local[tris[i * 3] * 3 + a];
+				const f32 v1 = local[tris[i * 3 + 1] * 3 + a];
+				const f32 v2 = local[tris[i * 3 + 2] * 3 + a];
+
+				near = !((v0 < blo[a] && v1 < blo[a] && v2 < blo[a]) || (v0 > bhi[a] && v1 > bhi[a] && v2 > bhi[a]));
+			}
+
+			if (near) {
+				memmove(&tris[kept * 3], &tris[i * 3], 3 * sizeof(s32));
+				kept++;
+			}
+		}
+
+		numtris = kept;
+	}
+
+	// The hat's outside - its triangles facing up in the head's frame, or out
+	// from its middle and not down, which a cap's lining does not - each
+	// corner with its triangle's outward normal, and how far the head's
+	// surface stands beyond it that way: hair through the hat there
+	pts = malloc((size_t)XBLAMESH_HAT_MAXPTS * 7 * sizeof(f32));
+	vnormals = calloc((size_t)hat->numvertices * 4, sizeof(f32));
+
+	if (!pts || !vnormals) {
+		free(pts);
+		free(vnormals);
+		free(local);
+		free(tris);
+		return 0;
+	}
+
+
+	for (s32 k = 0; k < hat->numgroups && k < 64; k++) {
+		for (s32 l = 0; l < 2; l++) {
+			const s32 start = l == 0 ? hat->groupgfx[k] : hat->groupxlu[k];
+			Gfx *gdl;
+			s32 base = 0;
+
+			if (start < 0 || (hat->groupabsent & (1ull << k))) {
+				continue;
+			}
+
+			gdl = &hat->gdl[start];
+
+			for (s32 c = 0; c < 0x100000; c++, gdl++) {
+				const u8 op = (u8)(gdl->words.w0 >> 24);
+				const uintptr_t w1 = gdl->words.w1;
+				s32 idx[3];
+				struct coord q[3];
+				f32 e0[3];
+				f32 e1[3];
+				f32 n[3];
+				f32 len;
+
+				if (op == (u8)G_ENDDL) {
+					break;
+				}
+
+				if (op == (u8)G_VTX) {
+					base = (s32)((UNSEGADDR(w1) & 0xffffff) / sizeof(Vtx)) - (s32)((gdl->words.w0 >> 16) & 0xf);
+					continue;
+				}
+
+				if (op != (u8)G_TRI1) {
+					continue;
+				}
+
+				idx[0] = base + (s32)((w1 >> 16) & 0xff) / 10;
+				idx[1] = base + (s32)((w1 >> 8) & 0xff) / 10;
+				idx[2] = base + (s32)(w1 & 0xff) / 10;
+
+				if (idx[0] < 0 || idx[1] < 0 || idx[2] < 0 || idx[0] >= hat->numvertices
+						|| idx[1] >= hat->numvertices || idx[2] >= hat->numvertices) {
+					continue;
+				}
+
+				for (s32 v = 0; v < 3; v++) {
+					struct coord in = { hat->vertices[idx[v]].x, hat->vertices[idx[v]].y, hat->vertices[idx[v]].z };
+					struct coord w;
+
+					mtx4TransformVec(&hatmodel->matrices[0], &in, &w);
+					mtx4TransformVec(&invhj, &w, &q[v]);
+				}
+
+				e0[0] = q[1].x - q[0].x; e0[1] = q[1].y - q[0].y; e0[2] = q[1].z - q[0].z;
+				e1[0] = q[2].x - q[0].x; e1[1] = q[2].y - q[0].y; e1[2] = q[2].z - q[0].z;
+				n[0] = e0[1] * e1[2] - e0[2] * e1[1];
+				n[1] = e0[2] * e1[0] - e0[0] * e1[2];
+				n[2] = e0[0] * e1[1] - e0[1] * e1[0];
+				len = sqrtf(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+
+				if (len < 1e-6f) {
+					continue;
+				}
+
+				n[0] /= len;
+				n[1] /= len;
+				n[2] /= len;
+
+				if (numatris >= capatris) {
+					f32 *grown = realloc(atris, (size_t)(capatris + 256) * 9 * sizeof(f32));
+
+					if (grown) {
+						atris = grown;
+						capatris += 256;
+					}
+				}
+
+				if (numatris < capatris) {
+					for (s32 v = 0; v < 3; v++) {
+						atris[numatris * 9 + v * 3] = q[v].x;
+						atris[numatris * 9 + v * 3 + 1] = q[v].y;
+						atris[numatris * 9 + v * 3 + 2] = q[v].z;
+					}
+
+					numatris++;
+				}
+
+				{
+					const f32 cx = (q[0].x + q[1].x + q[2].x) / 3.0f - mid[0];
+					const f32 cz = (q[0].z + q[1].z + q[2].z) / 3.0f - mid[1];
+					const f32 cl = sqrtf(cx * cx + cz * cz);
+					const f32 out = cl > 1e-3f ? (n[0] * cx + n[2] * cz) / cl : 0.0f;
+
+					// a band's inside, facing in however much up, is the
+					// lining, not the outside
+					if (n[1] < XBLAMESH_HAT_UP ? n[1] < XBLAMESH_HAT_SIDE || out <= 0.0f : out < XBLAMESH_HAT_INWARD) {
+						continue;
+					}
+				}
+
+				if (numhtris >= caphtris) {
+					f32 *grown = realloc(htris, (size_t)(caphtris + 256) * 9 * sizeof(f32));
+
+					if (grown) {
+						htris = grown;
+						caphtris += 256;
+					}
+				}
+
+				if (numhtris < caphtris) {
+					for (s32 v = 0; v < 3; v++) {
+						htris[numhtris * 9 + v * 3] = q[v].x;
+						htris[numhtris * 9 + v * 3 + 1] = q[v].y;
+						htris[numhtris * 9 + v * 3 + 2] = q[v].z;
+					}
+
+					numhtris++;
+				}
+
+				// each corner once, along the outside's normals there
+				// averaged (a ray a corner is a few hundred tests)
+				for (s32 v = 0; v < 3; v++) {
+					const f32 o[3] = { q[v].x, q[v].y, q[v].z };
+					f32 *vn = &vnormals[idx[v] * 4];
+
+					vn[0] += n[0]; vn[1] += n[1]; vn[2] += n[2];
+					vn[3] = 1.0f;
+
+					alo[0] = o[0] < alo[0] ? o[0] : alo[0];
+					ahi[0] = o[0] > ahi[0] ? o[0] : ahi[0];
+					alo[1] = o[1] < alo[1] ? o[1] : alo[1];
+					alo[2] = o[2] < alo[2] ? o[2] : alo[2];
+					ahi[2] = o[2] > ahi[2] ? o[2] : ahi[2];
+				}
+			}
+		}
+	}
+
+	for (s32 i = 0; i < hat->numvertices && numpts < XBLAMESH_HAT_MAXPTS; i++) {
+		const f32 *vn = &vnormals[i * 4];
+		const f32 len = sqrtf(vn[0] * vn[0] + vn[1] * vn[1] + vn[2] * vn[2]);
+		struct coord in = { hat->vertices[i].x, hat->vertices[i].y, hat->vertices[i].z };
+		struct coord w;
+		struct coord q;
+		f32 *pt = &pts[numpts * 7];
+
+		if (vn[3] == 0.0f || len < 1e-3f) {
+			continue;
+		}
+
+		mtx4TransformVec(&hatmodel->matrices[0], &in, &w);
+		mtx4TransformVec(&invhj, &w, &q);
+		pt[0] = q.x; pt[1] = q.y; pt[2] = q.z;
+		pt[3] = vn[0] / len; pt[4] = vn[1] / len; pt[5] = vn[2] / len;
+		pt[6] = xblaMeshHatSeatRay(local, tris, numtris, pt, &pt[3]);
+		numpts++;
+	}
+
+	free(vnormals);
+
+	// The head's own points out through the hat's outside, straight down
+	// onto it or in towards its middle: each a point of the hat to move out
+	// past the hair, the way the ray came in reversed
+	for (s32 i = 0; i < head->numvertices && numhtris > 0; i++) {
+		const f32 *o = &local[i * 3];
+		f32 dirs[2][3] = { { 0.0f, -1.0f, 0.0f }, { mid[0] - o[0], 0.0f, mid[1] - o[2] } };
+		const f32 across = sqrtf(dirs[1][0] * dirs[1][0] + dirs[1][2] * dirs[1][2]);
+		f32 hit[2] = { 0.0f, 0.0f };
+		f32 rim = 1e9f;
+
+		if (o[0] < alo[0] || o[0] > ahi[0] || o[2] < alo[2] || o[2] > ahi[2] || o[1] <= alo[1]) {
+			continue;
+		}
+
+		hit[0] = xblaMeshHatSeatHit(htris, numhtris, o, dirs[0], XBLAMESH_HAT_DEEPEST, 0);
+
+		if (across >= 1e-3f) {
+			dirs[1][0] /= across;
+			dirs[1][2] /= across;
+			hit[1] = xblaMeshHatSeatHit(htris, numhtris, o, dirs[1],
+					across < XBLAMESH_HAT_DEEPEST ? across : XBLAMESH_HAT_DEEPEST, 0);
+		}
+
+		if (hit[0] <= 0.0f && hit[1] <= 0.0f) {
+			continue;
+		}
+
+		// above the hat's rim there - a brow under a cap's peak or its
+		// band is outside it, not through it
+		for (s32 j = 0; j < numatris * 3; j++) {
+			const f32 *c = &atris[j * 3];
+			const f32 dx = c[0] - o[0];
+			const f32 dz = c[2] - o[2];
+
+			if (dx * dx + dz * dz < XBLAMESH_HAT_RIMNEAR * XBLAMESH_HAT_RIMNEAR && c[1] < rim) {
+				rim = c[1];
+			}
+		}
+
+		if (o[1] <= rim) {
+			continue;
+		}
+
+		for (s32 k = 0; k < 2 && numpts < XBLAMESH_HAT_MAXPTS; k++) {
+			if (hit[k] > 0.0f) {
+				f32 *pt = &pts[numpts * 7];
+
+				pt[0] = o[0] + dirs[k][0] * hit[k];
+				pt[1] = o[1] + dirs[k][1] * hit[k];
+				pt[2] = o[2] + dirs[k][2] * hit[k];
+				pt[3] = -dirs[k][0];
+				pt[4] = -dirs[k][1];
+				pt[5] = -dirs[k][2];
+				pt[6] = hit[k];
+				numpts++;
+			}
+		}
+	}
+
+	// How far the hat could come down before it meets the head: up from
+	// each point of the head under it to the nearest of its triangles, the
+	// third nearest of them
+	{
+		f32 nearest[3] = { -XBLAMESH_HAT_DEEPEST, -XBLAMESH_HAT_DEEPEST, -XBLAMESH_HAT_DEEPEST };
+		const f32 up[3] = { 0.0f, 1.0f, 0.0f };
+		s32 hits = 0;
+
+		for (s32 i = 0; i < head->numvertices && numatris > 0; i++) {
+			const f32 *o = &local[i * 3];
+			f32 t;
+
+			if (o[0] < alo[0] || o[0] > ahi[0] || o[2] < alo[2] || o[2] > ahi[2]) {
+				continue;
+			}
+
+			t = xblaMeshHatSeatHit(atris, numatris, o, up, XBLAMESH_HAT_DEEPEST, 1);
+
+			if (t > 0.0f) {
+				xblaMeshHatSeatTop3(nearest, -t);
+				hits++;
+			}
+		}
+
+		drop = hits >= 3 ? -nearest[2] : 0.0f;
+	}
+
+	free(local);
+	free(tris);
+	free(htris);
+	free(atris);
+
+	if (numpts < 3) {
+		free(pts);
+		return 0;
+	}
+
+	// The hat is sized about the middle of its rim: wider and taller, its
+	// rim where it was
+	anchor[0] = (alo[0] + ahi[0]) * 0.5f;
+	anchor[1] = alo[1];
+	anchor[2] = (alo[2] + ahi[2]) * 0.5f;
+
+	// Hair through the hat's sides only a bigger hat covers; through its
+	// crown a lift clears too. The smallest size whose sides are clear and
+	// whose lift is no more than XBLAMESH_HAT_LIFTOK (GoldenEye's own table
+	// sizes the hat to each N64 head, 0.77 to 1.18); past the largest, the
+	// size with the least left over
+	{
+		f32 bestcost = 1e9f;
+
+		for (s32 step = 0; step <= XBLAMESH_HAT_STEPS; step++) {
+			const f32 s = 1.0f + (XBLAMESH_HAT_STEPMAX - 1.0f) * (f32)step / (f32)XBLAMESH_HAT_STEPS;
+
+			if (s > maxscale + 0.001f) {
+				break;
+			}
+
+			f32 side;
+			f32 need;
+			f32 cost;
+
+			xblaMeshHatSeatNeed(pts, numpts, anchor, s, &side, &need, &touches);
+
+			if (step == 0) {
+				worst[0] = need > side ? need : side;
+			}
+
+			if (side <= 0.0f && need <= XBLAMESH_HAT_LIFTOK) {
+				scale = s;
+				lift = need;
+				bestcost = -1.0f;
+				break;
+			}
+
+			cost = (side > 0.0f ? side : 0.0f) + (need > 0.0f ? need : 0.0f);
+
+			if (cost < bestcost - XBLAMESH_HAT_GAIN) {
+				bestcost = cost;
+				scale = s;
+				lift = need;
+			}
+		}
+	}
+
+	free(pts);
+
+	worst[2] = lift;
+	lift = lift > 0.0f ? lift + XBLAMESH_HAT_CLEAR : 0.0f;
+	lift = lift > maxlift ? maxlift : lift;
+
+	// Nothing through it, a hat standing over the hair is set down onto it
+	if (scale == 1.0f && lift == 0.0f && drop > XBLAMESH_HAT_CLEAR) {
+		lift = -(drop - XBLAMESH_HAT_CLEAR < XBLAMESH_HAT_LOWEST ? drop - XBLAMESH_HAT_CLEAR : XBLAMESH_HAT_LOWEST);
+	}
+
+	// Along the joint's up, as an offset in the hat's own space, and the
+	// point it is sized about there
+	{
+		struct coord up = { hj.m[1][0] * lift, hj.m[1][1] * lift, hj.m[1][2] * lift };
+		struct coord a = { anchor[0], anchor[1], anchor[2] };
+		struct coord aw;
+		struct coord t;
+		Mtxf invmt;
+
+		xblaMeshInvert(&hatmodel->matrices[0], &invmt);
+		mtx4TransformVec(&hj, &a, &aw);
+		mtx4TransformVec(&invmt, &aw, &t);
+		out[4] = t.x;
+		out[5] = t.y;
+		out[6] = t.z;
+		invmt.m[3][0] = invmt.m[3][1] = invmt.m[3][2] = 0.0f;
+		mtx4TransformVec(&invmt, &up, &t);
+		out[0] = t.x;
+		out[1] = t.y;
+		out[2] = t.z;
+		out[3] = scale;
+	}
+
+	// Once a stage for each head and hat
+	{
+		s32 seen = 0;
+
+		for (s32 i = 0; i < XBLAMESH_HAT_CACHE; i++) {
+			if (hatSeats[i].headrow == he->beanrow + 1 && hatSeats[i].hatrow == te->beanrow + 1) {
+				seen = 1;
+				break;
+			}
+		}
+
+		if (!seen) {
+			sysLogPrintf(LOG_NOTE, "xblamesh: hat %s on head %s seated by its HD mesh: hair %.1f through its outside, sized %.2f (hair %.1f), %.1f over the head, lifted %.1f",
+					gebeanRowName(te->beanrow), gebeanRowName(he->beanrow), worst[0], scale, worst[2], drop, lift);
+		}
+
+		*outheadrow = he->beanrow + 1;
+		*outhatrow = te->beanrow + 1;
+	}
+
+	return 1;
+}
+
+s32 xblaMeshHatSeat(struct model *chrmodel, struct modeldef *headdef, struct model *hatmodel, f32 maxscale, f32 maxlift, f32 out[7])
+{
+	s32 at = -1;
+	s32 same = -1;
+
+	if (!xblaMeshGetEnabled() || !chrmodel || !headdef || !hatmodel || !hatmodel->definition || !chrmodel->definition) {
+		return 0;
+	}
+
+	for (s32 i = 0; i < XBLAMESH_HAT_CACHE; i++) {
+		if (hatSeats[i].chrmodel && hatSeats[i].headdef == headdef && hatSeats[i].hatdef == hatmodel->definition
+				&& hatSeats[i].maxscale == maxscale && hatSeats[i].maxlift == maxlift) {
+			if (hatSeats[i].chrmodel == chrmodel) {
+				at = i;
+				break;
+			}
+
+			same = i;
+		}
+	}
+
+	if (at < 0) {
+		at = hatSeatNext;
+		hatSeatNext = (hatSeatNext + 1) % XBLAMESH_HAT_CACHE;
+
+		if (same >= 0 && same != at) {
+			// another chr wears the same hat on the same head: the seat is in
+			// the hat's own space, which hangs rigidly on the head's joint, so
+			// it is the same seat, and each measure is millions of ray tests
+			hatSeats[at] = hatSeats[same];
+			hatSeats[at].chrmodel = chrmodel;
+		} else {
+			s32 headrow = 0;
+			s32 hatrow = 0;
+
+			hatSeats[at].chrmodel = chrmodel;
+			hatSeats[at].headdef = headdef;
+			hatSeats[at].hatdef = hatmodel->definition;
+			hatSeats[at].maxscale = maxscale;
+			hatSeats[at].maxlift = maxlift;
+			hatSeats[at].headrow = hatSeats[at].hatrow = 0;
+			hatSeats[at].ok = xblaMeshHatSeatMeasure(chrmodel, headdef, hatmodel, maxscale, maxlift, hatSeats[at].offset, &headrow, &hatrow);
+			hatSeats[at].headrow = headrow;
+			hatSeats[at].hatrow = hatrow;
+		}
+	}
+
+	if (hatSeats[at].ok) {
+		for (s32 i = 0; i < 7; i++) {
+			out[i] = hatSeats[at].offset[i];
+		}
+	}
+
+	return hatSeats[at].ok;
+}
+
+/**
+ * A list address as a loaded model node holds it: a segment 5 address into
+ * the file (the segment its colours are drawn under, with the low bit set once
+ * its textures are rewritten) or a pointer already - gebean.c's
+ * beanResolveGdl().
+ */
+static const Gfx *xblaMeshResolveNodeGdl(const struct modelnode *node, const Gfx *gdl)
+{
+	const uintptr_t addr = (uintptr_t)gdl;
+	const u8 *base = (const u8 *)node->rodata->dl.colours;
+
+	if (gdl && addr <= 0xffffffff && ((addr & 1) || ((UNSEGADDR(addr) >> 24) & 0xff) == SPSEGMENT_MODEL_COL1)) {
+		return base ? (const Gfx *)(base + (UNSEGADDR(addr) & 0xffffff)) : NULL;
+	}
+
+	return gdl;
+}
+
+/**
+ * A list node's own list with only the triangles whose three corners are kept
+ * (keep, a byte per vertex of the node): the others' slots in each G_TRI4 are
+ * zeroed, which the renderer skips, and a G_TRI1 becomes an empty G_TRI4.
+ * Everything else is copied as it is, so the copy draws under the same
+ * segments, render mode and pictures as the node's own. NULL for a list that
+ * jumps elsewhere (a G_DL that does not come back), which this does not follow.
+ */
+static Gfx *xblaMeshKeepFilter(const Gfx *src, const Vtx *vertices, const u8 *keep, s32 numkeep, s32 *outtris)
+{
+	s32 len = 0;
+	s32 slot[16];
+	Gfx *out;
+
+	*outtris = 0;
+
+	if (!src) {
+		return NULL;
+	}
+
+	while (len < 0x10000 && (u8)(src[len].words.w0 >> 24) != (u8)G_ENDDL) {
+		if ((u8)(src[len].words.w0 >> 24) == G_DL && ((src[len].words.w0 >> 16) & 1)) {
+			return NULL;
+		}
+
+		len++;
+	}
+
+	if (len >= 0x10000) {
+		return NULL;
+	}
+
+	out = malloc((len + 1) * sizeof(Gfx));
+
+	if (!out) {
+		return NULL;
+	}
+
+	memcpy(out, src, (len + 1) * sizeof(Gfx));
+
+	for (s32 i = 0; i < 16; i++) {
+		slot[i] = -1;
+	}
+
+	for (s32 c = 0; c < len; c++) {
+		Gfx *cmd = &out[c];
+		const u32 op = (u8)(cmd->words.w0 >> 24);
+
+		if (op == G_VTX) {
+			const uintptr_t w1 = cmd->words.w1;
+			const s32 first = (s32)((cmd->words.w0 >> 16) & 0xf);
+			const s32 count = (s32)((cmd->words.w0 & 0xffff) / sizeof(Vtx));
+			intptr_t vi0 = -1;
+
+			if (w1 <= 0xffffffff && ((w1 >> 24) & 0xf) == SPSEGMENT_MODEL_VTX) {
+				vi0 = (intptr_t)((UNSEGADDR(w1) & 0xffffff) / sizeof(Vtx));
+			} else if (vertices && w1 >= (uintptr_t)vertices) {
+				vi0 = (intptr_t)((w1 - (uintptr_t)vertices) / sizeof(Vtx));
+			}
+
+			for (s32 i = 0; i < count && first + i < 16; i++) {
+				slot[first + i] = vi0 >= 0 && vi0 + i < numkeep ? (s32)(vi0 + i) : -1;
+			}
+		} else if (op == (u8)G_TRI1 || op == (u8)G_TRI4) {
+			u32 w0 = (u32)cmd->words.w0;
+			u32 w1 = (u32)cmd->words.w1;
+			s32 v[4][3];
+			s32 n = 0;
+
+			if (op == (u8)G_TRI1) {
+				v[0][0] = ((w1 >> 16) & 0xff) / 10;
+				v[0][1] = ((w1 >> 8) & 0xff) / 10;
+				v[0][2] = (w1 & 0xff) / 10;
+				n = 1;
+			} else {
+				for (s32 t = 0; t < 4; t++) {
+					v[t][0] = (w1 >> (t * 8)) & 0xf;
+					v[t][1] = (w1 >> (t * 8 + 4)) & 0xf;
+					v[t][2] = (w0 >> (t * 4)) & 0xf;
+				}
+
+				n = 4;
+			}
+
+			s32 numkept = 0;
+
+			for (s32 t = 0; t < n; t++) {
+				s32 kept = 1;
+
+				if (op == (u8)G_TRI4 && !v[t][0] && !v[t][1] && !v[t][2]) {
+					continue;
+				}
+
+				for (s32 k = 0; k < 3 && kept; k++) {
+					const s32 vi = v[t][k] < 16 ? slot[v[t][k]] : -1;
+
+					kept = vi >= 0 && keep[vi];
+				}
+
+				if (kept) {
+					numkept++;
+				} else {
+					w1 &= ~(0xffu << (t * 8));
+					w0 &= ~(0xfu << (t * 4));
+				}
+			}
+
+			*outtris += numkept;
+
+			if (op == (u8)G_TRI1) {
+				if (numkept == 0) {
+					cmd->words.w0 = (uintptr_t)((u32)(u8)G_TRI4 << 24);
+					cmd->words.w1 = 0;
+				}
+			} else {
+				cmd->words.w0 = w0;
+				cmd->words.w1 = w1;
+			}
+		}
+	}
+
+	return out;
+}
+
+/**
+ * Whether a node the mesh has just drawn (xblaMeshRenderNode()) also draws
+ * some of its own triangles inside it, and which: the Cradle helicopter's
+ * pilot, which the release's helicopter has not got (gebean.c's
+ * beanUncoveredVertices()), drawn as GoldenEye draws her on the list the HD
+ * aircraft is on. *opa and *xlu stand for the node's own two lists - the same
+ * render mode, segments and matrix (model.c's modelRenderNodeDl()). Made from
+ * the stage's copy of the model the first time it is drawn, and again at the
+ * next stage (xblaMeshResetBeanMeshes()).
+ */
+s32 xblaMeshKeptLists(struct model *model, struct modelnode *node, Gfx **opa, Gfx **xlu)
+{
+	const struct xblameshentry *e;
+	struct xblameshbuilt *m;
+	union modelrwdata *rwdata;
+	const Gfx *src[2];
+
+	*opa = NULL;
+	*xlu = NULL;
+
+	// A tinted pane going opaque draws GoldenEye's own pane whole over the
+	// release's (xblaMeshRenderNode())
+	if (node && node == tintStockNode && model) {
+		tintStockNode = NULL;
+		rwdata = modelGetNodeRwData(model, node);
+		*opa = rwdata->dl.gdl;
+		*xlu = node->rodata->dl.xlugdl;
+
+		return *opa != NULL;
+	}
+
+	if (beanNumKeeping <= 0 || !model || !node || (node->type & 0xff) != MODELNODETYPE_DL || !beanBuilt[0]
+			|| !gebeanGetEnabled() || !xblaMeshGetEnabled()) {
+		return 0;
+	}
+
+	e = xblaMeshSlotFor(node);
+
+	if (!e || e->node != node || e->beanrow < 0 || !e->modeldef || model->definition != e->modeldef
+			|| e->packpart == XBLAMESH_NOPART) {
+		return 0;
+	}
+
+	// a model pack's file for it draws instead of the mesh, and whole
+	if (e->fileid && modelpackFindN64(e->fileid) != NULL) {
+		return 0;
+	}
+
+	m = beanBuilt[0][e->fileid];
+
+	if (!m || m->state <= 0 || !m->beankeepvtx || e->packpart != m->beankeeplist
+			|| node->rodata->dl.numvertices > m->beannumkeepvtx) {
+		return 0;
+	}
+
+	rwdata = modelGetNodeRwData(model, node);
+	src[0] = xblaMeshResolveNodeGdl(node, rwdata->dl.gdl);
+	src[1] = xblaMeshResolveNodeGdl(node, node->rodata->dl.xlugdl);
+
+	if (!src[0]) {
+		return 0;
+	}
+
+	for (s32 k = 0; k < 2; k++) {
+		s32 numtris = 0;
+
+		if (m->beankeptsrc[k] == src[k] && (m->beankeptgdl[k] || !src[k])) {
+			continue;
+		}
+
+		free(m->beankeptgdl[k]);
+		m->beankeptgdl[k] = xblaMeshKeepFilter(src[k], node->rodata->dl.vertices, m->beankeepvtx,
+				m->beannumkeepvtx, &numtris);
+		m->beankeptsrc[k] = src[k];
+
+		sysLogPrintf(LOG_NOTE, "xblamesh: model file %d list %d's %s list: %d of its own triangles drawn inside the mesh%s",
+				e->fileid, m->beankeeplist, k ? "translucent" : "opaque", numtris,
+				src[k] && !m->beankeptgdl[k] ? " - it jumps away, not drawn" : "");
+	}
+
+	*opa = m->beankeptgdl[0];
+	*xlu = m->beankeptgdl[1];
+
+	return *opa != NULL;
+}
+
+#else
+
+void xblaMeshTrace(FILE *f) { }
+s32 xblaMeshTraceModel(FILE *f, const struct model *model, const char *indent) { return 0; }
+void xblaMeshRegisterModel(struct modeldef *modeldef, u16 fileid) { }
+s32 xblaMeshPrebuildBean(struct modeldef *modeldef) { return -1; }
+void xblaMeshPreloadSet(s32 on) { }
+s32 xblaMeshPreloading(void) { return 0; }
+void xblaMeshPreloadStats(s32 *built, u64 *us) { *built = 0; *us = 0; }
+s32 xblaMeshPreloadModelFile(u16 fileid) { return 0; }
+s32 xblaMeshKeptLists(struct model *model, struct modelnode *node, Gfx **opa, Gfx **xlu) { *opa = *xlu = NULL; return 0; }
+void xblaMeshSetBypass(s32 on) { }
+void xblaMeshSetOpaqueMode(u32 cycle2, u32 onecycle) { }
+void xblaMeshSetEnvironment(s32 force) { }
+s32 xblaMeshGetLogoMaterial(void) { return 0; }
+const void *xblaMeshLevelMetalTile(void) { return NULL; }
+void xblaMeshSetLogoMaterial(s32 on) { }
+void xblaMeshSetLogoFade(s32 alpha) { }
+s32 xblaMeshGetReflections(void) { return 0; }
+void xblaMeshSetReflections(s32 enabled) { }
+s32 xblaMeshRenderNode(struct modelrenderdata *renderdata, struct model *model,
+		struct modelnode *node) { return 0; }
+void xblaMeshFrameReset(void) { }
+void xblaMeshPassBegin(void) { }
+s32 xblaMeshIsAvailable(void) { return 0; }
+s32 xblaMeshPackageReady(s32 mayUnpack) { return 0; }
+s32 xblaMeshGetEnabled(void) { return 0; }
+void xblaMeshSetEnabled(s32 enabled) { }
+void xblaMeshResetModels(void) { }
+void xblaMeshHitBegin(void) { }
+s32 xblaMeshHatSeat(struct model *chrmodel, struct modeldef *headdef, struct model *hatmodel, f32 maxscale, f32 maxlift, f32 out[7]) { return 0; }
+s32 xblaMeshTakeFineModel(struct model *model) { return 0; }
+s32 xblaMeshHitSkipsNode(struct model *model, struct modelnode *node) { return 0; }
+s32 xblaMeshModelHasMesh(struct model *model) { return 0; }
+s32 xblaMeshHeldOffset(struct model *model, struct modelnode *handnode, f32 out[3]) { return 0; }
+s32 xblaMeshModeldefDrawsMesh(const struct modeldef *modeldef) { return 0; }
+s32 xblaMeshModelDrawsBean(struct model *model) { return 0; }
+s32 xblaMeshHitTest(struct model *model, struct coord *pos, struct coord *far, struct coord *dir,
+		f32 *sqdist, struct hitthing *hitthing, struct modelnode **bboxnode, s32 *hitpart,
+		struct modelnode **dlnode) { return 0; }
+s32 xblaMeshSurfaceAlong(struct model *model, const struct coord *from, const struct coord *to, struct coord *hit) { return 0; }
+s32 xblaMeshObjShotTest(struct model *model, struct coord *pos, struct coord *dir, f32 range,
+		struct hitthing *hitthing, s32 *mtxindex, struct modelnode **bboxnode, s32 *hitpart,
+		struct modelnode **dlnode) { return -1; }
+void xblaMeshObjShotTestEnd(void) { }
+s32 xblaMeshModelsAreLate(void) { return 0; }
+u8 *xblaMeshReadFile(u16 fileid, u32 *outLen) { return NULL; }
+
+#endif
