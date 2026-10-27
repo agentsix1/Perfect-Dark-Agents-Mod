@@ -91,7 +91,7 @@ Everyone in a net game must use the **same** ROM. Mixing regions will break thin
 *I have yet to check if there is something public like this. But if there isnt I think this would be cool*
 - Scripting language to create scenarios/gamemodes
 - Scripting language to create basic game modfications
-- External Server Support
+- Dedicated Server Support
 
 ## Things I dont plan to do!
 
