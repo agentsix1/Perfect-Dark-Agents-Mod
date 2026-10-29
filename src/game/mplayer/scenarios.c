@@ -358,128 +358,15 @@ void scenarioNetPsStop(struct prop *prop)
 
 #ifndef PLATFORM_N64
 /*
- * Host remotes: brief room/aim/inv lag must not zero objective timers (KOH hill,
- * HTM download, HTB hold). ~0.75s at 60fps before treating them as actually left.
+ * Host remotes: brief room/aim/inv lag must not zero objective timers
+ * (HTM download, HTB hold). ~0.75s at 60fps before treating them as left.
+ * KOH occupancy is stock Rare: rooms[0] == hillrooms[0] only.
  */
 #define SCENARIO_REMOTE_ZONE_GRACE240 TICKS(180)
 
 static bool scenarioPlayerIsHostRemote(struct player *pl)
 {
 	return g_NetMode == NETMODE_SERVER && pl && pl->isremote;
-}
-
-/*
- * Most hills: stock whole-room claim (matches full-room highlight).
- * Skedar 00DA sits in an oversized BG room that also contains 0055/0056/0058
- * ~1500u away — for that pad only, require proximity to hillpos so the far
- * pads do not count. Other large rooms stay whole-room.
- */
-#define KOH_TIGHT_XZ_RADIUS   1200.0f
-#define KOH_TIGHT_Y_TOLERANCE 250.0f
-
-bool scenarioKohWorldPosInHillZone(f32 x, f32 y, f32 z)
-{
-	f32 dx;
-	f32 dy;
-	f32 dz;
-
-	if (g_ScenarioData.koh.movehill || g_ScenarioData.koh.hillindex < 0) {
-		return false;
-	}
-
-	dx = x - g_ScenarioData.koh.hillpos.x;
-	dy = y - g_ScenarioData.koh.hillpos.y;
-	dz = z - g_ScenarioData.koh.hillpos.z;
-	return (dx * dx + dz * dz) <= (KOH_TIGHT_XZ_RADIUS * KOH_TIGHT_XZ_RADIUS)
-			&& ABS(dy) <= KOH_TIGHT_Y_TOLERANCE;
-}
-
-/**
- * True when this hill's BG room is known to be far larger than the playable
- * platform (Skedar 00DA). Highlight stays whole-room; claim uses a pad radius.
- */
-static bool scenarioKohHillNeedsTightZone(void)
-{
-	s32 pad;
-
-	if (g_ScenarioData.koh.hillindex < 0
-			|| g_ScenarioData.koh.hillindex >= g_ScenarioData.koh.hillcount) {
-		return false;
-	}
-
-	pad = g_ScenarioData.koh.hillpads[g_ScenarioData.koh.hillindex];
-	return pad == PAD_OAT_00DA;
-}
-
-static bool scenarioKohNearHillPos(struct prop *prop, f32 xzradius, f32 ytol)
-{
-	f32 dx;
-	f32 dy;
-	f32 dz;
-
-	dx = prop->pos.x - g_ScenarioData.koh.hillpos.x;
-	dy = prop->pos.y - g_ScenarioData.koh.hillpos.y;
-	dz = prop->pos.z - g_ScenarioData.koh.hillpos.z;
-	return (dx * dx + dz * dz) <= (xzradius * xzradius) && ABS(dy) <= ytol;
-}
-
-/**
- * KOH occupancy: stock rooms[0] == hill room, plus a pad-radius gate only for
- * known oversized rooms (Skedar 00DA). Remotes may match any rooms[] slot or a
- * tight pad proximity when room membership flickers at seams.
- */
-static bool scenarioKohPropInHill(struct prop *prop)
-{
-	s32 i;
-	bool isremote;
-	bool inroom;
-	bool needstight;
-
-	if (!prop || g_ScenarioData.koh.movehill) {
-		return false;
-	}
-
-	needstight = scenarioKohHillNeedsTightZone();
-	inroom = (prop->rooms[0] == g_ScenarioData.koh.hillrooms[0]);
-
-	if (inroom) {
-		if (!needstight || scenarioKohWorldPosInHillZone(prop->pos.x, prop->pos.y, prop->pos.z)) {
-			return true;
-		}
-		return false;
-	}
-
-	isremote = false;
-
-	if (g_NetMode == NETMODE_SERVER && prop->type == PROPTYPE_PLAYER) {
-		i = playermgrGetPlayerNumByProp(prop);
-		if (i >= 0 && i < PLAYERCOUNT() && scenarioPlayerIsHostRemote(g_Vars.players[i])) {
-			isremote = true;
-		}
-	}
-
-	if (!isremote) {
-		return false;
-	}
-
-	if (needstight && !scenarioKohWorldPosInHillZone(prop->pos.x, prop->pos.y, prop->pos.z)) {
-		return false;
-	}
-
-	for (i = 0; i < 8; i++) {
-		if (prop->rooms[i] < 0) {
-			break;
-		}
-		if (prop->rooms[i] == g_ScenarioData.koh.hillrooms[0]) {
-			return true;
-		}
-	}
-
-	if (scenarioKohNearHillPos(prop, 300.0f, 220.0f)) {
-		return true;
-	}
-
-	return false;
 }
 #endif
 

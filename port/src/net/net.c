@@ -36,8 +36,10 @@
 #include "game/inv.h"
 #include "game/propsnd.h"
 #include "game/modelmgr.h"
+#include "game/camera.h"
 #include "lib/model.h"
 #include "lib/anim.h"
+#include "lib/mtx.h"
 #include "lib/main.h"
 #include "lib/snd.h"
 #include "lib/collision.h"
@@ -86,6 +88,9 @@ u32 g_NetClientOutRate = 128 * 1024;
 
 u32 g_NetInterpTicks = 3;
 char g_NetLastJoinAddr[NET_MAX_ADDR + 1] = "127.0.0.1:27100";
+
+s32 g_NetLagCompEnabled = 1;
+u32 g_NetLagCompMaxTicks = 24; // ~400ms at 60Hz; caps rewind abuse
 
 u32 g_NetTick = 0;
 u32 g_NetNextSyncId = 1;
@@ -1472,10 +1477,11 @@ void netClientSimApply(struct chrdata *chr)
 	}
 
 	// Muzzle flash: latch like remote players so one-tick host flashes stay visible.
+	// Use FLASH bits only — FIRING alone includes melee/punch and must not light gunfire.
 	{
 		const u8 flashbits = snap->gunflags & (NETGUN_FLASH_L | NETGUN_FLASH_R);
-		u8 want_r = (snap->gunflags & (NETGUN_FIRING_R | NETGUN_FLASH_R)) != 0;
-		u8 want_l = (snap->gunflags & (NETGUN_FIRING_L | NETGUN_FLASH_L)) != 0;
+		u8 want_r = (flashbits & NETGUN_FLASH_R) != 0;
+		u8 want_l = (flashbits & NETGUN_FLASH_L) != 0;
 
 		if (want_r) {
 			g_NetSimFlashLatch[slot][HAND_RIGHT] = 5;
@@ -2195,6 +2201,7 @@ void netServerStageStart(void)
 	g_NetWaitingForPlayers = 0;
 	g_NetAwaitingRejoin = 0;
 	g_NetForceRespawn = 0;
+	netLagCompClearAll();
 	for (s32 i = 0; i < NET_MAX_CLIENTS + 1; ++i) {
 		g_NetClients[i].endscreenready = 0;
 		g_NetClients[i].leftmatch = 0;
@@ -2626,8 +2633,10 @@ void netApplyRemoteGunVisuals(struct player *pl)
 
 	// Latch muzzle flash across a few frames so short flashes remain visible on TP
 	// held guns (and so clients don't miss a single-tick flash between packets).
+	// Only latch on real flashon — melee/punch sets firing without NOMUZZLEFLASH
+	// flash, and treating firing as flash made punches light gunfire parts.
 	for (s32 h = 0; h < 2; ++h) {
-		if (pl->hands[h].flashon || pl->hands[h].firing) {
+		if (pl->hands[h].flashon) {
 			cl->gunflashlatch[h] = 4;
 		} else if (cl->gunflashlatch[h] > 0) {
 			cl->gunflashlatch[h]--;
@@ -2672,6 +2681,329 @@ void netClientSettingsChanged(void)
 	netbufStartWrite(&g_NetMsgRel);
 	netmsgClcSettingsWrite(&g_NetMsgRel);
 	netSend(NULL, &g_NetMsgRel, true, NETCHAN_CONTROL);
+}
+
+/* -------------------------------------------------------------------------- */
+/* Lag compensation: host rewinds targets to the shooter's perceived time.    */
+/* -------------------------------------------------------------------------- */
+
+#define NET_LAGCOMP_HISTORY 64
+
+struct netlagpose {
+	u32 tick;
+	struct coord pos;
+	u8 valid;
+};
+
+struct netlagring {
+	struct netlagpose poses[NET_LAGCOMP_HISTORY];
+	u32 write;
+};
+
+struct netlagrestore {
+	u8 active;
+	struct prop *prop;
+	struct coord pos;
+	f32 propz;
+	struct coord dcam;
+};
+
+static struct netlagring g_NetLagPlayerHist[MAX_PLAYERS];
+static struct netlagring g_NetLagSimHist[MAX_BOTS];
+static struct netlagrestore g_NetLagPlayerRestore[MAX_PLAYERS];
+static struct netlagrestore g_NetLagSimRestore[MAX_BOTS];
+static s32 g_NetLagCompActive;
+
+static void netLagCompClearAll(void)
+{
+	memset(g_NetLagPlayerHist, 0, sizeof(g_NetLagPlayerHist));
+	memset(g_NetLagSimHist, 0, sizeof(g_NetLagSimHist));
+	memset(g_NetLagPlayerRestore, 0, sizeof(g_NetLagPlayerRestore));
+	memset(g_NetLagSimRestore, 0, sizeof(g_NetLagSimRestore));
+	g_NetLagCompActive = 0;
+}
+
+static void netLagCompRingPush(struct netlagring *ring, const struct coord *pos)
+{
+	struct netlagpose *pose = &ring->poses[ring->write % NET_LAGCOMP_HISTORY];
+
+	pose->tick = g_NetTick;
+	pose->pos = *pos;
+	pose->valid = 1;
+	ring->write++;
+}
+
+static const struct netlagpose *netLagCompRingFind(const struct netlagring *ring, u32 targettick)
+{
+	const struct netlagpose *best = NULL;
+
+	for (s32 i = 0; i < NET_LAGCOMP_HISTORY; ++i) {
+		const struct netlagpose *pose = &ring->poses[i];
+
+		if (!pose->valid || pose->tick > targettick) {
+			continue;
+		}
+		if (!best || pose->tick > best->tick) {
+			best = pose;
+		}
+	}
+
+	return best;
+}
+
+static void netLagCompOffsetModel(struct model *model, const struct coord *dcam)
+{
+	s32 n;
+
+	if (!model || !model->matrices || !model->definition) {
+		return;
+	}
+
+	n = model->definition->nummatrices;
+	for (s32 i = 0; i < n; ++i) {
+		model->matrices[i].m[3][0] += dcam->x;
+		model->matrices[i].m[3][1] += dcam->y;
+		model->matrices[i].m[3][2] += dcam->z;
+	}
+}
+
+static void netLagCompOffsetPropTree(struct prop *prop, const struct coord *dcam)
+{
+	struct prop *child;
+
+	if (!prop) {
+		return;
+	}
+
+	if (prop->type == PROPTYPE_CHR || prop->type == PROPTYPE_PLAYER) {
+		if (prop->chr && prop->chr->model) {
+			netLagCompOffsetModel(prop->chr->model, dcam);
+		}
+	} else if (prop->obj && prop->obj->model) {
+		netLagCompOffsetModel(prop->obj->model, dcam);
+	}
+
+	child = prop->child;
+	while (child) {
+		struct prop *next = propGetChildNext(child);
+		netLagCompOffsetPropTree(child, dcam);
+		child = next;
+	}
+}
+
+static void netLagCompApplyProp(struct prop *prop, const struct coord *histpos, struct netlagrestore *rest)
+{
+	struct coord delta;
+	struct coord dcam;
+	Mtxf *w2s;
+
+	if (!prop || !prop->chr || !histpos || !rest) {
+		return;
+	}
+
+	delta.x = histpos->x - prop->pos.x;
+	delta.y = histpos->y - prop->pos.y;
+	delta.z = histpos->z - prop->pos.z;
+
+	if (delta.x == 0.0f && delta.y == 0.0f && delta.z == 0.0f) {
+		return;
+	}
+
+	rest->active = 1;
+	rest->prop = prop;
+	rest->pos = prop->pos;
+	rest->propz = prop->z;
+
+	prop->pos = *histpos;
+	if (prop->chr->model) {
+		modelSetRootPosition(prop->chr->model, &prop->pos);
+	}
+
+	/*
+	 * Hitscan uses camera-space model matrices (built for the shooter's view).
+	 * Translate those by the same world delta rotated into cam space.
+	 */
+	dcam.x = dcam.y = dcam.z = 0.0f;
+	w2s = camGetWorldToScreenMtxf();
+	if (w2s && (prop->flags & PROPFLAG_ONTHISSCREENTHISTICK)
+			&& prop->chr->model && prop->chr->model->matrices) {
+		mtx4RotateVec(w2s, &delta, &dcam);
+		netLagCompOffsetPropTree(prop, &dcam);
+		prop->z = -prop->chr->model->matrices[0].m[3][2];
+	}
+
+	rest->dcam = dcam;
+}
+
+static void netLagCompRestoreOne(struct netlagrestore *rest)
+{
+	struct coord neg;
+
+	if (!rest || !rest->active || !rest->prop) {
+		return;
+	}
+
+	rest->prop->pos = rest->pos;
+	if (rest->prop->chr && rest->prop->chr->model) {
+		modelSetRootPosition(rest->prop->chr->model, &rest->pos);
+	}
+
+	neg.x = -rest->dcam.x;
+	neg.y = -rest->dcam.y;
+	neg.z = -rest->dcam.z;
+	if (neg.x != 0.0f || neg.y != 0.0f || neg.z != 0.0f) {
+		netLagCompOffsetPropTree(rest->prop, &neg);
+	}
+
+	rest->prop->z = rest->propz;
+	rest->active = 0;
+	rest->prop = NULL;
+}
+
+void netLagCompRecord(void)
+{
+	if (g_NetMode != NETMODE_SERVER || !g_NetLagCompEnabled) {
+		return;
+	}
+	if (!g_Vars.normmplayerisrunning || !g_Vars.players) {
+		return;
+	}
+
+	for (s32 i = 0; i < PLAYERCOUNT(); ++i) {
+		struct player *pl = g_Vars.players[i];
+
+		if (!pl || !pl->prop || pl->isdead) {
+			continue;
+		}
+		netLagCompRingPush(&g_NetLagPlayerHist[i], &pl->prop->pos);
+	}
+
+	for (s32 i = 0; i < g_BotCount && i < MAX_BOTS; ++i) {
+		struct chrdata *chr = g_MpBotChrPtrs[i];
+
+		if (!chr || !chr->prop || chrIsDead(chr)) {
+			continue;
+		}
+		netLagCompRingPush(&g_NetLagSimHist[i], &chr->prop->pos);
+	}
+}
+
+static u32 netLagCompRewindTicksForShooter(struct player *shooter)
+{
+	u32 rtt_ms = 0;
+	u32 one_way;
+	u32 ticks;
+	struct netclient *cl;
+
+	if (!shooter) {
+		return 0;
+	}
+
+	/* Host's own shots already see live server state — no rewind. */
+	if (!shooter->isremote) {
+		return 0;
+	}
+
+	cl = shooter->client;
+	if (!cl) {
+		for (s32 i = 0; i < g_NetMaxClients; ++i) {
+			if (g_NetClients[i].player == shooter) {
+				cl = &g_NetClients[i];
+				break;
+			}
+		}
+	}
+
+	if (cl && cl->peer) {
+		rtt_ms = enet_peer_get_rtt(cl->peer);
+	}
+
+	/* One-way delay in 60Hz ticks + client interpolation buffer. */
+	one_way = (rtt_ms * 60u) / 2000u;
+	ticks = one_way + g_NetInterpTicks;
+	if (ticks > g_NetLagCompMaxTicks) {
+		ticks = g_NetLagCompMaxTicks;
+	}
+	return ticks;
+}
+
+s32 netLagCompBegin(struct player *shooter)
+{
+	u32 rewind;
+	u32 targettick;
+	s32 shooter_pnum;
+
+	if (g_NetMode != NETMODE_SERVER || !g_NetLagCompEnabled || g_NetLagCompActive) {
+		return 0;
+	}
+	if (!shooter || !shooter->prop || !g_Vars.normmplayerisrunning) {
+		return 0;
+	}
+
+	rewind = netLagCompRewindTicksForShooter(shooter);
+	if (rewind == 0) {
+		return 0;
+	}
+
+	targettick = (g_NetTick > rewind) ? (g_NetTick - rewind) : 0;
+	shooter_pnum = playermgrGetPlayerNumByProp(shooter->prop);
+
+	memset(g_NetLagPlayerRestore, 0, sizeof(g_NetLagPlayerRestore));
+	memset(g_NetLagSimRestore, 0, sizeof(g_NetLagSimRestore));
+
+	for (s32 i = 0; i < PLAYERCOUNT(); ++i) {
+		struct player *pl;
+		const struct netlagpose *pose;
+
+		if (i == shooter_pnum) {
+			continue;
+		}
+
+		pl = g_Vars.players[i];
+		if (!pl || !pl->prop || pl->isdead) {
+			continue;
+		}
+
+		pose = netLagCompRingFind(&g_NetLagPlayerHist[i], targettick);
+		if (!pose) {
+			continue;
+		}
+		netLagCompApplyProp(pl->prop, &pose->pos, &g_NetLagPlayerRestore[i]);
+	}
+
+	for (s32 i = 0; i < g_BotCount && i < MAX_BOTS; ++i) {
+		struct chrdata *chr = g_MpBotChrPtrs[i];
+		const struct netlagpose *pose;
+
+		if (!chr || !chr->prop || chrIsDead(chr)) {
+			continue;
+		}
+
+		pose = netLagCompRingFind(&g_NetLagSimHist[i], targettick);
+		if (!pose) {
+			continue;
+		}
+		netLagCompApplyProp(chr->prop, &pose->pos, &g_NetLagSimRestore[i]);
+	}
+
+	g_NetLagCompActive = 1;
+	return 1;
+}
+
+void netLagCompEnd(void)
+{
+	if (!g_NetLagCompActive) {
+		return;
+	}
+
+	for (s32 i = 0; i < MAX_PLAYERS; ++i) {
+		netLagCompRestoreOne(&g_NetLagPlayerRestore[i]);
+	}
+	for (s32 i = 0; i < MAX_BOTS; ++i) {
+		netLagCompRestoreOne(&g_NetLagSimRestore[i]);
+	}
+
+	g_NetLagCompActive = 0;
 }
 
 /**
@@ -2788,6 +3120,9 @@ void netEndFrame(void)
 
 	g_NetReliableFrameLen = 0;
 	g_NetUnreliableFrameLen = 0;
+
+	// Snapshot poses for lag-compensated hitscan on the next shots.
+	netLagCompRecord();
 
 	// sync Combat Sim setup while everyone is still in the lobby
 	netMpSetupTick();
@@ -3493,6 +3828,8 @@ void netClientLeaveMatch(void)
 PD_CONSTRUCTOR static void netConfigInit(void)
 {
 	configRegisterUInt("Net.LerpTicks", &g_NetInterpTicks, 0, 600);
+	configRegisterInt("Net.LagComp.Enabled", &g_NetLagCompEnabled, 0, 1);
+	configRegisterUInt("Net.LagComp.MaxTicks", &g_NetLagCompMaxTicks, 0, NET_LAGCOMP_HISTORY - 1);
 
 	configRegisterString("Net.Client.LastJoinAddr", g_NetLastJoinAddr, NET_MAX_ADDR);
 	configRegisterUInt("Net.Client.InRate", &g_NetClientInRate, 0, 10 * 1024 * 1024);

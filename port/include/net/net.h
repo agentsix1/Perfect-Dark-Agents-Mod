@@ -136,6 +136,10 @@ extern u32 g_NetInterpTicks;
 extern u32 g_NetServerPort;
 extern char g_NetLastJoinAddr[NET_MAX_ADDR + 1];
 
+/** Host hitreg: rewind other players/sims by shooter's latency before hitscan. */
+extern s32 g_NetLagCompEnabled;
+extern u32 g_NetLagCompMaxTicks;
+
 extern s32 g_NetDebugDraw;
 
 extern s32 g_NetMaxClients;
@@ -198,6 +202,16 @@ void netClientSyncRng(void);
 void netClientSettingsChanged(void);
 s32 netGetLocalConfigIndex(void);
 void netApplyRemoteGunVisuals(struct player *pl);
+
+/**
+ * Host lag compensation for hitscan/melee.
+ * Record poses each tick; around a shot, rewind everyone except the shooter
+ * to where the shooter would have seen them (RTT/2 + interp).
+ * Begin returns non-zero if a rewind was applied (must End).
+ */
+void netLagCompRecord(void);
+s32 netLagCompBegin(struct player *shooter);
+void netLagCompEnd(void);
 
 void netMpSetupTick(void);
 void netMpSetupSend(void);

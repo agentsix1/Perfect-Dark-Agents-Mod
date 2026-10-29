@@ -29,13 +29,6 @@ bool scenarioRadarChr(Gfx **gdl, struct prop *prop);
 f32 scenarioChooseSpawnLocation(f32 chrradius, struct coord *pos, RoomNum *rooms, struct prop *prop);
 s32 scenarioGetMaxTeams(void);
 void scenarioHighlightRoom(RoomNum room, s32 *arg1, s32 *arg2, s32 *arg3);
-#ifndef PLATFORM_N64
-/**
- * True when a world point is inside the tight claim radius used for known
- * oversized KOH rooms (e.g. Skedar pad 00DA).
- */
-bool scenarioKohWorldPosInHillZone(f32 x, f32 y, f32 z);
-#endif
 s32 scenarioPickUpBriefcase(struct chrdata *chr, struct prop *prop);
 s32 scenarioPickUpUplink(struct chrdata *chr, struct prop *prop);
 void scenarioHandleDroppedToken(struct chrdata *chr, struct prop *prop);

@@ -290,7 +290,7 @@ void kohInitProps(void)
  */
 /**
  * True when 2+ teams have living chrs in the hill room.
- * Safe on clients — uses local room membership (host XZ/Y for sims).
+ * Stock Rare: rooms[0] == hillrooms[0] only (same as N64 Combat Sim).
  */
 static bool kohIsHillContested(void)
 {
@@ -315,11 +315,7 @@ static bool kohIsHillContested(void)
 
 	while (prop) {
 		if ((prop->type == PROPTYPE_PLAYER || prop->type == PROPTYPE_CHR)
-#ifndef PLATFORM_N64
-				&& scenarioKohPropInHill(prop)
-#else
 				&& prop->rooms[0] == g_ScenarioData.koh.hillrooms[0]
-#endif
 				&& prop->chr && !chrIsDead(prop->chr)) {
 			s32 teamindex = radarGetTeamIndex(prop->chr->team);
 
@@ -348,11 +344,7 @@ static bool kohCurrentPlayerInHill(void)
 
 	return prop
 			&& !g_ScenarioData.koh.movehill
-#ifndef PLATFORM_N64
-			&& scenarioKohPropInHill(prop);
-#else
 			&& prop->rooms[0] == g_ScenarioData.koh.hillrooms[0];
-#endif
 }
 
 void kohTick(void)
@@ -377,9 +369,6 @@ void kohTick(void)
 	s32 padnum;
 	s32 teamindex;
 	static bool s_kohWasContested;
-#ifndef PLATFORM_N64
-	static s32 s_KohEmptyGrace240;
-#endif
 
 #define hillteam       s0
 #define inhill         s1
@@ -392,9 +381,6 @@ void kohTick(void)
 
 	if (g_ScenarioData.koh.hillindex == -1) {
 		s_kohWasContested = false;
-#ifndef PLATFORM_N64
-		s_KohEmptyGrace240 = 0;
-#endif
 		return;
 	}
 
@@ -406,9 +392,6 @@ void kohTick(void)
 		g_ScenarioData.koh.occupiedteam = -1;
 		g_ScenarioData.koh.elapsed240 = 0;
 		s_kohWasContested = false;
-#ifndef PLATFORM_N64
-		s_KohEmptyGrace240 = 0;
-#endif
 
 		targetr = 1;
 		targetg = 1;
@@ -469,15 +452,9 @@ void kohTick(void)
 			if (prop->type == PROPTYPE_PLAYER || prop->type == PROPTYPE_CHR) {
 				inhill = false;
 
-#ifndef PLATFORM_N64
-				if (scenarioKohPropInHill(prop)) {
-					inhill = true;
-				}
-#else
 				if (prop->rooms[0] == g_ScenarioData.koh.hillrooms[0]) {
 					inhill = true;
 				}
-#endif
 
 				if (inhill) {
 					chr = prop->chr;
@@ -516,26 +493,6 @@ void kohTick(void)
 				teamsinhill[teamindex] = 1;
 			}
 		}
-
-#ifndef PLATFORM_N64
-		/*
-		 * Host: remotes can briefly drop out of the hill room list (pos/room
-		 * lag). Hold the previous exclusive claim for a short grace so the
-		 * timer does not zero mid-hold.
-		 */
-		if (numteamsinhill == 0
-				&& g_NetMode == NETMODE_SERVER
-				&& g_ScenarioData.koh.occupiedteam >= 0
-				&& g_ScenarioData.koh.occupiedteam < MAX_TEAMS) {
-			s_KohEmptyGrace240 += g_Vars.lvupdate240;
-			if (s_KohEmptyGrace240 < SCENARIO_REMOTE_ZONE_GRACE240) {
-				teamsinhill[g_ScenarioData.koh.occupiedteam] = 1;
-				numteamsinhill = 1;
-			}
-		} else {
-			s_KohEmptyGrace240 = 0;
-		}
-#endif
 
 		if (numteamsinhill == 0) {
 			if (g_ScenarioData.koh.occupiedteam != -1 || g_ScenarioData.koh.elapsed240 != 0) {
@@ -677,11 +634,7 @@ void kohTick(void)
 							if (radarGetTeamIndex(g_MpAllChrPtrs[playernum2]->team) == g_ScenarioData.koh.occupiedteam) {
 								prop = g_MpAllChrPtrs[playernum2]->prop;
 
-#ifndef PLATFORM_N64
-								if (scenarioKohPropInHill(prop)) {
-#else
 								if (prop->rooms[0] == g_ScenarioData.koh.hillrooms[0]) {
-#endif
 									g_MpAllChrConfigPtrs[playernum2]->numpoints++;
 								}
 							}

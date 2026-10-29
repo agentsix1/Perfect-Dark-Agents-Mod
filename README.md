@@ -16,7 +16,7 @@ A community mod / netplay fork of the [Perfect Dark PC port](https://github.com/
 1. [Read this first](#read-this-first)
 2. [What is this?](#what-is-this)
 3. [Supported ROM](#supported-rom)
-4. [What’s working (high level)](#what-s-next---goals-)
+4. [What’s Next? (Goals)](#whats-next-goals)
 5. [Network play](#network-play)
 6. [Changelog](#changelog)
 7. [Running the game](#running-the-game)
@@ -91,7 +91,7 @@ Everyone in a net game must use the **same** ROM. Mixing regions will break thin
 *I have yet to check if there is something public like this. But if there isnt I think this would be cool*
 - Scripting language to create scenarios/gamemodes
 - Scripting language to create basic game modfications
-- External Server Support
+- Dedicated Server Support
 
 ## Things I dont plan to do!
 
@@ -164,6 +164,8 @@ Combat Sim damage is already decided on the **host**. XBLA mesh triangle hits ru
 
 If the host stays on Default (N64) geometry and a client draws larger XBLA models (or the reverse), aim / silhouettes can disagree visually. That is intentional: hits follow the host’s loaded geometry, not each viewer’s pack.
 
+**Lag compensation:** on the host, before a remote player’s hitscan/melee resolves, other players and sims are briefly rewound by about half that shooter’s RTT plus `Net.LerpTicks` (capped by `Net.LagComp.MaxTicks`, default 24 ≈ 400ms). Config: `Net.LagComp.Enabled`, `Net.LagComp.MaxTicks`.
+
 ---
 
 
@@ -174,14 +176,17 @@ If the host stays on Default (N64) geometry and a client draws larger XBLA model
 >Still **experimental**. Matches can crash or desync. This is a milestone tag, not a release quality claim.
 
 **Features Added**
+- Added Positional Sound
+- Added lag compensation for netplay hitreg (host rewinds targets by shooter RTT/2 + interp)
 - Added HD Texture Support
 *You can download textures at https://github.com/retro-foundry/Perfect-Dark-Plus-HD-Textures/releases*
 
 *My texture support code was refrenced from https://github.com/DabDavis/perfect-dark-dabs-mod*
 
 **Bug Fixes**
-- Hills not improperly detecting players
+- Hills in general were fixed
 - Timer text wrong color when teamate owns hill
+- Removed Muzzle Flash from punching
 
 
 ### Experimental v0.0.1

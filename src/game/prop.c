@@ -2411,8 +2411,20 @@ void handTickAttack(s32 handnum)
 void handsTickAttack(void)
 {
 	if (g_Vars.lvupdate240 > 0) {
+#ifndef PLATFORM_N64
+		s32 lagcomp = 0;
+
+		if (g_NetMode == NETMODE_SERVER) {
+			lagcomp = netLagCompBegin(g_Vars.currentplayer);
+		}
+#endif
 		handTickAttack(HAND_RIGHT);
 		handTickAttack(HAND_LEFT);
+#ifndef PLATFORM_N64
+		if (lagcomp) {
+			netLagCompEnd();
+		}
+#endif
 	}
 }
 

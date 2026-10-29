@@ -1990,39 +1990,55 @@ void bgun0f09a6f8(struct handweaponinfo *info, s32 handnum, struct hand *hand, s
 			osSetThreadPri(0, osGetThreadPri(&g_AudioManager.thread) + 1);
 #endif
 
-			if (hand->audiohandle2 && sndGetState(hand->audiohandle2) != AL_STOPPED) {
-				audioStop(hand->audiohandle2);
-			}
+#ifndef PLATFORM_N64
+			// Host remotes: FP sndStart is non-positional (heard at full volume
+			// everywhere). Play from the shooter's prop like sims / client remotes.
+			if (g_Vars.currentplayer->isremote && g_Vars.currentplayer->prop) {
+				u16 soundnum = gsetGetSingleShootSound(&hand->gset);
 
-			if (hand->audiohandle3 && sndGetState(hand->audiohandle3) != AL_STOPPED) {
-				audioStop(hand->audiohandle3);
-			}
-
-			if (gsetGetSingleShootSound(&hand->gset)) {
-				struct sndstate *handle = NULL;
-
-				if (hand->audiohandle2 == NULL) {
-					handle = sndStart(var80095200, gsetGetSingleShootSound(&hand->gset), &hand->audiohandle2, -1, -1, -1, -1, -1);
-				} else if (hand->audiohandle3 == NULL) {
-					handle = sndStart(var80095200, gsetGetSingleShootSound(&hand->gset), &hand->audiohandle3, -1, -1, -1, -1, -1);
+				if (soundnum) {
+					psCreate(NULL, g_Vars.currentplayer->prop, soundnum, -1, -1,
+							PSFLAG_0400, PSFLAG2_PRINTABLE | PSFLAG2_MPPAUSABLE,
+							PSTYPE_CHRSHOOT, NULL, -1, NULL, -1, -1, -1, -1);
+					hand->lastshootframe60 = g_Vars.lvframe60;
+				}
+			} else
+#endif
+			{
+				if (hand->audiohandle2 && sndGetState(hand->audiohandle2) != AL_STOPPED) {
+					audioStop(hand->audiohandle2);
 				}
 
-				hand->lastshootframe60 = g_Vars.lvframe60;
+				if (hand->audiohandle3 && sndGetState(hand->audiohandle3) != AL_STOPPED) {
+					audioStop(hand->audiohandle3);
+				}
 
-				if (hand->gset.weaponnum == WEAPON_MAULER && handle) {
-					s32 matmot = hand->matmot1;
-					f32 tmp;
-					f32 frac = matmot / 3.0f;
+				if (gsetGetSingleShootSound(&hand->gset)) {
+					struct sndstate *handle = NULL;
 
-					if (frac > 1.0f) {
-						frac = 1.0f;
+					if (hand->audiohandle2 == NULL) {
+						handle = sndStart(var80095200, gsetGetSingleShootSound(&hand->gset), &hand->audiohandle2, -1, -1, -1, -1, -1);
+					} else if (hand->audiohandle3 == NULL) {
+						handle = sndStart(var80095200, gsetGetSingleShootSound(&hand->gset), &hand->audiohandle3, -1, -1, -1, -1, -1);
 					}
 
-					tmp = 1.0f - frac * 0.4f;
+					hand->lastshootframe60 = g_Vars.lvframe60;
 
-					audioPostEvent(handle, AL_SNDP_PITCH_EVT, *(s32 *) &tmp);
+					if (hand->gset.weaponnum == WEAPON_MAULER && handle) {
+						s32 matmot = hand->matmot1;
+						f32 tmp;
+						f32 frac = matmot / 3.0f;
+
+						if (frac > 1.0f) {
+							frac = 1.0f;
+						}
+
+						tmp = 1.0f - frac * 0.4f;
+
+						audioPostEvent(handle, AL_SNDP_PITCH_EVT, *(s32 *) &tmp);
+					}
+
 				}
-
 			}
 
 #if VERSION >= VERSION_NTSC_1_0
@@ -7087,7 +7103,11 @@ void bgunUpdateReaper(struct hand *hand, struct modeldef *modeldef)
 	hand->matmot1 -= tmp * 6.2831802368164f;
 	var8009d140 = hand->matmot1;
 
-	if (hand->audiohandle == NULL && hand->matmot3 > 0.1f && g_Vars.lvupdate240 != 0) {
+	if (hand->audiohandle == NULL && hand->matmot3 > 0.1f && g_Vars.lvupdate240 != 0
+#ifndef PLATFORM_N64
+			&& !g_Vars.currentplayer->isremote
+#endif
+			) {
 		sndStart(var80095200, SFX_805E, &hand->audiohandle, -1, -1, -1.0f, -1, -1);
 	}
 
@@ -7246,9 +7266,23 @@ void bgunUpdateShotgun(struct hand *hand, u8 *allocation, bool *arg2, struct mod
 void bgunUpdateLaser(struct hand *hand)
 {
 	if (hand->firing && hand->gset.weaponfunc == FUNC_SECONDARY) {
-		if (hand->audiohandle == NULL && g_Vars.lvupdate240 != 0) {
+		if (hand->audiohandle == NULL && g_Vars.lvupdate240 != 0
+#ifndef PLATFORM_N64
+				&& !g_Vars.currentplayer->isremote
+#endif
+				) {
 			sndStart(var80095200, SFX_LASER_STREAM, &hand->audiohandle, -1, -1, -1, -1, -1);
 		}
+
+#ifndef PLATFORM_N64
+		// Host remotes: positional laser when the beam starts (no non-positional FP stream).
+		if (g_Vars.currentplayer->isremote && g_Vars.currentplayer->prop
+				&& hand->matmot1 <= 0.0f) {
+			psCreate(NULL, g_Vars.currentplayer->prop, SFX_LASER_STREAM, -1, -1,
+					PSFLAG_0400, PSFLAG2_PRINTABLE | PSFLAG2_MPPAUSABLE,
+					PSTYPE_CHRSHOOT, NULL, -1, NULL, -1, -1, -1, -1);
+		}
+#endif
 
 		hand->matmot1 = 1;
 		return;
@@ -8268,7 +8302,11 @@ void bgunTickMaulerCharge(void)
 			if (hand->audiohandle == NULL
 					&& hand->matmot1 > 0.1f
 					&& charging
-					&& g_Vars.lvupdate240 != 0) {
+					&& g_Vars.lvupdate240 != 0
+#ifndef PLATFORM_N64
+					&& !g_Vars.currentplayer->isremote
+#endif
+					) {
 				sndStart(var80095200, SFX_MAULER_CHARGE, &hand->audiohandle, -1, -1, -1, -1, -1);
 			}
 
